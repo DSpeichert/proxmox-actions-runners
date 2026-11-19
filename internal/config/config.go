@@ -37,8 +37,24 @@ type Config struct {
 	Proxmox Proxmox `yaml:"proxmox"`
 	GitHub  GitHub  `yaml:"github,omitempty"`
 	// Worker is the controller-wide worker hardware. Fields left unset use the GitHub-matching defaults.
-	Worker    Worker     `yaml:"worker,omitempty"`
-	ScaleSets []ScaleSet `yaml:"scaleSets"`
+	Worker Worker `yaml:"worker,omitempty"`
+	// MaxWorkers caps the workers of all scale sets together, so scale sets that each may use the whole node can't
+	// together overcommit it. Zero means the sum of the scale sets' maxRunners.
+	MaxWorkers int        `yaml:"maxWorkers,omitempty"`
+	ScaleSets  []ScaleSet `yaml:"scaleSets"`
+}
+
+// EffectiveMaxWorkers returns how many workers the controller runs at most: MaxWorkers, or if it is zero, the sum of
+// the scale sets' maxRunners.
+func (c *Config) EffectiveMaxWorkers() int {
+	if c.MaxWorkers > 0 {
+		return c.MaxWorkers
+	}
+	n := 0
+	for _, s := range c.ScaleSets {
+		n += max(s.MaxRunners, 0)
+	}
+	return n
 }
 
 // Proxmox says how to reach the Proxmox VE API and where workers are created.

@@ -177,6 +177,8 @@ github:
 worker:            # controller-wide; omit to use the GitHub-matching defaults (2 cores, 8 GiB, 14 GiB free)
   cores: 2
 
+maxWorkers: 3      # the most workers of all scale sets together; omit for the sum of their maxRunners
+
 scaleSets:
   - name: proxmox-ubuntu-26.04
     labels: [proxmox-ubuntu-26.04]

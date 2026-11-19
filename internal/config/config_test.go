@@ -290,6 +290,9 @@ func TestParseInvalid(t *testing.T) {
 		{"VMID below 100", "proxmox.vmidRange.start", 99, "proxmox.vmidRange.start"},
 		{"VMID range backwards", "proxmox.vmidRange", map[string]any{"start": 2000, "end": 1000}, "is after end"},
 		{"VMID range too small", "proxmox.vmidRange", map[string]any{"start": 100, "end": 105}, "needs at least 7"},
+		{"VMID range too small for maxWorkers", "maxWorkers", 2000, "needs at least 2004"},
+		{"negative maxWorkers", "maxWorkers", -1, "maxWorkers: must not be negative"},
+		{"maxRunners above maxWorkers", "maxWorkers", 2, "scaleSets[0].maxRunners: 3 is more than maxWorkers 2"},
 
 		{"GitHub Enterprise Server", "github.configUrl", "https://ghes.example.com/my-org", "https://github.com/<org>"},
 		{"too deep GitHub URL", "github.configUrl", "https://github.com/a/b/c", "https://github.com/<org>"},
@@ -324,6 +327,26 @@ func TestParseInvalid(t *testing.T) {
 				t.Errorf("error does not mention %q:\n%v", tt.want, err)
 			}
 		})
+	}
+}
+
+func TestEffectiveMaxWorkers(t *testing.T) {
+	c := &Config{ScaleSets: []ScaleSet{{MaxRunners: 3}, {MaxRunners: 4}}}
+	if n := c.EffectiveMaxWorkers(); n != 7 {
+		t.Errorf("without maxWorkers: %d, want the sum of maxRunners, 7", n)
+	}
+	c.MaxWorkers = 4
+	if n := c.EffectiveMaxWorkers(); n != 4 {
+		t.Errorf("with maxWorkers 4: %d", n)
+	}
+	// One scale set per target, each allowed the whole node, fits a range sized for maxWorkers, not their sum.
+	doc := validDoc()
+	set(t, doc, "maxWorkers", 4)
+	set(t, doc, "proxmox.vmidRange", map[string]any{"start": 100, "end": 107})
+	set(t, doc, "scaleSets", []any{map[string]any{"name": "a", "maxRunners": 4}, map[string]any{"name": "b",
+		"maxRunners": 4}})
+	if _, err := parseDoc(t, doc); err != nil {
+		t.Errorf("maxWorkers 4 with 8 IDs: %v", err)
 	}
 }
 

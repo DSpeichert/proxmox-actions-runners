@@ -705,3 +705,70 @@ func TestNewRequiresClients(t *testing.T) {
 		t.Error("New without clients succeeded")
 	}
 }
+
+// workersOf counts the live workers of each scale set.
+func (h *harness) workersOf() map[string]int {
+	n := map[string]int{}
+	for _, vm := range h.pve.workers() {
+		if w, err := parseWorker(vm); err == nil && vm.Status != "stopped" {
+			n[w.scaleSet]++
+		}
+	}
+	return n
+}
+
+func twoScaleSets(maxWorkers int) *config.Config {
+	a, b := testScaleSetConfig(), testScaleSetConfig()
+	a.Name, a.Labels = "a", []string{"a"}
+	b.Name, b.Labels = "b", []string{"b"}
+	cfg := testConfig(a, b)
+	cfg.MaxWorkers = maxWorkers
+	return cfg
+}
+
+func (h *harness) wantFor(name string, assignedJobs int) {
+	h.t.Helper()
+	if _, err := h.c.scaleSets[name].DesiredRunners(context.Background(), assignedJobs); err != nil {
+		h.t.Fatal(err)
+	}
+}
+
+func TestMaxWorkersCapsAllScaleSetsAndSharesTheRoom(t *testing.T) {
+	h := newHarness(t, twoScaleSets(4))
+	h.pve.addTemplate(testTemplateID, 1)
+	h.wantFor("a", 5)
+	h.wantFor("b", 5)
+	h.pass()
+	h.pass()
+	if got := h.workersOf(); got["a"] != 2 || got["b"] != 2 {
+		t.Errorf("workers = %v, want 2 each: maxWorkers 4 shared evenly", got)
+	}
+}
+
+func TestMaxWorkersGivesTheNextWorkerToTheLongestWaiting(t *testing.T) {
+	h := newHarness(t, twoScaleSets(2))
+	h.pve.addTemplate(testTemplateID, 1)
+	h.wantFor("a", 2)
+	h.pass()
+	if got := h.workersOf(); got["a"] != 2 {
+		t.Fatalf("workers = %v, want a to fill the node", got)
+	}
+	// b starts waiting, then a wants one more later: when a slot frees up, b has waited longest.
+	h.clock.Advance(time.Minute)
+	h.wantFor("b", 1)
+	h.pass()
+	h.clock.Advance(time.Minute)
+	h.wantFor("a", 3)
+	h.pass()
+	if got := h.workersOf(); got["b"] != 0 {
+		t.Fatalf("workers = %v, want none for b while the node is full", got)
+	}
+	// One of a's workers finishes its job and powers off; the pass destroys it and gives the slot to b.
+	vmid := h.readyWorkers()[0]
+	h.pve.setStatus(vmid, "stopped")
+	h.pass()
+	h.pass()
+	if got := h.workersOf(); got["b"] != 1 || got["a"] != 1 {
+		t.Errorf("workers = %v, want the freed slot to go to b, which waited longest", got)
+	}
+}

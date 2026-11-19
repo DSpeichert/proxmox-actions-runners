@@ -165,9 +165,11 @@ func (c *Config) validateScaleSets(v *validator) {
 		return
 	}
 
+	if c.MaxWorkers < 0 {
+		v.addf("maxWorkers", "must not be negative")
+	}
 	names := map[string]int{}
 	labels := map[string]string{}
-	totalMaxRunners := 0
 	for i, s := range c.ScaleSets {
 		prefix := fmt.Sprintf("scaleSets[%d]", i)
 		if v.required(prefix+".name", s.Name) && !ScaleSetNamePattern.MatchString(s.Name) {
@@ -203,7 +205,9 @@ func (c *Config) validateScaleSets(v *validator) {
 		if s.MinRunners > s.MaxRunners {
 			v.addf(prefix+".minRunners", "%d is more than maxRunners %d", s.MinRunners, s.MaxRunners)
 		}
-		totalMaxRunners += max(s.MaxRunners, 0)
+		if c.MaxWorkers > 0 && s.MaxRunners > c.MaxWorkers {
+			v.addf(prefix+".maxRunners", "%d is more than maxWorkers %d", s.MaxRunners, c.MaxWorkers)
+		}
 
 		if s.MaxLifetime < MinMaxLifetime || s.MaxLifetime > MaxMaxLifetime {
 			v.addf(prefix+".maxLifetime", "%s is out of range [%s, %s]", s.MaxLifetime, MinMaxLifetime,
@@ -214,8 +218,9 @@ func (c *Config) validateScaleSets(v *validator) {
 
 	// Only check capacity for a range that is otherwise valid; a broken range was already reported.
 	r := c.Proxmox.VMIDRange
-	if need := totalMaxRunners + ReservedVMIDs; r.Start >= minVMID && r.Start <= r.End && r.Size() < need {
-		v.addf("proxmox.vmidRange", "has %d IDs but needs at least %d: the sum of maxRunners (%d) plus %d reserved",
-			r.Size(), need, totalMaxRunners, ReservedVMIDs)
+	workers := c.EffectiveMaxWorkers()
+	if need := workers + ReservedVMIDs; r.Start >= minVMID && r.Start <= r.End && r.Size() < need {
+		v.addf("proxmox.vmidRange", "has %d IDs but needs at least %d: the most workers at once (%d) plus %d "+
+			"reserved", r.Size(), need, workers, ReservedVMIDs)
 	}
 }

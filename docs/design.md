@@ -238,6 +238,13 @@ RAM, and free space on the clone storage, and count how many vCPUs are already a
 concurrency and raise it only after measuring contention. Queue time, clone latency, and job duration in the
 controller's metrics are the signals to watch.
 
+The node's limit is `maxWorkers`, the most workers of all scale sets together (`runners.max` on the host). Each scale
+set may ask GitHub for up to its own `maxRunners`, so several scale sets can each be allowed the whole node without
+overcommitting it together. When they want more workers than `maxWorkers` leaves room for, they take turns, one worker
+each, starting with the one that has waited longest, so a busy scale set can't starve a quiet one. Workers of a scale
+set that is no longer configured still count until they are gone. The VMID range is sized for `maxWorkers`, not for
+the sum of `maxRunners`.
+
 ## Network isolation
 
 Workers run untrusted code and should be treated as hostile to everything around them. Home labs and company

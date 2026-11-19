@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/klponce/proxmox-actions-runners/internal/config"
@@ -101,9 +102,11 @@ func (c *Controller) reconcile(ctx context.Context) error {
 		}
 	}
 
+	wants := map[*scaleSetState]int{}
 	for _, s := range c.scaleSets {
-		c.scale(ctx, s, v, now)
+		wants[s] = c.scale(ctx, s, v, now)
 	}
+	c.grow(ctx, wants, v, now)
 	c.countWorkers(v)
 	return nil
 }
@@ -181,11 +184,12 @@ func (c *Controller) runnerCheckDue(vmid int, now time.Time) bool {
 	return true
 }
 
-// scale creates or retires workers so the scale set has as many as GitHub wants.
-func (c *Controller) scale(ctx context.Context, s *scaleSetState, v view, now time.Time) {
+// scale retires the workers a scale set has beyond what GitHub wants, and returns how many more it wants.
+func (c *Controller) scale(ctx context.Context, s *scaleSetState, v view, now time.Time) int {
 	target, known := s.target()
 	if !known || s.scaleSetID() == 0 {
-		return
+		s.wanting(0, now)
+		return 0
 	}
 
 	// Count workers that are alive or on their way: creations in flight, and listed workers that aren't being
@@ -203,32 +207,106 @@ func (c *Controller) scale(ctx context.Context, s *scaleSetState, v view, now ti
 		}
 	}
 
-	switch {
-	case active < target:
-		if v.template == nil {
-			c.logger.WarnContext(ctx, "no runner template; can't create workers", slog.String("scaleSet", s.cfg.Name),
-				slog.String("pool", c.cfg.Proxmox.Pool))
-			return
-		}
-		if !s.canCreate(now) {
-			return
-		}
-		for range target - active {
-			vmid, ok := c.allocateVMID(v.used)
-			if !ok {
-				c.logger.WarnContext(ctx, "no free VMID in the configured range", slog.String("scaleSet", s.cfg.Name))
-				return
-			}
-			c.startCreate(ctx, s, *v.template, vmid)
-		}
-
-	case active > target && creating == 0:
+	if active > target && creating == 0 {
 		// Retire the oldest idle workers first; they are closest to maxLifetime anyway. A worker whose runner
 		// picked up a job in the meantime refuses to go (RemoveRunner fails), stays, and counts as busy from then on.
 		sort.Slice(idle, func(i, j int) bool { return idle[i].created.Before(idle[j].created) })
 		for _, w := range idle[:min(active-target, len(idle))] {
 			c.startRetire(ctx, s.gh, s, w.vm, w.name, false, "more workers than GitHub wants")
 		}
+	}
+	want := max(target-active, 0)
+	s.wanting(want, now)
+	return want
+}
+
+// grow creates the workers the scale sets want, within the controller-wide maxWorkers. When there is less room than
+// demand, the scale sets take turns, one worker each, starting with the one that has waited longest, so a busy scale
+// set can't starve the others.
+func (c *Controller) grow(ctx context.Context, wants map[*scaleSetState]int, v view, now time.Time) {
+	var queue []*scaleSetState
+	for s, n := range wants {
+		if n <= 0 || !s.canCreate(now) {
+			continue
+		}
+		if v.template == nil {
+			c.logger.WarnContext(ctx, "no runner template; can't create workers", slog.String("scaleSet", s.cfg.Name),
+				slog.String("pool", c.cfg.Proxmox.Pool))
+			continue
+		}
+		queue = append(queue, s)
+	}
+	if len(queue) == 0 {
+		c.noteWaiting(ctx, 0)
+		return
+	}
+	sort.Slice(queue, func(i, j int) bool {
+		a, b := queue[i].waitingSince(), queue[j].waitingSince()
+		if !a.Equal(b) {
+			return a.Before(b)
+		}
+		return queue[i].cfg.Name < queue[j].cfg.Name
+	})
+
+	room := c.cfg.EffectiveMaxWorkers() - c.inUse(v)
+	for room > 0 && len(queue) > 0 {
+		next := queue[:0]
+		for _, s := range queue {
+			if room == 0 {
+				next = append(next, s)
+				continue
+			}
+			vmid, ok := c.allocateVMID(v.used)
+			if !ok {
+				c.logger.WarnContext(ctx, "no free VMID in the configured range", slog.String("scaleSet", s.cfg.Name))
+				return
+			}
+			c.startCreate(ctx, s, *v.template, vmid)
+			room--
+			if wants[s]--; wants[s] > 0 {
+				next = append(next, s)
+			}
+		}
+		queue = next
+	}
+	waiting := 0
+	for _, s := range queue {
+		waiting += wants[s]
+	}
+	c.noteWaiting(ctx, waiting)
+}
+
+// inUse counts the workers that hold a share of maxWorkers: creations in flight, and listed workers of any scale set,
+// configured or not, that haven't stopped and aren't being retired.
+func (c *Controller) inUse(v view) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	n := 0
+	for _, op := range c.busy {
+		if strings.HasPrefix(op, opCreatePrefix) {
+			n++
+		}
+	}
+	for _, workers := range v.workers {
+		for _, w := range workers {
+			if _, busy := c.busy[w.vm.VMID]; !busy && w.vm.Status != "stopped" {
+				n++
+			}
+		}
+	}
+	return n
+}
+
+// noteWaiting logs when the number of workers held back by maxWorkers changes, so a full node shows in the log
+// without repeating every pass.
+func (c *Controller) noteWaiting(ctx context.Context, waiting int) {
+	c.mu.Lock()
+	changed := waiting != c.waiting
+	c.waiting = waiting
+	c.mu.Unlock()
+	if changed && waiting > 0 {
+		c.logger.InfoContext(ctx, "maxWorkers reached; workers wait for others to finish",
+			slog.Int("maxWorkers", c.cfg.EffectiveMaxWorkers()), slog.Int("waiting", waiting))
 	}
 }
 

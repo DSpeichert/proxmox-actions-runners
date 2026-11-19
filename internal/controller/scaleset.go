@@ -30,6 +30,9 @@ type scaleSetState struct {
 	busy map[string]bool
 	// retryAfter holds off new workers after a failed creation.
 	retryAfter time.Time
+	// wantSince is when the scale set last went from having the workers it wants to wanting more; zero while it
+	// wants none. Scale sets that have waited longest create first when maxWorkers leaves too little room.
+	wantSince time.Time
 
 	// For the status: the message session, and GitHub's last statistics.
 	sessionOpen  bool
@@ -135,6 +138,24 @@ func (s *scaleSetState) forget(runner string) {
 	s.mu.Lock()
 	delete(s.busy, runner)
 	s.mu.Unlock()
+}
+
+// wanting records how many more workers the scale set wants.
+func (s *scaleSetState) wanting(n int, now time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	switch {
+	case n == 0:
+		s.wantSince = time.Time{}
+	case s.wantSince.IsZero():
+		s.wantSince = now
+	}
+}
+
+func (s *scaleSetState) waitingSince() time.Time {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.wantSince
 }
 
 func (s *scaleSetState) backOff(until time.Time) {

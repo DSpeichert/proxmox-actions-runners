@@ -41,6 +41,8 @@ func ControllerConfig(s *Settings, env Env) (*config.Config, []byte, error) {
 		},
 		GitHub: config.GitHub{ConfigURL: s.GitHub.ConfigURL},
 		Worker: s.Worker,
+		// runners.max is the node's limit, whatever the scale sets each ask GitHub for.
+		MaxWorkers: s.ScaleSet.MaxRunners,
 		ScaleSets: []config.ScaleSet{{
 			Name:        s.ScaleSet.Name,
 			Labels:      s.ScaleSet.Labels,

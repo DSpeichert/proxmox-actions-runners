@@ -134,6 +134,8 @@ type Controller struct {
 	foreign map[int]bool
 	// lastRunnerCheck is when each worker's runner was last looked up, by VMID.
 	lastRunnerCheck map[int]time.Time
+	// waiting is how many workers the last pass held back because of maxWorkers.
+	waiting int
 
 	// nextRunnerCheck is when the template's runner is next compared with the latest release.
 	nextRunnerCheck time.Time
