@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/klponce/proxmox-actions-runners/internal/proxmox"
+	"github.com/klponce/proxmox-actions-runners/internal/settings"
 	"github.com/klponce/proxmox-actions-runners/internal/vmtags"
 )
 
@@ -44,9 +45,9 @@ func vmids(vms []proxmox.VM) string {
 	return strings.Join(ids, " ")
 }
 
-// Uninstall removes everything parcon and the controller created: the scale set in GitHub, the VMs (an older
+// Uninstall removes everything parcon and the controller created: the scale sets in GitHub, the VMs (an older
 // release's gateway VM too), the Proxmox objects, the worker firewall and network, the offload rule, no-kvm-apf,
-// the settings, and parcon itself, last. The GitHub App stays.
+// the settings, and parcon itself, last. The GitHub Apps stay.
 func (in *Installer) Uninstall(ctx context.Context) error {
 	vms, err := in.vms(ctx)
 	if err != nil {
@@ -65,7 +66,12 @@ func (in *Installer) Uninstall(ctx context.Context) error {
 	in.Out.Step("Plan")
 	in.Out.Say("Remove proxmox-actions-runners from node %s:", node)
 	if hasController {
-		in.Out.Say("  stop the controller and delete its scale sets in GitHub (the App itself stays)")
+		targets := "every target"
+		if s, err := settings.Load(in.SettingsPath); err == nil && len(s.GitHub.Targets) > 0 {
+			targets = strings.Join(targetURLs(s), ", ")
+		}
+		in.Out.Say("  stop the controller and delete its scale sets in GitHub, for %s (the Apps themselves stay)",
+			targets)
 	}
 	in.Out.Say("  destroy the VMs tagged %s in %s and %s, now: %s", vmtags.Managed, SystemPool, RunnerPool,
 		vmids(managed))
@@ -103,8 +109,8 @@ func (in *Installer) Uninstall(ctx context.Context) error {
 		in.Change.Log(fmt.Sprintf("controller VM %d: parcon github scaleset delete", controller.VMID))
 		if out, err := in.asParcon(ctx, controller.VMID, 2*time.Minute, nil, "parcon", "github", "scaleset",
 			"delete"); err != nil {
-			in.Out.Warn("deleting the scale set in GitHub failed; remove it in the organization's or repository's "+
-				"Actions settings (Runners): %v", err)
+			in.Out.Warn("deleting the scale sets in GitHub failed; remove those left in the organizations' or "+
+				"repositories' Actions settings (Runners): %v", err)
 		} else {
 			in.Out.Say("    %s", strings.TrimSpace(string(out)))
 		}
@@ -150,7 +156,7 @@ func (in *Installer) Uninstall(ctx context.Context) error {
 		return err
 	}
 	in.Out.Step("Done")
-	in.Out.Say("proxmox-actions-runners is removed. The GitHub App remains; delete it in GitHub's settings if you like.")
+	in.Out.Say("proxmox-actions-runners is removed. The GitHub Apps remain; delete them in GitHub's settings if you like.")
 	return nil
 }
 

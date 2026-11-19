@@ -48,7 +48,12 @@ func TestControllerConfigBeforeTheApp(t *testing.T) {
 
 func TestControllerConfigWithTheApp(t *testing.T) {
 	s := Default()
-	s.GitHub = GitHub{ConfigURL: "https://github.com/my-org", App: App{ClientID: "Iv23liEXAMPLE", InstallationID: 7}}
+	s.GitHub = GitHub{
+		Apps: []App{{ClientID: "Iv23liEXAMPLE"}, {ClientID: "Iv23liUSER"}},
+		Targets: []Target{{URL: "https://github.com/my-org", ClientID: "Iv23liEXAMPLE", InstallationID: 7},
+			// Waiting for its installation: the controller doesn't serve it yet.
+			{URL: "https://github.com/octocat/hello", ClientID: "Iv23liUSER"}},
+	}
 	s.ScaleSet.Labels = []string{"null", "true", "linux"}
 	s.ScaleSet.MaxRunners = 4
 	s.Worker.MemoryMiB = 16384
@@ -63,7 +68,8 @@ func TestControllerConfigWithTheApp(t *testing.T) {
 		t.Error(err)
 	}
 	wantGitHub := config.GitHub{
-		Apps:    []config.GitHubApp{{ClientID: "Iv23liEXAMPLE", PrivateKeyFile: config.AppKeyFile}},
+		Apps: []config.GitHubApp{{ClientID: "Iv23liEXAMPLE", PrivateKeyFile: config.AppKeyFile("Iv23liEXAMPLE")},
+			{ClientID: "Iv23liUSER", PrivateKeyFile: config.AppKeyFile("Iv23liUSER")}},
 		Targets: []config.Target{{ConfigURL: "https://github.com/my-org", ClientID: "Iv23liEXAMPLE", InstallationID: 7}},
 	}
 	if !reflect.DeepEqual(c.GitHub, wantGitHub) {

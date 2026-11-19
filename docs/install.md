@@ -226,8 +226,10 @@ The controller image, `parcon` on the host, and the controller agree on this lay
 - **Binary:** `/usr/local/bin/parcon`, baked into the controller image. `parcon update` has the VM download the new
   release's binary and check it against the verified `SHA256SUMS`, replaces the file, and restarts the unit.
 - **Config and secrets:** the directory `/etc/proxmox-actions-runners` is owned by `parcon:parcon` with mode `0700`.
-  Every file in it is owned by `parcon` with mode `0600`: `config.yaml`, `pve-token`, `github-app.pem`, and, when
-  the API serves the node's own certificate, `pve-ca.pem`.
+  Every file in it is owned by `parcon` with mode `0600`: `config.yaml`, `pve-token`, each GitHub App's key as
+  `github-app-<Client ID>.pem`, and, when the API serves the node's own certificate, `pve-ca.pem`. Releases before
+  several Apps kept the one key as `github-app.pem`; `parcon update` copies it to its new name, and removes it once the
+  controller runs with the config that names the new one.
 - **Commands:** `parcon` on the host runs every `parcon` command in the VM as `parcon`, with
   `runuser -u parcon -- parcon …` through `qm guest exec`, so files that `parcon` writes get the right owner.
 - **Before the App exists:** `github.apps`, and a target's `clientId` and `installationId`, may be left out of
@@ -253,9 +255,13 @@ The controller image, `parcon` on the host, and the controller agree on this lay
 | ------- | ---- | ---------- |
 | `network` | the bridge, VLAN, API address, the VMs' LAN addresses and router, the worker subnet | install flags |
 | `proxmox` | the storage and the VMID range | install flags |
-| `github` | the organization or repository, and the App's Client ID, installation ID, and slug (for its install link) | the install, as it learns them |
+| `github` | `apps`: each App's Client ID, slug (for its install link), and owner; `targets`: each organization or repository, and the App and installation that reach it | the install and `parcon target add`, as they learn them |
 | `scaleSet` | the name, labels, runner group, the most and fewest workers, and how long a worker may live | install flags, `runners.max`, `worker.maxLifetime` |
 | `worker` | worker hardware; a field left out uses the GitHub-matching default | `worker.cores`, `worker.memory` |
+
+Version 2 of the file, from releases before several targets, had one `github.configUrl` and one `github.app`. `parcon`
+reads it as one App and one target, and `parcon update` saves it as version 3. A target that is waiting for its App or
+installation isn't rendered into the controller's config, so the controller serves only the targets that are set up.
 
 It holds nothing secret. `parcon` renders the controller's `config.yaml` from it together with what it reads from
 the node each time (the node's name, the API's address and certificate, and whether the storage can make linked
@@ -422,11 +428,13 @@ never logged or printed:
 
 | Command | Stdin | Stdout |
 | ------- | ----- | ------ |
-| `parcon github app create [-key-file PATH]` | the manifest code | `{"clientId":"…","appId":…,"slug":"…","owner":"…","ownerType":"Organization"}` |
-| `parcon github app import [-key-file PATH]` | an existing App's PEM private key | nothing |
+| `parcon github app create [-key-file PATH]` | the manifest code | `{"clientId":"…","appId":…,"slug":"…","owner":"…","ownerType":"Organization","keyFile":"…"}` |
+| `parcon github app import -client-id ID [-key-file PATH]` | an existing App's PEM private key | nothing |
 | `parcon github app wait-installation -client-id ID [-account LOGIN [-repository NAME]] [-key-file PATH] [-timeout 15m]` | nothing | `{"installationId":…,"account":"…","accountType":"User","repositories":["…"]}` |
 
-- `-key-file` defaults to `/etc/proxmox-actions-runners/github-app.pem`. `create` and `import` write it with mode
+- `-key-file` defaults to `/etc/proxmox-actions-runners/github-app-<Client ID>.pem`, so each App's key has its own
+  file; `create` learns the Client ID from GitHub, and `import` and `wait-installation` from `-client-id`. `create` and
+  `import` write it with mode
   `0600` through a temporary file in the same directory and a rename, so a reader never sees half a key. `create`
   creates the temporary file before it exchanges the code, so a key path it can't write fails without spending the
   single-use code.

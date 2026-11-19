@@ -127,7 +127,8 @@ func TestStatus(t *testing.T) {
 	c := ti.controller(t)
 	desired := 1
 	snap := controller.Status{Schema: controller.StatusSchema, Version: "0.2.0", UpdatedAt: ti.Now(),
-		ScaleSets: []controller.ScaleSetStatus{{Name: "proxmox-ubuntu-26.04", ID: 3, SessionOpen: true,
+		ScaleSets: []controller.ScaleSetStatus{{Target: "https://github.com/my-org", TargetKey: "my-org",
+			Name: "proxmox-ubuntu-26.04", ID: 3, SessionOpen: true,
 			SessionSince: ti.Now().Add(-2 * time.Hour), Desired: &desired,
 			Stats: &github.Stats{AvailableJobs: 1, RunningJobs: 1, RegisteredRunners: 1, BusyRunners: 1}}}}
 	c.files[controller.StatusPath] = jsonOf(snap)

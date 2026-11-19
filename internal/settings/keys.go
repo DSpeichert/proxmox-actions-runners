@@ -88,7 +88,7 @@ const appliesToNewWorkers = "to new workers; the controller restarts, and runnin
 
 var runnersMax = Key{
 	Name:    "runners.max",
-	Summary: "the most worker VMs at once, and so the most jobs at once",
+	Summary: "the most worker VMs at once, and so the most jobs at once, shared by all targets",
 	Allowed: func(s *Settings, _ Limits) string {
 		r := s.Proxmox.VMIDRange
 		allowed := fmt.Sprintf("a whole number from %d to %d: the VMID range %d-%d has %d IDs for workers",

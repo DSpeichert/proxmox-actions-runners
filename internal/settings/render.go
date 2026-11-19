@@ -60,13 +60,15 @@ func ControllerConfig(s *Settings, env Env) (*config.Config, []byte, error) {
 	case hostsys.TLSPin:
 		c.Proxmox.TLSFingerprint = env.TLS.Fingerprint
 	}
-	// The App comes once its key is in the controller, which is when the installer learns its Client ID.
-	if s.GitHub.App.ClientID != "" {
-		c.GitHub.Apps = []config.GitHubApp{{ClientID: s.GitHub.App.ClientID, PrivateKeyFile: config.AppKeyFile}}
+	// An App comes once its key is in the controller, which is when the installer learns its Client ID, and a
+	// target once its App is installed there. Until then the controller doesn't serve it.
+	for _, a := range s.GitHub.Apps {
+		c.GitHub.Apps = append(c.GitHub.Apps, config.GitHubApp{ClientID: a.ClientID,
+			PrivateKeyFile: config.AppKeyFile(a.ClientID)})
 	}
-	if s.GitHub.ConfigURL != "" {
-		c.GitHub.Targets = []config.Target{{ConfigURL: s.GitHub.ConfigURL, ClientID: s.GitHub.App.ClientID,
-			InstallationID: s.GitHub.App.InstallationID}}
+	for _, t := range s.GitHub.CompleteTargets() {
+		c.GitHub.Targets = append(c.GitHub.Targets, config.Target{ConfigURL: t.URL, ClientID: t.ClientID,
+			InstallationID: t.InstallationID})
 	}
 
 	body, err := config.Marshal(c)

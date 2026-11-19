@@ -17,8 +17,14 @@ import (
 	"github.com/klponce/proxmox-actions-runners/internal/github"
 )
 
-// defaultKeyFile is where the GitHub App's private key lives in the controller VM.
-const defaultKeyFile = config.AppKeyFile
+// keyFileFor returns the -key-file flag's value, or where the App's private key lives in the controller VM by
+// default: config.AppKeyFile of its Client ID.
+func keyFileFor(flagValue, clientID string) string {
+	if flagValue != "" {
+		return flagValue
+	}
+	return config.AppKeyFile(clientID)
+}
 
 // maxStdin bounds what the commands read from stdin: a manifest code or a PEM key.
 const maxStdin = 64 << 10
@@ -79,10 +85,12 @@ func parseFlags(fs *flag.FlagSet, args []string, stderr io.Writer) error {
 }
 
 // appCreate exchanges the manifest code read from stdin for the new App, writes its private key, and prints the
-// App's client ID, App ID, and slug as JSON for the installer.
+// App's client ID, App ID, slug, owner, and key file as JSON for the installer. The key goes to config.AppKeyFile of
+// the new App's Client ID unless -key-file says otherwise.
 func appCreate(args []string, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("github app create", flag.ContinueOnError)
-	keyFile := fs.String("key-file", defaultKeyFile, "where to write the App's private key")
+	keyFile := fs.String("key-file", "", "where to write the App's private key (default: by its Client ID in "+
+		config.Dir+")")
 	if err := parseFlags(fs, args, stderr); err != nil {
 		return err
 	}
@@ -90,12 +98,18 @@ func appCreate(args []string, stdout, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
+	dir := config.Dir
+	if *keyFile != "" {
+		dir = filepath.Dir(*keyFile)
+	}
 	var app github.App
-	err = writeSecretFile(*keyFile, func() (string, error) {
+	// The key's file is named by the App's Client ID, which is known only once the code is spent. The temporary file
+	// is created in the directory first, so the single-use code is never spent on a directory that can't be written.
+	err = writeSecretFileIn(dir, func() (string, string, error) {
 		var key string
 		var err error
 		app, key, err = convertManifest(context.Background(), code)
-		return key, err
+		return key, keyFileFor(*keyFile, app.ClientID), err
 	})
 	if err != nil {
 		return err
@@ -106,16 +120,24 @@ func appCreate(args []string, stdout, stderr io.Writer) error {
 		Slug      string `json:"slug"`
 		Owner     string `json:"owner"`
 		OwnerType string `json:"ownerType"`
-	}{app.ClientID, app.ID, app.Slug, app.Owner, app.OwnerType})
+		KeyFile   string `json:"keyFile"`
+	}{app.ClientID, app.ID, app.Slug, app.Owner, app.OwnerType, keyFileFor(*keyFile, app.ClientID)})
 }
 
 // appImport writes an existing App's private key, read from stdin, for installs that don't use the manifest flow.
 func appImport(args []string, _, stderr io.Writer) error {
 	fs := flag.NewFlagSet("github app import", flag.ContinueOnError)
-	keyFile := fs.String("key-file", defaultKeyFile, "where to write the App's private key")
+	clientID := fs.String("client-id", "", "the App's client ID, which names its key file")
+	keyFile := fs.String("key-file", "", "where to write the App's private key (default: by -client-id in "+
+		config.Dir+")")
 	if err := parseFlags(fs, args, stderr); err != nil {
 		return err
 	}
+	if *clientID == "" && *keyFile == "" {
+		fmt.Fprintln(stderr, "-client-id or -key-file is required")
+		return errUsage
+	}
+	path := keyFileFor(*keyFile, *clientID)
 	key, err := readStdin("private key")
 	if err != nil {
 		return err
@@ -123,7 +145,7 @@ func appImport(args []string, _, stderr io.Writer) error {
 	if err := github.CheckPrivateKey(key); err != nil {
 		return err
 	}
-	return writeSecretFile(*keyFile, func() (string, error) { return key, nil })
+	return writeSecretFile(path, func() (string, error) { return key, nil })
 }
 
 // appWaitInstallation waits until the App is installed and prints where, as JSON: the installation's ID, the
@@ -134,7 +156,7 @@ func appImport(args []string, _, stderr io.Writer) error {
 func appWaitInstallation(args []string, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("github app wait-installation", flag.ContinueOnError)
 	clientID := fs.String("client-id", "", "the App's client ID (required)")
-	keyFile := fs.String("key-file", defaultKeyFile, "the App's private key")
+	keyFile := fs.String("key-file", "", "the App's private key (default: by -client-id in "+config.Dir+")")
 	timeout := fs.Duration("timeout", 15*time.Minute, "how long to wait for the installation")
 	account := fs.String("account", "", "the organization or personal account the App must be installed on")
 	repository := fs.String("repository", "", "a repository the installation must reach (needs -account)")
@@ -149,7 +171,7 @@ func appWaitInstallation(args []string, stdout, stderr io.Writer) error {
 		fmt.Fprintln(stderr, "-repository needs -account")
 		return errUsage
 	}
-	key, err := config.ReadSecretFile(*keyFile)
+	key, err := config.ReadSecretFile(keyFileFor(*keyFile, *clientID))
 	if err != nil {
 		return fmt.Errorf("GitHub App key: %w", err)
 	}
@@ -217,10 +239,20 @@ func readStdin(what string) (string, error) {
 // writeSecretFile writes the secret that produce returns to path with mode 0600. It writes a temporary file in the
 // same directory and renames it, so a reader never sees half a key. The temporary file is created first, so a path
 // that can't be written fails before produce spends a single-use manifest code.
-func writeSecretFile(path string, produce func() (string, error)) (err error) {
-	f, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".*")
+func writeSecretFile(path string, produce func() (string, error)) error {
+	return writeSecretFileIn(filepath.Dir(path), func() (string, string, error) {
+		secret, err := produce()
+		return secret, path, err
+	})
+}
+
+// writeSecretFileIn writes the secret produce returns to the path it returns, which must be in dir, atomically and
+// readable only by its owner. The temporary file is created before produce runs, so a directory that can't be
+// written fails before a single-use secret is spent.
+func writeSecretFileIn(dir string, produce func() (secret, path string, err error)) (err error) {
+	f, err := os.CreateTemp(dir, ".secret.*")
 	if err != nil {
-		return fmt.Errorf("write %s: %w", path, err)
+		return fmt.Errorf("write a file in %s: %w", dir, err)
 	}
 	defer func() {
 		if err != nil {
@@ -228,9 +260,12 @@ func writeSecretFile(path string, produce func() (string, error)) (err error) {
 			_ = os.Remove(f.Name())
 		}
 	}()
-	secret, err := produce()
+	secret, path, err := produce()
 	if err != nil {
 		return err
+	}
+	if filepath.Dir(path) != filepath.Clean(dir) {
+		return fmt.Errorf("write %s: not in %s", path, dir)
 	}
 	// os.CreateTemp creates the file with mode 0600.
 	_, err = f.WriteString(strings.TrimSpace(secret) + "\n")

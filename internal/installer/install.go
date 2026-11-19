@@ -54,7 +54,7 @@ func (in *Installer) Install(ctx context.Context, opts InstallOptions) error {
 	if err := s.Validate(); err != nil {
 		return err
 	}
-	if opts.App == AppManual && opts.ClientID == "" && s.GitHub.App.ClientID == "" {
+	if opts.App == AppManual && opts.ClientID == "" && len(s.GitHub.Apps) == 0 {
 		return errors.New("--app manual needs --client-id, the existing App's Client ID")
 	}
 
@@ -141,7 +141,7 @@ func (in *Installer) install(ctx context.Context, s *settings.Settings, opts Ins
 	if err := in.CheckNetwork(ctx, s, addr); err != nil {
 		return err
 	}
-	if err := in.waitSession(ctx, controller, started, 5*time.Minute); err != nil {
+	if err := in.waitSessions(ctx, controller, s, started, 5*time.Minute); err != nil {
 		return err
 	}
 	in.Out.Say("    the controller registered scale set %s and is listening for jobs", s.ScaleSet.Name)
@@ -168,7 +168,8 @@ Controller VM %d (%s).
 Status:    parcon status
 Settings:  parcon config get --all
 Update:    parcon update
-Uninstall: parcon uninstall`, s.GitHub.ConfigURL, runsOn, controller, addr)
+Targets:   parcon target add|remove|list
+Uninstall: parcon uninstall`, strings.Join(targetURLs(s), " and "), runsOn, controller, addr)
 	in.rebootNote(ctx)
 	return nil
 }
@@ -238,7 +239,7 @@ func (in *Installer) printPlan(ctx context.Context, s *settings.Settings, warnin
 	wk := s.EffectiveWorker()
 	p("Workers: VMIDs %d-%d on %s (%s), at most %d, each %d vCPU and %s", r.Start, r.End-config.ReservedVMIDs, VNet,
 		s.Network.WorkerSubnet, s.ScaleSet.MaxRunners, wk.Cores, config.FormatMiB(wk.MemoryMiB))
-	target := s.GitHub.ConfigURL
+	target := strings.Join(targetURLs(s), ", ")
 	if target == "" {
 		target = "the organization or repository you choose when you create and install the GitHub App"
 	}
@@ -258,4 +259,13 @@ func warnAll(w io.Writer, checks []Check, more []settings.Warning) {
 	for _, m := range more {
 		_, _ = fmt.Fprintf(w, "  %s\n", m)
 	}
+}
+
+// targetURLs returns the URLs of the settings' targets.
+func targetURLs(s *settings.Settings) []string {
+	var urls []string
+	for _, t := range s.GitHub.Targets {
+		urls = append(urls, t.URL)
+	}
+	return urls
 }

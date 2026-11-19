@@ -205,6 +205,9 @@ func (in *Installer) upgradeSteps(ctx context.Context, s *settings.Settings, for
 	have, err := in.asParcon(ctx, controller.VMID, guestTimeout, nil, "cat", config.DefaultPath)
 	configDrift := err != nil || strings.TrimSpace(string(have)) != strings.TrimSpace(string(want))
 	needBinary := controllerVersion != in.Version.String()
+	// Settings from before several targets are saved in the new format, and the one App's key moves to its own path.
+	migrate := s.MigratedFrom() != 0
+	configDrift = configDrift || migrate
 	network := append(in.networkDrift(ctx, s), in.firewallDrift(ctx, s)...)
 	offloads := in.offloadPlan(ctx, s)
 	asyncPF := in.asyncPFPlan(ctx)
@@ -273,14 +276,44 @@ func (in *Installer) upgradeSteps(ctx context.Context, s *settings.Settings, for
 		})
 	}
 	if needBinary || configDrift || force {
+		plan := "render the controller's config from the settings, restart the controller, and wait for its sessions"
+		if migrate && len(s.GitHub.Apps) > 0 {
+			plan = fmt.Sprintf("save %s in format %d, copy the GitHub App key to %s in controller VM %d, then %s, "+
+				"then remove %s", in.SettingsPath, settings.Version, config.AppKeyFile(s.GitHub.Apps[0].ClientID),
+				controller.VMID, plan, config.LegacyAppKeyFile)
+		} else if migrate {
+			plan = fmt.Sprintf("save %s in format %d, then %s", in.SettingsPath, settings.Version, plan)
+		}
 		steps = append(steps, upgradeStep{
-			plan: "render the controller's config from the settings, restart the controller, and wait for its session",
+			plan: plan,
 			do: func(ctx context.Context) error {
 				in.Out.Step("Controller config")
+				// The key is copied before the settings are saved in the new format, so a re-run after a failure
+				// still knows to copy it.
+				if err := in.migrateAppKey(ctx, controller.VMID, s); err != nil {
+					return err
+				}
+				if migrate {
+					if err := in.saveSettings(s); err != nil {
+						return err
+					}
+				}
 				if err := in.pushConfig(ctx, controller.VMID, s); err != nil {
 					return err
 				}
-				return in.restartController(ctx, controller.VMID)
+				if err := in.restartController(ctx, controller.VMID, s); err != nil {
+					return err
+				}
+				if migrate && len(s.GitHub.Apps) > 0 {
+					in.Change.Log(fmt.Sprintf("controller VM %d: rm -f %s", controller.VMID, config.LegacyAppKeyFile))
+					if !in.Change.DryRun {
+						if _, err := in.asParcon(ctx, controller.VMID, guestTimeout, nil, "rm", "-f",
+							config.LegacyAppKeyFile); err != nil {
+							return err
+						}
+					}
+				}
+				return nil
 			},
 		})
 	}

@@ -91,7 +91,7 @@ func (in *Installer) apply(ctx context.Context, s *settings.Settings) error {
 		return fmt.Errorf("the controller has the new config, but saving the settings failed; run parcon config "+
 			"apply once it is fixed: %w", err)
 	}
-	return in.restartController(ctx, vm.VMID)
+	return in.restartController(ctx, vm.VMID, s)
 }
 
 // sameVersion refuses to push a config to a controller that runs another parcon than this one: the config's format
@@ -109,7 +109,7 @@ func (in *Installer) sameVersion(ctx context.Context, vmid int) error {
 }
 
 // restartController restarts parcon.service if it runs, and waits for its scale set session.
-func (in *Installer) restartController(ctx context.Context, vmid int) error {
+func (in *Installer) restartController(ctx context.Context, vmid int, s *settings.Settings) error {
 	in.Change.Log(fmt.Sprintf("controller VM %d: systemctl try-restart parcon.service", vmid))
 	if in.Change.DryRun {
 		return nil
@@ -123,7 +123,7 @@ func (in *Installer) restartController(ctx context.Context, vmid int) error {
 		in.Out.Say("The controller isn't running yet; it gets the new config when parcon install starts it.")
 		return nil //nolint:nilerr // A controller that isn't enabled yet is fine.
 	}
-	if err := in.waitSession(ctx, vmid, restarted, 5*time.Minute); err != nil {
+	if err := in.waitSessions(ctx, vmid, s, restarted, 5*time.Minute); err != nil {
 		return err
 	}
 	in.Out.Say("The controller restarted with the new config and is listening for jobs.")

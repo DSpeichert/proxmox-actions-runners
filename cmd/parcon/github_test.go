@@ -115,7 +115,7 @@ func TestGitHubAppCreate(t *testing.T) {
 		t.Fatalf("outcome %s:\n%s", got, all)
 	}
 	if want := `{"clientId":"Iv23liEXAMPLE0000000","appId":123456,"slug":"par-runners-a1b2c3d4",` +
-		`"owner":"octocat","ownerType":"User"}` + "\n"; stdout != want {
+		`"owner":"octocat","ownerType":"User","keyFile":"` + key + `"}` + "\n"; stdout != want {
 		t.Errorf("stdout = %q, want %q", stdout, want)
 	}
 	if *calls != 1 {
@@ -167,6 +167,12 @@ func TestGitHubAppImport(t *testing.T) {
 		t.Fatalf("outcome %s, stdout %q:\n%s", got, stdout, all)
 	}
 	checkKeyFile(t, key)
+
+	// The key file is named by the App, so import needs to know which one.
+	got, _, all = runApp(t, testKeyPEM, "github", "app", "import")
+	if got != usageError || !strings.Contains(all, "-client-id or -key-file is required") {
+		t.Errorf("import without -client-id: outcome %s:\n%s", got, all)
+	}
 
 	other := t.TempDir()
 	got, _, all = runApp(t, "not a key", "github", "app", "import", "-key-file", filepath.Join(other, "github-app.pem"))

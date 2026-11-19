@@ -20,6 +20,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/klponce/proxmox-actions-runners/internal/config"
 	"github.com/klponce/proxmox-actions-runners/internal/hostsys"
 	"github.com/klponce/proxmox-actions-runners/internal/pvecli"
 	"github.com/klponce/proxmox-actions-runners/internal/release"
@@ -30,7 +31,9 @@ import (
 const (
 	tokenSecret  = "SENTINEL-token-secret"
 	manifestCode = "SENTINEL-manifest-code"
-	appKeyPEM    = "-----BEGIN RSA PRIVATE KEY-----\nSENTINEL-app-key\n-----END RSA PRIVATE KEY-----\n"
+	// userManifestCode makes the manifest flow create an App on the personal account octocat.
+	userManifestCode = "SENTINEL-user-manifest-code"
+	appKeyPEM        = "-----BEGIN RSA PRIVATE KEY-----\nSENTINEL-app-key\n-----END RSA PRIVATE KEY-----\n"
 )
 
 type fakeVM struct {
@@ -90,6 +93,10 @@ type fakeNode struct {
 	guest func(vm *fakeVM, argv []string, stdin []byte) (exit int, stdout, stderr string, handled bool)
 	// failOnce makes the first command whose line starts with a key fail.
 	failOnce map[string]bool
+	// apps are the Apps the manifest flow creates, by manifest code, and installations where they are installed,
+	// by account in lowercase; "" is what wait-installation finds without -account.
+	apps          map[string]fakeApp
+	installations map[string]installation
 
 	calls []pvecli.Cmd
 }
@@ -108,7 +115,27 @@ func newFakeNode(t *testing.T, sysNet string) *fakeNode {
 		routes:     `[{"dst":"default","dev":"vmbr0"},{"dst":"192.0.2.0/24","dev":"vmbr0"}]`,
 		offloadsOn: map[string]bool{},
 		failOnce:   map[string]bool{},
+		apps: map[string]fakeApp{
+			manifestCode: {ClientID: "Iv23liEXAMPLE", AppID: 1, Slug: "my-runners", Owner: "my-org",
+				OwnerType: "Organization"},
+			userManifestCode: {ClientID: "Iv23liUSER", AppID: 2, Slug: "octocat-runners", Owner: "octocat",
+				OwnerType: "User"},
+		},
+		installations: map[string]installation{
+			"":        {InstallationID: 7, Account: "my-org", AccountType: "Organization"},
+			"my-org":  {InstallationID: 7, Account: "my-org", AccountType: "Organization"},
+			"octocat": {InstallationID: 9, Account: "octocat", AccountType: "User", Repositories: []string{"hello", "world"}},
+		},
 	}
+}
+
+// fakeApp is what parcon github app create prints.
+type fakeApp struct {
+	ClientID  string `json:"clientId"`
+	AppID     int    `json:"appId"`
+	Slug      string `json:"slug"`
+	Owner     string `json:"owner"`
+	OwnerType string `json:"ownerType"`
 }
 
 func (n *fakeNode) Run(_ context.Context, c pvecli.Cmd) ([]byte, error) {
@@ -700,16 +727,34 @@ func (n *fakeNode) exec(vm *fakeVM, argv []string, stdin []byte) (int, string, s
 		line == "systemctl disable --now parcon.service":
 		return 0, "", ""
 	case line == "parcon github app create":
-		if strings.TrimSpace(string(stdin)) != manifestCode {
+		app, ok := n.apps[strings.TrimSpace(string(stdin))]
+		if !ok {
 			return 1, "", "bad code"
 		}
-		return 0, `{"clientId":"Iv23liEXAMPLE","appId":1,"slug":"my-runners","owner":"my-org","ownerType":"Organization"}`, ""
-	case line == "parcon github app import":
+		vm.files[config.AppKeyFile(app.ClientID)] = "key of " + app.ClientID
+		return 0, jsonOf(app), ""
+	case strings.HasPrefix(line, "parcon github app import -client-id "):
+		vm.files[config.AppKeyFile(argv[len(argv)-1])] = string(stdin)
 		return 0, "", ""
 	case strings.HasPrefix(line, "parcon github app wait-installation"):
-		return 0, `{"installationId":7,"account":"my-org","accountType":"Organization"}`, ""
-	case line == "parcon github scaleset delete":
-		return 0, "scale set proxmox-ubuntu-26.04: deleted (ID 3)\n", ""
+		account := ""
+		if i := slices.Index(argv, "-account"); i >= 0 {
+			account = strings.ToLower(argv[i+1])
+		}
+		inst, ok := n.installations[account]
+		if !ok {
+			return 1, "", "the GitHub App isn't installed after 15m"
+		}
+		return 0, jsonOf(inst), ""
+	case strings.HasPrefix(line, "parcon github scaleset delete"):
+		return 0, "https://github.com/my-org: scale set proxmox-ubuntu-26.04: deleted (ID 3)\n", ""
+	case argv[0] == "sh" && strings.Contains(line, "cp -p"):
+		// The App key's move: test -e "$2" || ! test -e "$1" || cp -p "$1" "$2".
+		src, dst := argv[len(argv)-2], argv[len(argv)-1]
+		if vm.files[dst] == "" && vm.files[src] != "" {
+			vm.files[dst] = vm.files[src]
+		}
+		return 0, "", ""
 	case line == "parcon version":
 		if v := vm.files["parcon-version"]; v != "" {
 			return 0, v + "\n", ""
@@ -723,7 +768,15 @@ func (n *fakeNode) exec(vm *fakeVM, argv []string, stdin []byte) (int, string, s
 		}
 		return 1, "", "cat: " + argv[1] + ": No such file or directory"
 	case argv[0] == "journalctl":
-		return 0, "starting\nscale set session opened\n", ""
+		// The controller logs JSON, and a line for each target's session once it is open.
+		out := `{"level":"INFO","msg":"starting"}` + "\n"
+		if cfg, err := config.Parse([]byte(vm.files[config.DefaultPath])); err == nil {
+			for _, t := range cfg.GitHub.Targets {
+				out += jsonOf(map[string]any{"level": "INFO", "msg": "scale set session opened",
+					"component": "github", "target": t.ConfigURL, "scaleSetId": 3}) + "\n"
+			}
+		}
+		return 0, out, ""
 	case argv[0] == "curl" && strings.Contains(line, "api.github.com"):
 		return 0, "", ""
 	case argv[0] == "curl", argv[0] == "timeout":

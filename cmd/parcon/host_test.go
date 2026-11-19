@@ -43,7 +43,7 @@ func TestSettingsFlags(t *testing.T) {
 	}
 	if s.Network.Bridge != "vmbr1" || s.Network.VLAN != 20 || s.Proxmox.VMIDRange != (config.VMIDRange{Start: 20000, End: 20099}) ||
 		!slices.Equal(s.ScaleSet.Labels, []string{"big", "linux"}) || s.ScaleSet.MaxRunners != 4 ||
-		s.Worker.MemoryMiB != 16384 || s.GitHub.ConfigURL != "https://github.com/my-org" || sf.clientID != "Iv23liEXAMPLE" {
+		s.Worker.MemoryMiB != 16384 || !slices.Equal(s.GitHub.Targets, []settings.Target{{URL: "https://github.com/my-org"}}) || sf.clientID != "Iv23liEXAMPLE" {
 		t.Errorf("settings = %+v", s)
 	}
 

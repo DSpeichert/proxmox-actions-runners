@@ -20,7 +20,7 @@ proxmox:
 github:
   apps:                            # one per organization or account; written by the installer's App setup
     - clientId: Iv23liEXAMPLE0000000
-      privateKeyFile: /etc/proxmox-actions-runners/github-app.pem
+      privateKeyFile: /etc/proxmox-actions-runners/github-app-Iv23liEXAMPLE0000000.pem
     - clientId: Iv23liEXAMPLE0000001
       privateKeyFile: /etc/proxmox-actions-runners/github-app-Iv23liEXAMPLE0000001.pem
   targets:                         # every scale set is registered with every target

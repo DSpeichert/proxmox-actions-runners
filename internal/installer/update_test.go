@@ -15,7 +15,11 @@ import (
 	"strings"
 	"testing"
 
+	"go.yaml.in/yaml/v3"
+
+	"github.com/klponce/proxmox-actions-runners/internal/config"
 	"github.com/klponce/proxmox-actions-runners/internal/release"
+	"github.com/klponce/proxmox-actions-runners/internal/settings"
 	"github.com/klponce/proxmox-actions-runners/internal/vmtags"
 )
 
@@ -173,4 +177,58 @@ func TestInstallOnAnOlderInstallUpdatesIt(t *testing.T) {
 		t.Errorf("output:\n%s", ti.stdout)
 	}
 	_ = errors.New
+}
+
+// Settings from a release before several targets are saved in the new format, and the one App's key moves to its
+// own path: copied first, removed only once the controller runs with the config that names the new path.
+func TestUpgradeMovesSettingsFromVersion2(t *testing.T) {
+	ti := installed(t)
+	data, err := os.ReadFile(ti.SettingsPath)
+	must(t, err)
+	var doc map[string]any
+	must(t, yaml.Unmarshal(data, &doc))
+	doc["version"] = 2
+	doc["github"] = map[string]any{"configUrl": "https://github.com/my-org",
+		"app": map[string]any{"clientId": "Iv23liEXAMPLE", "installationId": 7, "slug": "my-runners"}}
+	data, err = yaml.Marshal(doc)
+	must(t, err)
+	must(t, os.WriteFile(ti.SettingsPath, data, 0o600))
+	c := ti.controller(t)
+	newKey := config.AppKeyFile("Iv23liEXAMPLE")
+	delete(c.files, newKey)
+	c.files[config.LegacyAppKeyFile] = "the App's key"
+	ti.Yes = true
+
+	v, _ := release.ParseVersion("0.2.0")
+	must(t, ti.Upgrade(context.Background(), v, true, false))
+	if !strings.Contains(ti.stdout.String(), "in format 3, copy the GitHub App key to "+newKey) {
+		t.Errorf("plan:\n%s", ti.stdout)
+	}
+	s, err := settings.Load(ti.SettingsPath)
+	must(t, err)
+	if s.MigratedFrom() != 0 || len(s.GitHub.Targets) != 1 || s.GitHub.Apps[0].Owner != "my-org" {
+		t.Errorf("settings after the update = %+v", s.GitHub)
+	}
+	if c.files[newKey] != "the App's key" || c.files[config.LegacyAppKeyFile] != "" {
+		t.Errorf("keys after the update: new %q, old %q", c.files[newKey], c.files[config.LegacyAppKeyFile])
+	}
+	// The key is copied before the config naming it is pushed, and the old one removed only after the restart.
+	order := []string{"cp -p", "mv " + config.DefaultPath + ".new", "systemctl try-restart",
+		"rm -f " + config.LegacyAppKeyFile}
+	at := 0
+	for _, l := range ti.node.lines() {
+		if at < len(order) && strings.Contains(l, order[at]) {
+			at++
+		}
+	}
+	if at != len(order) {
+		t.Errorf("steps out of order, missing %q:\n%s", order[min(at, len(order)-1)], strings.Join(ti.node.lines(), "\n"))
+	}
+
+	// Done once, it isn't done again.
+	ti.stdout.Reset()
+	must(t, ti.Upgrade(context.Background(), v, true, false))
+	if !strings.Contains(ti.stdout.String(), "nothing needs updating") {
+		t.Errorf("second update:\n%s", ti.stdout)
+	}
 }

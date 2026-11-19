@@ -28,8 +28,9 @@ import (
 // the file has a different one, so the two are never confused.
 const DefaultPath = "/etc/proxmox-actions-runners/settings.yaml"
 
-// Version is the settings file's format version.
-const Version = 2
+// Version is the settings file's format version. Version 3 holds several GitHub Apps and targets; Parse migrates
+// version 2, which held one of each.
+const Version = 3
 
 // DHCP is the value of an address setting that asks for DHCP.
 const DHCP = "dhcp"
@@ -43,7 +44,14 @@ type Settings struct {
 	ScaleSet ScaleSet `yaml:"scaleSet"`
 	// Worker is the worker hardware the user set. A zero field means the GitHub-matching default in internal/config.
 	Worker config.Worker `yaml:"worker,omitempty"`
+
+	// migratedFrom is the version Parse migrated the file from, or 0.
+	migratedFrom int
 }
+
+// MigratedFrom returns the format version the settings were read in, if Parse migrated them, or 0. The file is
+// rewritten in the current format by the next command that saves the settings.
+func (s *Settings) MigratedFrom() int { return s.migratedFrom }
 
 // Network is the controller VM's LAN side, and the worker network.
 type Network struct {
@@ -68,18 +76,105 @@ type Proxmox struct {
 	VMIDRange config.VMIDRange `yaml:"vmidRange"`
 }
 
-// GitHub is the organization or repository the runners serve and the App they use, as learned during the install.
+// GitHub is the organizations and repositories the runners serve and the Apps they use, as learned during the install
+// and parcon target add.
 type GitHub struct {
-	ConfigURL string `yaml:"configUrl,omitempty"`
-	App       App    `yaml:"app,omitempty"`
+	// Apps are the GitHub Apps whose keys are in the controller VM. A private App can only be installed on the
+	// account that owns it, so there is one per organization or personal account.
+	Apps []App `yaml:"apps,omitempty"`
+	// Targets are the organizations and repositories the runners serve. The first is the one parcon install set up.
+	Targets []Target `yaml:"targets,omitempty"`
 }
 
-// App identifies the GitHub App. Its private key is only in the controller VM.
+// App identifies a GitHub App. Its private key is only in the controller VM.
 type App struct {
-	ClientID       string `yaml:"clientId,omitempty"`
-	InstallationID int64  `yaml:"installationId,omitempty"`
+	ClientID string `yaml:"clientId"`
 	// Slug is the App's name in its URLs, when parcon created it: it makes the App's install link.
 	Slug string `yaml:"slug,omitempty"`
+	// Owner is the organization or personal account the App belongs to and is installed on, once known.
+	Owner string `yaml:"owner,omitempty"`
+}
+
+// Target is an organization or repository the runners serve. ClientID and InstallationID are empty until the App
+// is set up and installed.
+type Target struct {
+	URL            string `yaml:"url"`
+	ClientID       string `yaml:"clientId,omitempty"`
+	InstallationID int64  `yaml:"installationId,omitempty"`
+}
+
+// Owner returns the organization or personal account the target belongs to.
+func (t Target) Owner() string {
+	owner, _, _ := config.ParseGitHubURL(t.URL)
+	return owner
+}
+
+// Key returns the target's key (config.TargetKey).
+func (t Target) Key() string { return config.TargetKey(t.URL) }
+
+// Complete reports whether the target has its App and installation.
+func (t Target) Complete() bool { return t.ClientID != "" && t.InstallationID != 0 }
+
+// Target returns the target for a URL, compared by key, or nil.
+func (g *GitHub) Target(url string) *Target {
+	key := config.TargetKey(url)
+	for i := range g.Targets {
+		if key != "" && g.Targets[i].Key() == key {
+			return &g.Targets[i]
+		}
+	}
+	return nil
+}
+
+// AppByID returns the App with a Client ID, or nil.
+func (g *GitHub) AppByID(clientID string) *App {
+	for i := range g.Apps {
+		if g.Apps[i].ClientID == clientID {
+			return &g.Apps[i]
+		}
+	}
+	return nil
+}
+
+// AppFor returns the App for an organization or personal account, compared as GitHub does, or nil: the App whose
+// owner it is, or the App of a target of that account.
+func (g *GitHub) AppFor(owner string) *App {
+	if owner == "" {
+		return nil
+	}
+	for i := range g.Apps {
+		if strings.EqualFold(g.Apps[i].Owner, owner) {
+			return &g.Apps[i]
+		}
+	}
+	for _, t := range g.Targets {
+		if t.ClientID != "" && strings.EqualFold(t.Owner(), owner) {
+			return g.AppByID(t.ClientID)
+		}
+	}
+	return nil
+}
+
+// TargetsOf returns the URLs of the targets an App serves.
+func (g *GitHub) TargetsOf(clientID string) []string {
+	var urls []string
+	for _, t := range g.Targets {
+		if t.ClientID == clientID {
+			urls = append(urls, t.URL)
+		}
+	}
+	return urls
+}
+
+// CompleteTargets returns the targets that have their App and installation, which the controller serves.
+func (g *GitHub) CompleteTargets() []Target {
+	var out []Target
+	for _, t := range g.Targets {
+		if t.Complete() {
+			out = append(out, t)
+		}
+	}
+	return out
 }
 
 // ScaleSet is the one scale set the installer creates.
@@ -143,13 +238,17 @@ func Parse(data []byte) (*Settings, error) {
 			"with the Proxmox firewall; run parcon uninstall, then parcon install")
 	}
 	var s Settings
-	dec := yaml.NewDecoder(bytes.NewReader(data))
-	dec.KnownFields(true)
-	if err := dec.Decode(&s); err != nil {
-		if errors.Is(err, io.EOF) {
-			return nil, errors.New("settings are empty")
+	if v.Version == 2 {
+		old, err := decodeStrict[settingsV2](data)
+		if err != nil {
+			return nil, err
 		}
-		return nil, fmt.Errorf("decode: %w", err)
+		s = old.migrate()
+	} else {
+		var err error
+		if s, err = decodeStrict[Settings](data); err != nil {
+			return nil, err
+		}
 	}
 	if s.Version != Version {
 		return nil, fmt.Errorf("version %d isn't supported; this parcon reads version %d", s.Version, Version)
@@ -162,6 +261,20 @@ func Parse(data []byte) (*Settings, error) {
 
 const header = "# parcon's settings for this node. Change them with `parcon config set KEY VALUE`, which also updates\n" +
 	"# the controller; see `parcon config get --all`.\n"
+
+// decodeStrict decodes one YAML document into a T, failing on unknown fields.
+func decodeStrict[T any](data []byte) (T, error) {
+	var out T
+	dec := yaml.NewDecoder(bytes.NewReader(data))
+	dec.KnownFields(true)
+	if err := dec.Decode(&out); err != nil {
+		if errors.Is(err, io.EOF) {
+			return out, errors.New("settings are empty")
+		}
+		return out, fmt.Errorf("decode: %w", err)
+	}
+	return out, nil
+}
 
 // Marshal encodes the settings as the file parcon writes.
 func (s *Settings) Marshal() ([]byte, error) {
@@ -206,6 +319,7 @@ var (
 	runnerGroupPattern = regexp.MustCompile(`^[A-Za-z0-9._ -]+$`)
 	githubURLPattern   = regexp.MustCompile(`^https://github\.com/[A-Za-z0-9-]+(/[A-Za-z0-9._-]+)?$`)
 	slugPattern        = regexp.MustCompile(`^[a-z0-9][a-z0-9-]*$`)
+	loginPattern       = regexp.MustCompile(`^[A-Za-z0-9-]+$`)
 )
 
 // DHCPLeases is how many addresses a worker subnet's DHCP range holds: all but the network address, the host's
@@ -262,18 +376,47 @@ func (s *Settings) Validate() error {
 	}
 
 	g := s.GitHub
-	if g.ConfigURL != "" && !githubURLPattern.MatchString(g.ConfigURL) {
-		add("github.configUrl", "%q must be https://github.com/<org> or https://github.com/<owner>/<repo>",
-			g.ConfigURL)
+	apps := map[string]bool{}
+	for i, a := range g.Apps {
+		field := fmt.Sprintf("github.apps[%d]", i)
+		if !labelPattern.MatchString(a.ClientID) {
+			add(field+".clientId", "%q is not a Client ID", a.ClientID)
+		} else if apps[a.ClientID] {
+			add(field+".clientId", "%s is listed twice", a.ClientID)
+		}
+		apps[a.ClientID] = true
+		if a.Slug != "" && !slugPattern.MatchString(a.Slug) {
+			add(field+".slug", "%q is not an App's slug", a.Slug)
+		}
+		if a.Owner != "" && !loginPattern.MatchString(a.Owner) {
+			add(field+".owner", "%q is not a GitHub account", a.Owner)
+		}
 	}
-	if g.App.ClientID != "" && !labelPattern.MatchString(g.App.ClientID) {
-		add("github.app.clientId", "%q is not a Client ID", g.App.ClientID)
-	}
-	if g.App.Slug != "" && !slugPattern.MatchString(g.App.Slug) {
-		add("github.app.slug", "%q is not an App's slug", g.App.Slug)
-	}
-	if g.App.InstallationID < 0 {
-		add("github.app.installationId", "must not be negative")
+	targets := map[string]bool{}
+	installations := map[string]int64{} // by App and owner
+	for i, t := range g.Targets {
+		field := fmt.Sprintf("github.targets[%d]", i)
+		if !githubURLPattern.MatchString(t.URL) {
+			add(field+".url", "%q must be https://github.com/<org> or https://github.com/<owner>/<repo>", t.URL)
+		} else if targets[t.Key()] {
+			add(field+".url", "%s is listed twice", t.URL)
+		}
+		targets[t.Key()] = true
+		if t.ClientID != "" && !apps[t.ClientID] {
+			add(field+".clientId", "%q isn't one of github.apps", t.ClientID)
+		}
+		if t.InstallationID < 0 {
+			add(field+".installationId", "must not be negative")
+		}
+		// An App has one installation per account, which all of the account's targets share.
+		if t.InstallationID > 0 {
+			k := t.ClientID + "/" + strings.ToLower(t.Owner())
+			if id, ok := installations[k]; ok && id != t.InstallationID {
+				add(field+".installationId", "%d differs from %d, the App's installation on %s", t.InstallationID, id,
+					t.Owner())
+			}
+			installations[k] = t.InstallationID
+		}
 	}
 
 	ss := s.ScaleSet
@@ -286,11 +429,10 @@ func (s *Settings) Validate() error {
 			add("scaleSet.labels", "%q must be letters, digits, '.', '_', or '-'", l)
 		}
 	}
+	// A repository's scale sets use the default runner group whatever this says (config.ScaleSet.RunnerGroupFor), so
+	// organizations and repositories can be served together.
 	if !runnerGroupPattern.MatchString(ss.RunnerGroup) {
 		add("scaleSet.runnerGroup", "%q has characters a runner group can't have", ss.RunnerGroup)
-	} else if g.ConfigURL != "" && (config.Target{ConfigURL: g.ConfigURL}).IsRepository() &&
-		ss.RunnerGroup != config.DefaultRunnerGroup {
-		add("scaleSet.runnerGroup", "repository runners must use the runner group %q", config.DefaultRunnerGroup)
 	}
 	if l := ss.MaxLifetime; l != 0 && (l < config.MinMaxLifetime || l > config.MaxMaxLifetime) {
 		add("scaleSet.maxLifetime", "%s must be %s to %s", l, config.FormatLifetime(config.MinMaxLifetime),

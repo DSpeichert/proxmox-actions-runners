@@ -78,13 +78,14 @@ func parseHostFlags(fs *flag.FlagSet, args []string, stderr io.Writer) error {
 
 // settingsFlags are install's flags for the host settings.
 type settingsFlags struct {
-	s        settings.Settings
-	vmids    string
-	labels   string
-	set      []string
-	given    bool
-	app      string
-	clientID string
+	s         settings.Settings
+	vmids     string
+	labels    string
+	githubURL string
+	set       []string
+	given     bool
+	app       string
+	clientID  string
 }
 
 func (f *settingsFlags) register(fs *flag.FlagSet) {
@@ -105,7 +106,7 @@ func (f *settingsFlags) register(fs *flag.FlagSet) {
 	fs.StringVar(&f.labels, "labels", "", "comma-separated runs-on labels (default: the scale set name)")
 	fs.StringVar(&ss.RunnerGroup, "runner-group", ss.RunnerGroup, "GitHub runner group; repositories must use default")
 	fs.IntVar(&ss.MinRunners, "min-runners", ss.MinRunners, "idle workers to keep booted")
-	fs.StringVar(&f.s.GitHub.ConfigURL, "github-url", "", "the organization or repository the App must be "+
+	fs.StringVar(&f.githubURL, "github-url", "", "the organization or repository the App must be "+
 		"installed on, as https://github.com/<org> or https://github.com/<owner>/<repo> (default: where you "+
 		"install the App)")
 	fs.Func("set", "a config key's value, as KEY=VALUE (see parcon config describe); repeat for more",
@@ -132,7 +133,9 @@ func (f *settingsFlags) settings(fs *flag.FlagSet, limits settings.Limits) (*set
 	if f.labels != "" {
 		f.s.ScaleSet.Labels = strings.Split(f.labels, ",")
 	}
-	f.s.GitHub.ConfigURL = strings.TrimSuffix(f.s.GitHub.ConfigURL, "/")
+	if f.githubURL != "" {
+		f.s.GitHub.Targets = []settings.Target{{URL: strings.TrimSuffix(f.githubURL, "/")}}
+	}
 	for _, kv := range f.set {
 		key, value, ok := strings.Cut(kv, "=")
 		if !ok {

@@ -63,6 +63,8 @@ func (ti *testInstaller) answerManifest() { ti.Term = &linkAnswerer{ti: ti} }
 type linkAnswerer struct {
 	ti      *testInstaller
 	prompts []string
+	// code is the manifest code the page shows; empty means manifestCode.
+	code string
 }
 
 var stateInLink = regexp.MustCompile(`\?state=([A-Za-z0-9_-]+)`)
@@ -73,11 +75,20 @@ func (l *linkAnswerer) Confirm(q string) (bool, error) {
 }
 func (l *linkAnswerer) Line(p string) (string, error) {
 	l.prompts = append(l.prompts, p)
-	m := stateInLink.FindStringSubmatch(l.ti.stdout.String())
+	all := stateInLink.FindAllStringSubmatch(l.ti.stdout.String(), -1)
+	var m []string
+	for _, a := range all {
+		m = append(m, a[1])
+	}
 	if m == nil {
 		return "", errors.New("no link printed")
 	}
-	return m[1] + "." + manifestCode, nil
+	code := l.code
+	if code == "" {
+		code = manifestCode
+	}
+	// The newest link is the one the question is about.
+	return m[len(m)-1] + "." + code, nil
 }
 func (l *linkAnswerer) PEM(p string) (string, error) {
 	l.prompts = append(l.prompts, p)
@@ -91,7 +102,7 @@ func (l *linkAnswerer) Choose(p string, _ []string) (int, error) {
 // assertNoSecrets checks that no secret reached a command line, the output, or the host's files.
 func (ti *testInstaller) assertNoSecrets(t *testing.T, errs ...error) {
 	t.Helper()
-	secrets := []string{tokenSecret, manifestCode, "SENTINEL-app-key"}
+	secrets := []string{tokenSecret, manifestCode, userManifestCode, "SENTINEL-app-key"}
 	for _, l := range ti.node.lines() {
 		for _, s := range secrets {
 			if strings.Contains(l, s) {
@@ -154,9 +165,12 @@ func TestInstall(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if s.GitHub.ConfigURL != "https://github.com/my-org" || s.GitHub.App.ClientID != "Iv23liEXAMPLE" ||
-		s.GitHub.App.InstallationID != 7 {
-		t.Errorf("settings github = %+v", s.GitHub)
+	wantGitHub := settings.GitHub{
+		Apps:    []settings.App{{ClientID: "Iv23liEXAMPLE", Slug: "my-runners", Owner: "my-org"}},
+		Targets: []settings.Target{{URL: "https://github.com/my-org", ClientID: "Iv23liEXAMPLE", InstallationID: 7}},
+	}
+	if !reflect.DeepEqual(s.GitHub, wantGitHub) || s.Version != settings.Version {
+		t.Errorf("settings github = %+v, want %+v", s.GitHub, wantGitHub)
 	}
 	// The installation is looked up on the account that owns the new App, never taken on trust.
 	if !slices.ContainsFunc(ti.node.lines(), func(l string) bool {
@@ -303,7 +317,7 @@ func TestInstallContinuesWithTheSameApp(t *testing.T) {
 		t.Fatalf("first Install = %v", err)
 	}
 	s, err := settings.Load(ti.SettingsPath)
-	if err != nil || s.GitHub.App.ClientID != "Iv23liEXAMPLE" {
+	if err != nil || len(s.GitHub.Apps) != 1 || s.GitHub.Apps[0].ClientID != "Iv23liEXAMPLE" {
 		t.Fatalf("settings after the first run: %+v, %v", s, err)
 	}
 
@@ -356,15 +370,17 @@ func TestInstallWithAnExistingApp(t *testing.T) {
 	}
 	var imported bool
 	for _, c := range ti.node.calls {
-		if strings.HasSuffix(c.String(), "parcon github app import") && string(c.Stdin) == appKeyPEM {
+		if strings.HasSuffix(c.String(), "parcon github app import -client-id Iv23liEXISTING") &&
+			string(c.Stdin) == appKeyPEM {
 			imported = true
 		}
 	}
 	if !imported {
 		t.Error("the key wasn't imported on stdin")
 	}
-	if s, _ := settings.Load(ti.SettingsPath); s.GitHub.App.ClientID != "Iv23liEXISTING" {
-		t.Errorf("client ID = %q", s.GitHub.App.ClientID)
+	if s, _ := settings.Load(ti.SettingsPath); len(s.GitHub.Apps) != 1 || s.GitHub.Apps[0].ClientID != "Iv23liEXISTING" ||
+		s.GitHub.Apps[0].Owner != "my-org" {
+		t.Errorf("apps = %+v, want the existing App, owned by where it is installed", s.GitHub.Apps)
 	}
 	// Without --github-url, the owner of an existing App is unknown, so wait-installation is left to refuse an App
 	// installed on several accounts.
@@ -513,8 +529,8 @@ func TestInstallEndsWithTheAppsInstallLink(t *testing.T) {
 	if !slices.Equal(shown, []string{link, link}) {
 		t.Errorf("last line while waiting = %q, want the link", shown)
 	}
-	if s, _ := settings.Load(ti.SettingsPath); s.GitHub.App.Slug != "my-runners" {
-		t.Errorf("slug = %q", s.GitHub.App.Slug)
+	if s, _ := settings.Load(ti.SettingsPath); s.GitHub.Apps[0].Slug != "my-runners" {
+		t.Errorf("slug = %q", s.GitHub.Apps[0].Slug)
 	}
 }
 

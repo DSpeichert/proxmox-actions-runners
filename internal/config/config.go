@@ -28,11 +28,15 @@ const (
 	DefaultPath = Dir + "/config.yaml"
 	// TokenSecretFile holds the Proxmox API token's secret.
 	TokenSecretFile = Dir + "/pve-token"
-	// AppKeyFile holds the GitHub App's private key.
-	AppKeyFile = Dir + "/github-app.pem"
+	// LegacyAppKeyFile held the one GitHub App's private key before several Apps; parcon update moves it to
+	// AppKeyFile.
+	LegacyAppKeyFile = Dir + "/github-app.pem"
 	// CACertFile is a copy of the node's CA, when the API serves the node's own certificate.
 	CACertFile = Dir + "/pve-ca.pem"
 )
+
+// AppKeyFile returns where a GitHub App's private key is kept, by its Client ID.
+func AppKeyFile(clientID string) string { return Dir + "/github-app-" + clientID + ".pem" }
 
 // Config is the controller's whole configuration.
 type Config struct {

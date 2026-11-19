@@ -367,7 +367,8 @@ func (in *Installer) controllerStatus(ctx context.Context, vm proxmox.VM, s *set
 		st.Findings = append(st.Findings, Finding{OK, "its config matches the settings"})
 	}
 
-	out, err := in.guest(ctx, vm.VMID, "cat", controller.StatusPath)
+	// The status file is in parcon's runtime directory, so it is read as parcon.
+	out, err := in.guest(ctx, vm.VMID, "runuser", "-u", "parcon", "--", "cat", controller.StatusPath)
 	if err != nil {
 		return st, nil
 	}
@@ -385,30 +386,48 @@ func (in *Installer) controllerStatus(ctx context.Context, vm proxmox.VM, s *set
 }
 
 func githubFindings(s *settings.Settings, snap *controller.Status, now time.Time) []Finding {
-	if s.GitHub.App.ClientID == "" || s.GitHub.App.InstallationID == 0 {
+	if len(s.GitHub.Targets) == 0 {
 		return []Finding{{FAIL, "the GitHub App isn't set up yet; run parcon install"}}
 	}
-	f := []Finding{{OK, fmt.Sprintf("%s, App %s, installation %d", s.GitHub.ConfigURL, s.GitHub.App.ClientID,
-		s.GitHub.App.InstallationID)}}
-	if snap == nil {
-		return append(f, Finding{WARN, "the controller reports no status yet"})
+	var f []Finding
+	for _, t := range s.GitHub.Targets {
+		if !t.Complete() {
+			f = append(f, Finding{FAIL, fmt.Sprintf("%s: its App isn't installed yet; run parcon target add "+
+				"--github-url %s", t.URL, t.URL)})
+			continue
+		}
+		f = append(f, Finding{OK, fmt.Sprintf("%s, App %s, installation %d", t.URL, t.ClientID, t.InstallationID)})
+		if snap == nil {
+			continue
+		}
+		for _, ss := range snap.ScaleSets {
+			if ss.TargetKey != t.Key() {
+				continue
+			}
+			f = append(f, scaleSetFindings(ss, now)...)
+		}
 	}
-	for _, ss := range snap.ScaleSets {
-		switch {
-		case ss.SessionOpen:
-			f = append(f, Finding{OK, fmt.Sprintf("scale set %s (ID %d): listening for jobs for %s", ss.Name, ss.ID,
-				ago(now.Sub(ss.SessionSince)))})
-		case ss.SessionError != "":
-			f = append(f, Finding{FAIL, fmt.Sprintf("scale set %s: no session with GitHub since %s ago: %s", ss.Name,
-				ago(now.Sub(ss.SessionSince)), ss.SessionError)})
-		default:
-			f = append(f, Finding{WARN, fmt.Sprintf("scale set %s: no session with GitHub yet", ss.Name)})
-		}
-		if st := ss.Stats; st != nil {
-			f = append(f, Finding{OK, fmt.Sprintf("  jobs: %d waiting, %d running; runners: %d (%d busy, %d idle)",
-				st.AvailableJobs+st.AcquiredJobs, st.RunningJobs, st.RegisteredRunners, st.BusyRunners,
-				st.IdleRunners)})
-		}
+	if snap == nil {
+		f = append(f, Finding{WARN, "the controller reports no status yet"})
+	}
+	return f
+}
+
+func scaleSetFindings(ss controller.ScaleSetStatus, now time.Time) []Finding {
+	var f []Finding
+	switch {
+	case ss.SessionOpen:
+		f = append(f, Finding{OK, fmt.Sprintf("  scale set %s (ID %d): listening for jobs for %s", ss.Name, ss.ID,
+			ago(now.Sub(ss.SessionSince)))})
+	case ss.SessionError != "":
+		f = append(f, Finding{FAIL, fmt.Sprintf("  scale set %s: no session with GitHub since %s ago: %s", ss.Name,
+			ago(now.Sub(ss.SessionSince)), ss.SessionError)})
+	default:
+		f = append(f, Finding{WARN, fmt.Sprintf("  scale set %s: no session with GitHub yet", ss.Name)})
+	}
+	if st := ss.Stats; st != nil {
+		f = append(f, Finding{OK, fmt.Sprintf("    jobs: %d waiting, %d running; runners: %d (%d busy, %d idle)",
+			st.AvailableJobs+st.AcquiredJobs, st.RunningJobs, st.RegisteredRunners, st.BusyRunners, st.IdleRunners)})
 	}
 	return f
 }
