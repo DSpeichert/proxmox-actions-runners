@@ -175,7 +175,7 @@ func (c *Controller) runnerCheckDue(vmid int, now time.Time) bool {
 // scale creates or retires workers so the scale set has as many as GitHub wants.
 func (c *Controller) scale(ctx context.Context, s *scaleSetState, v view, now time.Time) {
 	target, known := s.target()
-	if !known || s.id == 0 {
+	if !known || s.scaleSetID() == 0 {
 		return
 	}
 

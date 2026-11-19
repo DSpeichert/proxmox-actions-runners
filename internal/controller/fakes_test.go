@@ -330,8 +330,10 @@ type fakeGitHub struct {
 	busy      map[string]bool
 	jitErr    error
 	ensureErr []error
-	handlers  chan github.Handler
-	removed   []string
+	// refuse makes registering the scale sets named in it fail every time.
+	refuse   map[string]bool
+	handlers chan github.Handler
+	removed  []string
 	// latest is the latest actions/runner release; releaseErr fails the lookup. releaseCalls counts lookups.
 	latest       github.RunnerRelease
 	releaseErr   error
@@ -368,6 +370,9 @@ func newFakeGitHub() *fakeGitHub {
 func (f *fakeGitHub) EnsureScaleSet(_ context.Context, spec github.ScaleSetSpec) (github.ScaleSet, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.refuse[spec.Name] {
+		return github.ScaleSet{}, fmt.Errorf("scale set %s: 403 Forbidden", spec.Name)
+	}
 	if len(f.ensureErr) > 0 {
 		err := f.ensureErr[0]
 		f.ensureErr = f.ensureErr[1:]
@@ -486,7 +491,7 @@ func newHarness(t *testing.T, cfg *config.Config) *harness {
 	}
 	c.agentPoll = time.Millisecond
 	for _, s := range c.scaleSets {
-		s.id = testScaleSetID
+		s.setScaleSetID(testScaleSetID)
 	}
 	h.c = c
 	return h

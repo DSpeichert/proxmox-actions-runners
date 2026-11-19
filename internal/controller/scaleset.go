@@ -15,10 +15,10 @@ import (
 type scaleSetState struct {
 	cfg  config.ScaleSet
 	wake func()
-	// id is GitHub's ID for the scale set, set once before the listener starts.
-	id int
 
 	mu sync.Mutex
+	// id is GitHub's ID for the scale set, 0 until it is registered.
+	id int
 	// desired is how many workers GitHub's last message calls for, once known is true. Until the first message the
 	// controller neither adds nor retires workers, so a restart doesn't disturb running ones.
 	desired int
@@ -92,6 +92,19 @@ func (s *scaleSetState) JobCompleted(_ context.Context, job github.Job) error {
 	s.mu.Unlock()
 	s.wake()
 	return nil
+}
+
+// scaleSetID returns GitHub's ID for the scale set, or 0 if it isn't registered yet.
+func (s *scaleSetState) scaleSetID() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.id
+}
+
+func (s *scaleSetState) setScaleSetID(id int) {
+	s.mu.Lock()
+	s.id = id
+	s.mu.Unlock()
 }
 
 // target returns the desired worker count and whether it is known yet.

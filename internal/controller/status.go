@@ -57,7 +57,7 @@ func (c *Controller) countWorkers(v view) {
 	defer c.mu.Unlock()
 	c.status.ScaleSets = c.status.ScaleSets[:0]
 	for name, s := range c.scaleSets {
-		ss := ScaleSetStatus{Name: name, ID: s.id}
+		ss := ScaleSetStatus{Name: name, ID: s.scaleSetID()}
 		for _, w := range v.workers[name] {
 			ss.Workers++
 			if w.ready {

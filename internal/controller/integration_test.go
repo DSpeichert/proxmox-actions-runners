@@ -262,7 +262,7 @@ func (h *live) controller() *Controller {
 		h.t.Fatalf("New: %v", err)
 	}
 	for _, s := range c.scaleSets {
-		s.id = testScaleSetID
+		s.setScaleSetID(testScaleSetID)
 	}
 	return c
 }

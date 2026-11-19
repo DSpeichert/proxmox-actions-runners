@@ -617,7 +617,7 @@ func TestRunRegistersListensAndLeavesWorkersOnShutdown(t *testing.T) {
 	h.c.resync = 10 * time.Millisecond
 	h.pve.addTemplate(testTemplateID, 1)
 	for _, s := range h.c.scaleSets {
-		s.id = 0 // Run must learn it
+		s.setScaleSetID(0) // Run must learn it
 	}
 	h.gh.ensureErr = []error{errors.New("GitHub is down")}
 
@@ -631,8 +631,8 @@ func TestRunRegistersListensAndLeavesWorkersOnShutdown(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("Run never started listening")
 	}
-	if h.c.scaleSets[testScaleSet].id != testScaleSetID {
-		t.Errorf("scale set ID = %d, want %d", h.c.scaleSets[testScaleSet].id, testScaleSetID)
+	if h.c.scaleSets[testScaleSet].scaleSetID() != testScaleSetID {
+		t.Errorf("scale set ID = %d, want %d", h.c.scaleSets[testScaleSet].scaleSetID(), testScaleSetID)
 	}
 	if _, err := handler.DesiredRunners(ctx, 1); err != nil {
 		t.Fatal(err)
@@ -656,6 +656,37 @@ func TestRunRegistersListensAndLeavesWorkersOnShutdown(t *testing.T) {
 	}
 	if n := len(h.readyWorkers()); n != 1 {
 		t.Errorf("%d workers after shutdown, want the running one left alone", n)
+	}
+}
+
+func TestRunServesScaleSetsThatRegisterWhileAnotherCant(t *testing.T) {
+	refused := testScaleSetConfig()
+	refused.Name, refused.Labels = "refused", []string{"refused"}
+	h := newHarness(t, testConfig(testScaleSetConfig(), refused))
+	h.c.resync = 10 * time.Millisecond
+	for _, s := range h.c.scaleSets {
+		s.setScaleSetID(0)
+	}
+	h.gh.refuse = map[string]bool{"refused": true}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- h.c.Run(ctx) }()
+	select {
+	case <-h.gh.handlers:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the scale set GitHub accepts never started listening")
+	}
+	if id := h.c.scaleSets[testScaleSet].scaleSetID(); id != testScaleSetID {
+		t.Errorf("scale set ID = %d, want %d", id, testScaleSetID)
+	}
+	if id := h.c.scaleSets["refused"].scaleSetID(); id != 0 {
+		t.Errorf("refused scale set ID = %d, want 0", id)
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("Run: %v", err)
 	}
 }
 

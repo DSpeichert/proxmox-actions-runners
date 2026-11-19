@@ -193,20 +193,18 @@ func (c *Controller) trigger() {
 	}
 }
 
-// Run registers the scale sets with GitHub, listens to their message sessions, and reconciles until ctx ends. On
-// the way out it waits for VM operations in flight to finish, but leaves running workers alone: a restarted
-// controller adopts them, so a controller upgrade doesn't cancel jobs.
+// Run registers each scale set with GitHub and listens to its message session, and reconciles until ctx ends. Each
+// scale set is served on its own, so one that GitHub refuses doesn't hold up the others, and the loop runs from the
+// start: it only creates workers for a scale set once that is registered. On the way out it waits for VM operations
+// in flight to finish, but leaves running workers alone: a restarted controller adopts them, so a controller upgrade
+// doesn't cancel jobs.
 func (c *Controller) Run(ctx context.Context) error {
-	if !c.registerScaleSets(ctx) {
-		return nil
-	}
-
 	var listeners sync.WaitGroup
 	for _, s := range c.scaleSets {
 		listeners.Add(1)
 		go func() {
 			defer listeners.Done()
-			c.gh.Listen(ctx, github.ListenOptions{ScaleSetID: s.id, MaxRunners: s.cfg.MaxRunners, Owner: c.owner}, s)
+			c.serve(ctx, s)
 		}()
 	}
 
@@ -232,29 +230,35 @@ func (c *Controller) Run(ctx context.Context) error {
 	}
 }
 
-// registerScaleSets makes sure each scale set exists in GitHub and learns its ID, retrying until ctx ends, because
-// GitHub may be unreachable while the controller VM boots. It reports false if ctx ended first.
-func (c *Controller) registerScaleSets(ctx context.Context) bool {
-	for _, s := range c.scaleSets {
-		backoff := time.Second
-		for {
-			ss, err := c.gh.EnsureScaleSet(ctx, github.ScaleSetSpec{Name: s.cfg.Name, Labels: s.cfg.Labels,
-				RunnerGroup: s.cfg.RunnerGroup})
-			if err == nil {
-				s.id = ss.ID
-				c.logger.InfoContext(ctx, "scale set registered", slog.String("scaleSet", s.cfg.Name),
-					slog.Int("scaleSetId", ss.ID))
-				break
-			}
-			c.logger.WarnContext(ctx, "registering scale set failed; retrying", slog.String("scaleSet", s.cfg.Name),
-				slog.Duration("backoff", backoff), slog.String("error", err.Error()))
-			if !sleep(ctx, backoff) {
-				return false
-			}
-			backoff = min(backoff*2, time.Minute)
-		}
+// serve registers a scale set and then listens to its message session until ctx ends.
+func (c *Controller) serve(ctx context.Context, s *scaleSetState) {
+	if !c.register(ctx, s) {
+		return
 	}
-	return true
+	c.trigger()
+	c.gh.Listen(ctx, github.ListenOptions{ScaleSetID: s.scaleSetID(), MaxRunners: s.cfg.MaxRunners, Owner: c.owner}, s)
+}
+
+// register makes sure a scale set exists in GitHub and learns its ID, retrying until ctx ends, because GitHub may be
+// unreachable while the controller VM boots. It reports false if ctx ended first.
+func (c *Controller) register(ctx context.Context, s *scaleSetState) bool {
+	backoff := time.Second
+	for {
+		ss, err := c.gh.EnsureScaleSet(ctx, github.ScaleSetSpec{Name: s.cfg.Name, Labels: s.cfg.Labels,
+			RunnerGroup: s.cfg.RunnerGroup})
+		if err == nil {
+			s.setScaleSetID(ss.ID)
+			c.logger.InfoContext(ctx, "scale set registered", slog.String("scaleSet", s.cfg.Name),
+				slog.Int("scaleSetId", ss.ID))
+			return true
+		}
+		c.logger.WarnContext(ctx, "registering scale set failed; retrying", slog.String("scaleSet", s.cfg.Name),
+			slog.Duration("backoff", backoff), slog.String("error", err.Error()))
+		if !sleep(ctx, backoff) {
+			return false
+		}
+		backoff = min(backoff*2, time.Minute)
+	}
 }
 
 // waitForOps waits up to timeout for VM operations in flight.

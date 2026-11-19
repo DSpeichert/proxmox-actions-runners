@@ -303,7 +303,7 @@ func (c *Controller) create(ctx context.Context, s *scaleSetState, template prox
 	}
 
 	ghCtx, cancel := c.withGitHubTimeout(ctx)
-	jit, err := c.gh.GenerateJITConfig(ghCtx, s.id, name)
+	jit, err := c.gh.GenerateJITConfig(ghCtx, s.scaleSetID(), name)
 	cancel()
 	if err != nil {
 		return fmt.Errorf("register runner: %w", err)
