@@ -34,6 +34,10 @@ const (
 const (
 	// ScaleSetPrefix is followed by a worker's scale set name.
 	ScaleSetPrefix = "par-ss-"
+	// TargetPrefix is followed by the key of the organization or repository a worker's scale set serves
+	// (config.TargetKey). Every target has a scale set of the same name, so the two tags together say which one a
+	// worker belongs to. Workers from before several targets lack it and belong to the first target.
+	TargetPrefix = "par-tg-"
 	// CreatedPrefix is followed by a worker's creation time in Unix seconds.
 	CreatedPrefix = "par-created-"
 	// TemplateRefPrefix is followed by the VMID of the template a worker was cloned from. Linked clones depend on

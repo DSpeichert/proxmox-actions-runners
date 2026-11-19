@@ -7,6 +7,8 @@ package config
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -141,6 +143,29 @@ type GitHub struct {
 func (g GitHub) IsRepository() bool {
 	_, repo, err := ParseGitHubURL(g.ConfigURL)
 	return err == nil && repo != ""
+}
+
+// maxTargetKey is the longest TargetKey, so the worker tag that carries it stays well within what Proxmox accepts.
+const maxTargetKey = 48
+
+// TargetKey returns a short, stable name for the organization or repository a GitHub URL names, for VM tags and logs:
+// the owner, or owner.repo, in lowercase, as GitHub compares them. GitHub logins and repository names use only
+// letters, digits, '.', '_', and '-', all allowed in a Proxmox tag. A key longer than 48 characters is cut short and
+// ends with a hash of the whole, so it stays unique. A URL ParseGitHubURL rejects has no key.
+func TargetKey(raw string) string {
+	owner, repo, err := ParseGitHubURL(raw)
+	if err != nil {
+		return ""
+	}
+	key := strings.ToLower(owner)
+	if repo != "" {
+		key += "." + strings.ToLower(repo)
+	}
+	if len(key) > maxTargetKey {
+		sum := sha256.Sum256([]byte(key))
+		key = key[:maxTargetKey-9] + "-" + hex.EncodeToString(sum[:4])
+	}
+	return key
 }
 
 // ParseGitHubURL splits https://github.com/<org> or https://github.com/<owner>/<repo>, with or without a trailing

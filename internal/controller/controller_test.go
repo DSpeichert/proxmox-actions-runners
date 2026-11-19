@@ -18,7 +18,7 @@ import (
 
 func TestWorkerNamingRoundTrip(t *testing.T) {
 	created := testStart
-	vm := proxmox.VM{VMID: 10003, Tags: workerTags("proxmox-ubuntu-26.04", created, testTemplateID, true)}
+	vm := proxmox.VM{VMID: 10003, Tags: workerTags(key("proxmox-ubuntu-26.04"), created, testTemplateID, true)}
 	w, err := parseWorker(vm)
 	if err != nil {
 		t.Fatalf("parseWorker: %v", err)
@@ -191,7 +191,7 @@ func TestFinishedWorkerIsReplaced(t *testing.T) {
 
 	// The runner takes a job, finishes it, and the VM powers itself off.
 	ctx := context.Background()
-	s := h.c.scaleSets[testScaleSet]
+	s := h.c.scaleSets[key(testScaleSet)]
 	_ = s.JobStarted(ctx, github.Job{RunnerName: name, JobID: "job-1"})
 	_ = s.JobCompleted(ctx, github.Job{RunnerName: name, JobID: "job-1"})
 	// GitHub hasn't caught up yet and still reports the runner busy; the VM is off, so it goes anyway.
@@ -240,7 +240,7 @@ func TestScaleDownRetiresOldestIdleWorkers(t *testing.T) {
 	// The oldest runner is busy by GitHub's account but the controller missed the JobStarted message.
 	h.gh.setBusy(h.nameOf(ids[0]), true)
 	// The second is busy and the controller knows it.
-	_ = h.c.scaleSets[testScaleSet].JobStarted(context.Background(), github.Job{RunnerName: h.nameOf(ids[1])})
+	_ = h.c.scaleSets[key(testScaleSet)].JobStarted(context.Background(), github.Job{RunnerName: h.nameOf(ids[1])})
 
 	h.want(1)
 	h.pass()
@@ -280,8 +280,8 @@ func TestHalfCreatedWorkersAreDestroyed(t *testing.T) {
 	created := testStart.Add(-time.Minute)
 
 	// A worker left unready by a crash, and one whose runner already took a job before the crash.
-	idle := proxmox.VM{VMID: 10000, Pool: testPool, Status: "running", Tags: workerTags(testScaleSet, created, testTemplateID, false)}
-	working := proxmox.VM{VMID: 10001, Pool: testPool, Status: "running", Tags: workerTags(testScaleSet, created, testTemplateID, false)}
+	idle := proxmox.VM{VMID: 10000, Pool: testPool, Status: "running", Tags: workerTags(key(testScaleSet), created, testTemplateID, false)}
+	working := proxmox.VM{VMID: 10001, Pool: testPool, Status: "running", Tags: workerTags(key(testScaleSet), created, testTemplateID, false)}
 	h.pve.add(idle)
 	h.pve.add(working)
 	workingName := workerName(10001, created)
@@ -312,7 +312,7 @@ func TestOnlyOwnedVMsAreTouched(t *testing.T) {
 		// The installer's smoke-test clone, in the reserved IDs.
 		{VMID: 10008, Pool: testPool, Status: "running", Tags: []string{vmtags.Managed, vmtags.Build}},
 		// A stopped worker of another pool.
-		{VMID: 10003, Pool: "other", Tags: workerTags(testScaleSet, testStart, testTemplateID, true)},
+		{VMID: 10003, Pool: "other", Tags: workerTags(key(testScaleSet), testStart, testTemplateID, true)},
 	}
 	for _, vm := range vms {
 		h.pve.add(vm)
@@ -328,8 +328,8 @@ func TestOnlyOwnedVMsAreTouched(t *testing.T) {
 
 func TestRemovedScaleSet(t *testing.T) {
 	h := newHarness(t, testConfig())
-	gone := proxmox.VM{VMID: 10000, Pool: testPool, Status: "running", Tags: workerTags("old", testStart, testTemplateID, true)}
-	busy := proxmox.VM{VMID: 10001, Pool: testPool, Status: "running", Tags: workerTags("old", testStart, testTemplateID, true)}
+	gone := proxmox.VM{VMID: 10000, Pool: testPool, Status: "running", Tags: workerTags(key("old"), testStart, testTemplateID, true)}
+	busy := proxmox.VM{VMID: 10001, Pool: testPool, Status: "running", Tags: workerTags(key("old"), testStart, testTemplateID, true)}
 	h.pve.add(gone)
 	h.pve.add(busy)
 	busyName := workerName(10001, testStart)
@@ -356,7 +356,7 @@ func TestRemovedScaleSet(t *testing.T) {
 
 func TestRemovedScaleSetKeepsDefaultMaxLifetime(t *testing.T) {
 	h := newHarness(t, testConfig())
-	h.pve.add(proxmox.VM{VMID: 10000, Pool: testPool, Status: "running", Tags: workerTags("old", testStart, testTemplateID, true)})
+	h.pve.add(proxmox.VM{VMID: 10000, Pool: testPool, Status: "running", Tags: workerTags(key("old"), testStart, testTemplateID, true)})
 	name := workerName(10000, testStart)
 	if _, err := h.gh.GenerateJITConfig(context.Background(), testScaleSetID, name); err != nil {
 		t.Fatal(err)
@@ -631,8 +631,8 @@ func TestRunRegistersListensAndLeavesWorkersOnShutdown(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("Run never started listening")
 	}
-	if h.c.scaleSets[testScaleSet].scaleSetID() != testScaleSetID {
-		t.Errorf("scale set ID = %d, want %d", h.c.scaleSets[testScaleSet].scaleSetID(), testScaleSetID)
+	if h.c.scaleSets[key(testScaleSet)].scaleSetID() != testScaleSetID {
+		t.Errorf("scale set ID = %d, want %d", h.c.scaleSets[key(testScaleSet)].scaleSetID(), testScaleSetID)
 	}
 	if _, err := handler.DesiredRunners(ctx, 1); err != nil {
 		t.Fatal(err)
@@ -678,10 +678,10 @@ func TestRunServesScaleSetsThatRegisterWhileAnotherCant(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("the scale set GitHub accepts never started listening")
 	}
-	if id := h.c.scaleSets[testScaleSet].scaleSetID(); id != testScaleSetID {
+	if id := h.c.scaleSets[key(testScaleSet)].scaleSetID(); id != testScaleSetID {
 		t.Errorf("scale set ID = %d, want %d", id, testScaleSetID)
 	}
-	if id := h.c.scaleSets["refused"].scaleSetID(); id != 0 {
+	if id := h.c.scaleSets[key("refused")].scaleSetID(); id != 0 {
 		t.Errorf("refused scale set ID = %d, want 0", id)
 	}
 	cancel()
@@ -728,7 +728,7 @@ func twoScaleSets(maxWorkers int) *config.Config {
 
 func (h *harness) wantFor(name string, assignedJobs int) {
 	h.t.Helper()
-	if _, err := h.c.scaleSets[name].DesiredRunners(context.Background(), assignedJobs); err != nil {
+	if _, err := h.c.scaleSets[key(name)].DesiredRunners(context.Background(), assignedJobs); err != nil {
 		h.t.Fatal(err)
 	}
 }
@@ -770,5 +770,39 @@ func TestMaxWorkersGivesTheNextWorkerToTheLongestWaiting(t *testing.T) {
 	h.pass()
 	if got := h.workersOf(); got["b"] != 1 || got["a"] != 1 {
 		t.Errorf("workers = %v, want the freed slot to go to b, which waited longest", got)
+	}
+}
+
+func TestWorkersCarryTheirTarget(t *testing.T) {
+	cfg := testConfig()
+	cfg.GitHub.ConfigURL = "https://github.com/My-Org"
+	h := newHarness(t, cfg)
+	h.pve.addTemplate(testTemplateID, 1)
+	// A worker from before several targets has no target tag and belongs to the first target: it counts toward the
+	// scale set's workers rather than being retired as one of a scale set no longer configured.
+	h.pve.add(proxmox.VM{VMID: 10000, Pool: testPool, Status: "running",
+		Tags: workerTags(key(testScaleSet), testStart, testTemplateID, true)})
+	name := workerName(10000, testStart)
+	if _, err := h.gh.GenerateJITConfig(context.Background(), testScaleSetID, name); err != nil {
+		t.Fatal(err)
+	}
+	k := ssKey{target: "my-org", name: testScaleSet}
+	if _, err := h.c.scaleSets[k].DesiredRunners(context.Background(), 2); err != nil {
+		t.Fatal(err)
+	}
+	h.pass()
+
+	if !slices.Contains(h.pve.ids(), 10000) {
+		t.Error("the untagged worker was retired")
+	}
+	if len(h.readyWorkers()) != 2 {
+		t.Fatalf("ready workers = %v, want the untagged one and one new one", h.readyWorkers())
+	}
+	vm, _ := h.pve.snapshot(10001)
+	if !vm.vm.HasTag(vmtags.TargetPrefix + "my-org") {
+		t.Errorf("new worker's tags = %v, want its target", vm.vm.Tags)
+	}
+	if d := vm.config["description"]; !strings.Contains(d, "of https://github.com/My-Org") {
+		t.Errorf("description = %q, want the target", d)
 	}
 }

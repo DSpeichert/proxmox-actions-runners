@@ -16,7 +16,7 @@ func TestStatusFile(t *testing.T) {
 	h.c.statusPath = filepath.Join(t.TempDir(), "status.json")
 	h.c.status.Version = "0.2.0"
 	h.pve.addTemplate(testTemplateID, 1)
-	s := h.c.scaleSets[testScaleSet]
+	s := h.c.scaleSets[key(testScaleSet)]
 	s.SessionOpened()
 	s.RecordStats(github.Stats{AssignedJobs: 2, BusyRunners: 1, RegisteredRunners: 2})
 	h.want(2)

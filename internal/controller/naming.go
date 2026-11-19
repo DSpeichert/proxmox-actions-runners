@@ -24,15 +24,18 @@ func workerName(vmid int, created time.Time) string {
 	return fmt.Sprintf("par-%d-%s", vmid, strconv.FormatInt(created.Unix(), 36))
 }
 
-// workerTags returns a worker's tags: its scale set, creation time, and the template it was cloned from. ready adds
-// vmtags.Ready.
-func workerTags(scaleSet string, created time.Time, templateVMID int, ready bool) []string {
+// workerTags returns a worker's tags: its target and scale set, creation time, and the template it was cloned from.
+// ready adds vmtags.Ready.
+func workerTags(key ssKey, created time.Time, templateVMID int, ready bool) []string {
 	tags := []string{
 		vmtags.Managed,
 		vmtags.Worker,
-		vmtags.ScaleSetPrefix + scaleSet,
+		vmtags.ScaleSetPrefix + key.name,
 		vmtags.CreatedPrefix + strconv.FormatInt(created.Unix(), 10),
 		vmtags.TemplateRefPrefix + strconv.Itoa(templateVMID),
+	}
+	if key.target != "" {
+		tags = append(tags, vmtags.TargetPrefix+key.target)
 	}
 	if ready {
 		tags = append(tags, vmtags.Ready)
@@ -40,14 +43,31 @@ func workerTags(scaleSet string, created time.Time, templateVMID int, ready bool
 	return tags
 }
 
-// worker is what the tags of a worker VM say about it.
+// ssKey names a scale set: the key of the organization or repository it serves (config.TargetKey), and its name.
+// Every target has a scale set of each configured name.
+type ssKey struct {
+	target string
+	name   string
+}
+
+func (k ssKey) String() string {
+	if k.target == "" {
+		return k.name
+	}
+	return k.target + "/" + k.name
+}
+
+// worker is what the tags of a worker VM say about it. target is empty for a worker from before several targets.
 type worker struct {
 	vm       proxmox.VM
 	name     string
+	target   string
 	scaleSet string
 	created  time.Time
 	ready    bool
 }
+
+func (w worker) key() ssKey { return ssKey{target: w.target, name: w.scaleSet} }
 
 // parseWorker reads a worker's identity from its tags. It fails for a VM that has vmtags.Worker but lacks a valid
 // scale set or creation time, which only a crash or a person editing tags can cause.
@@ -57,6 +77,8 @@ func parseWorker(vm proxmox.VM) (worker, error) {
 		switch {
 		case strings.HasPrefix(tag, vmtags.ScaleSetPrefix):
 			w.scaleSet = strings.TrimPrefix(tag, vmtags.ScaleSetPrefix)
+		case strings.HasPrefix(tag, vmtags.TargetPrefix):
+			w.target = strings.TrimPrefix(tag, vmtags.TargetPrefix)
 		case strings.HasPrefix(tag, vmtags.CreatedPrefix):
 			sec, err := strconv.ParseInt(strings.TrimPrefix(tag, vmtags.CreatedPrefix), 10, 64)
 			if err != nil {

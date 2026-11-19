@@ -500,7 +500,7 @@ func newHarness(t *testing.T, cfg *config.Config) *harness {
 // want reports assignedJobs to the test scale set's handler, as a GitHub message would.
 func (h *harness) want(assignedJobs int) {
 	h.t.Helper()
-	if _, err := h.c.scaleSets[testScaleSet].DesiredRunners(context.Background(), assignedJobs); err != nil {
+	if _, err := h.c.scaleSets[key(testScaleSet)].DesiredRunners(context.Background(), assignedJobs); err != nil {
 		h.t.Fatal(err)
 	}
 }
@@ -551,3 +551,6 @@ func (f *fakeGitHub) LatestRunnerRelease(context.Context) (github.RunnerRelease,
 	}
 	return f.latest, nil
 }
+
+// key returns the key of a scale set of the test config, which has no GitHub target.
+func key(name string) ssKey { return ssKey{name: name} }

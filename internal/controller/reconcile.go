@@ -25,8 +25,8 @@ const runnerCheckBudget = 20 * time.Second
 type view struct {
 	// template is the newest runner template, or nil if there is none.
 	template *proxmox.VM
-	// workers holds the workers of each scale set, by scale set name, including scale sets no longer configured.
-	workers map[string][]worker
+	// workers holds the workers of each scale set, by target and name, including scale sets no longer configured.
+	workers map[ssKey][]worker
 	// strays are managed VMs in the worker part of the VMID range that aren't workers: clones left half-created by
 	// a crash, which still carry the template's tags, and workers with broken tags.
 	strays []proxmox.VM
@@ -38,7 +38,7 @@ type view struct {
 // vmtags.Managed, and never counts a VM outside the worker part of the VMID range as a worker or stray (AGENTS.md,
 // invariant 5).
 func (c *Controller) observe(vms []proxmox.VM) view {
-	v := view{workers: map[string][]worker{}, used: map[int]bool{}}
+	v := view{workers: map[ssKey][]worker{}, used: map[int]bool{}}
 	if t, ok := vmtags.NewestTemplate(vms, c.cfg.Proxmox.Pool); ok {
 		v.template = &t
 	}
@@ -65,7 +65,10 @@ func (c *Controller) observe(vms []proxmox.VM) view {
 			v.strays = append(v.strays, vm)
 			continue
 		}
-		v.workers[w.scaleSet] = append(v.workers[w.scaleSet], w)
+		if w.target == "" {
+			w.target = c.defaultTarget
+		}
+		v.workers[w.key()] = append(v.workers[w.key()], w)
 	}
 	return v
 }
@@ -90,8 +93,8 @@ func (c *Controller) reconcile(ctx context.Context) error {
 	checks := 0
 	checkCtx, cancelChecks := context.WithTimeout(ctx, c.runnerCheckBudget)
 	defer cancelChecks()
-	for name, workers := range v.workers {
-		s := c.scaleSets[name] // nil for a scale set no longer configured
+	for key, workers := range v.workers {
+		s := c.scaleSets[key] // nil for a scale set no longer configured
 		for _, w := range workers {
 			if c.isBusy(w.vm.VMID) {
 				continue
@@ -194,10 +197,10 @@ func (c *Controller) scale(ctx context.Context, s *scaleSetState, v view, now ti
 
 	// Count workers that are alive or on their way: creations in flight, and listed workers that aren't being
 	// retired, haven't stopped, and aren't about to be retired as half-created.
-	creating := c.creatingFor(s.cfg.Name)
+	creating := c.creatingFor(s.key)
 	active := creating
 	var idle []worker
-	for _, w := range v.workers[s.cfg.Name] {
+	for _, w := range v.workers[s.key] {
 		if c.isBusy(w.vm.VMID) || w.vm.Status == "stopped" || !w.ready {
 			continue
 		}
@@ -230,7 +233,7 @@ func (c *Controller) grow(ctx context.Context, wants map[*scaleSetState]int, v v
 			continue
 		}
 		if v.template == nil {
-			c.logger.WarnContext(ctx, "no runner template; can't create workers", slog.String("scaleSet", s.cfg.Name),
+			c.logger.WarnContext(ctx, "no runner template; can't create workers", slog.String("target", s.targetURL), slog.String("scaleSet", s.cfg.Name),
 				slog.String("pool", c.cfg.Proxmox.Pool))
 			continue
 		}
@@ -245,7 +248,7 @@ func (c *Controller) grow(ctx context.Context, wants map[*scaleSetState]int, v v
 		if !a.Equal(b) {
 			return a.Before(b)
 		}
-		return queue[i].cfg.Name < queue[j].cfg.Name
+		return queue[i].key.String() < queue[j].key.String()
 	})
 
 	room := c.cfg.EffectiveMaxWorkers() - c.inUse(v)
@@ -258,7 +261,7 @@ func (c *Controller) grow(ctx context.Context, wants map[*scaleSetState]int, v v
 			}
 			vmid, ok := c.allocateVMID(v.used)
 			if !ok {
-				c.logger.WarnContext(ctx, "no free VMID in the configured range", slog.String("scaleSet", s.cfg.Name))
+				c.logger.WarnContext(ctx, "no free VMID in the configured range", slog.String("target", s.targetURL), slog.String("scaleSet", s.cfg.Name))
 				return
 			}
 			c.startCreate(ctx, s, *v.template, vmid)

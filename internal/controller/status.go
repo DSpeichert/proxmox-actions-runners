@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"log/slog"
@@ -17,8 +18,9 @@ import (
 // invariant 3), and it holds nothing secret.
 const StatusPath = "/run/parcon/status.json"
 
-// StatusSchema is the status file's format version.
-const StatusSchema = 1
+// StatusSchema is the status file's format version. Version 2 added each scale set's target, since every target has a
+// scale set of the same name.
+const StatusSchema = 2
 
 // Status is the controller's view of its scale sets, written after each reconcile pass.
 type Status struct {
@@ -33,7 +35,10 @@ type Status struct {
 
 // ScaleSetStatus is one scale set's state.
 type ScaleSetStatus struct {
-	Name string `json:"name"`
+	// Target is the organization or repository the scale set serves, and TargetKey its key (config.TargetKey).
+	Target    string `json:"target,omitempty"`
+	TargetKey string `json:"targetKey,omitempty"`
+	Name      string `json:"name"`
 	// ID is GitHub's ID for the scale set, once it is registered.
 	ID int `json:"id"`
 	// SessionOpen reports whether the message session is open, since SessionSince; SessionError is why it last
@@ -56,9 +61,9 @@ func (c *Controller) countWorkers(v view) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.status.ScaleSets = c.status.ScaleSets[:0]
-	for name, s := range c.scaleSets {
-		ss := ScaleSetStatus{Name: name, ID: s.scaleSetID()}
-		for _, w := range v.workers[name] {
+	for key, s := range c.scaleSets {
+		ss := ScaleSetStatus{Target: s.targetURL, TargetKey: key.target, Name: key.name, ID: s.scaleSetID()}
+		for _, w := range v.workers[key] {
 			ss.Workers++
 			if w.ready {
 				ss.Ready++
@@ -70,10 +75,7 @@ func (c *Controller) countWorkers(v view) {
 		c.status.ScaleSets = append(c.status.ScaleSets, ss)
 	}
 	slices.SortFunc(c.status.ScaleSets, func(a, b ScaleSetStatus) int {
-		if a.Name < b.Name {
-			return -1
-		}
-		return 1
+		return cmp.Or(cmp.Compare(a.TargetKey, b.TargetKey), cmp.Compare(a.Name, b.Name))
 	})
 }
 
@@ -93,7 +95,7 @@ func (c *Controller) writeStatus(ctx context.Context, err error) {
 		st.LastError = err.Error()
 	}
 	for i := range st.ScaleSets {
-		s := c.scaleSets[st.ScaleSets[i].Name]
+		s := c.scaleSets[ssKey{target: st.ScaleSets[i].TargetKey, name: st.ScaleSets[i].Name}]
 		s.mu.Lock()
 		ss := &st.ScaleSets[i]
 		ss.SessionOpen, ss.SessionSince, ss.SessionError = s.sessionOpen, s.sessionSince, s.sessionErr

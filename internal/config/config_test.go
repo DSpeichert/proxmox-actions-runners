@@ -2,6 +2,7 @@ package config
 
 import (
 	"errors"
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
@@ -504,5 +505,37 @@ func TestParseDecodeErrors(t *testing.T) {
 				t.Errorf("error = %v, want it to mention %q", err, tt.want)
 			}
 		})
+	}
+}
+
+func TestTargetKey(t *testing.T) {
+	long := "https://github.com/an-organization-with-a-long-name/" + strings.Repeat("r", 60)
+	tests := []struct{ url, want string }{
+		{"https://github.com/my-org", "my-org"},
+		{"https://github.com/My-Org/", "my-org"},
+		{"https://github.com/octocat/Hello-World", "octocat.hello-world"},
+		{"https://github.com/octocat/.github", "octocat..github"},
+		{"https://ghes.example.com/my-org", ""},
+		{"", ""},
+	}
+	for _, tt := range tests {
+		if got := TargetKey(tt.url); got != tt.want {
+			t.Errorf("TargetKey(%q) = %q, want %q", tt.url, got, tt.want)
+		}
+	}
+	got := TargetKey(long)
+	if len(got) != maxTargetKey || !strings.HasPrefix(got, "an-organization-with-a-long-name.rrrrrr") {
+		t.Errorf("TargetKey of a long URL = %q (%d characters), want it cut to %d with a hash", got, len(got),
+			maxTargetKey)
+	}
+	if other := TargetKey(long + "x"); other == got {
+		t.Errorf("two long URLs share the key %q", got)
+	}
+	// Every key must be a valid part of a Proxmox tag.
+	tag := regexp.MustCompile(`^[a-z0-9_.+-]+$`)
+	for _, u := range []string{long, "https://github.com/A_b/c.D-e"} {
+		if k := TargetKey(u); !tag.MatchString(k) {
+			t.Errorf("TargetKey(%q) = %q isn't valid in a tag", u, k)
+		}
 	}
 }

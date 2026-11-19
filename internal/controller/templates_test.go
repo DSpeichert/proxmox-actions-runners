@@ -19,7 +19,7 @@ func TestPruneTemplates(t *testing.T) {
 	// Templates live in the reserved IDs at the end of the test range (10006-10009).
 	worker := func(vmid, template int) proxmox.VM {
 		return proxmox.VM{VMID: vmid, Pool: testPool, Status: "running",
-			Tags: workerTags(testScaleSet, testStart, template, true)}
+			Tags: workerTags(key(testScaleSet), testStart, template, true)}
 	}
 	tests := []struct {
 		name  string
@@ -39,7 +39,7 @@ func TestPruneTemplates(t *testing.T) {
 		{
 			name: "a worker without a template reference stops all pruning",
 			extra: []proxmox.VM{{VMID: 10000, Pool: testPool, Status: "running",
-				Tags: slices.DeleteFunc(workerTags(testScaleSet, testStart, 10007, true), func(tag string) bool {
+				Tags: slices.DeleteFunc(workerTags(key(testScaleSet), testStart, 10007, true), func(tag string) bool {
 					return strings.HasPrefix(tag, vmtags.TemplateRefPrefix)
 				})}},
 			want: []int{10000, 10006, 10007, 10009},

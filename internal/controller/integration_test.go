@@ -270,7 +270,7 @@ func (h *live) controller() *Controller {
 // want reports assignedJobs to the scale set, as a GitHub message would.
 func (h *live) want(c *Controller, assignedJobs int) {
 	h.t.Helper()
-	if _, err := c.scaleSets[integrationScaleSet].DesiredRunners(h.ctx, assignedJobs); err != nil {
+	if _, err := c.scaleSets[key(integrationScaleSet)].DesiredRunners(h.ctx, assignedJobs); err != nil {
 		h.t.Fatal(err)
 	}
 }

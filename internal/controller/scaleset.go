@@ -13,7 +13,10 @@ import (
 // into it, and the reconcile loop reads it. Handler methods only record and wake the loop, because the listener
 // doesn't fetch the next message until they return.
 type scaleSetState struct {
-	cfg config.ScaleSet
+	key ssKey
+	// targetURL is the organization or repository the scale set serves.
+	targetURL string
+	cfg       config.ScaleSet
 	// gh serves the scale set: the client for the App installation it is registered with.
 	gh   GitHub
 	wake func()
@@ -42,8 +45,19 @@ type scaleSetState struct {
 	now          func() time.Time
 }
 
-func newScaleSetState(cfg config.ScaleSet, gh GitHub, wake func(), now func() time.Time) *scaleSetState {
-	return &scaleSetState{cfg: cfg, gh: gh, wake: wake, busy: map[string]bool{}, now: now}
+func newScaleSetState(key ssKey, targetURL string, cfg config.ScaleSet, gh GitHub, wake func(),
+	now func() time.Time) *scaleSetState {
+	return &scaleSetState{key: key, targetURL: targetURL, cfg: cfg, gh: gh, wake: wake, busy: map[string]bool{},
+		now: now}
+}
+
+// description is the VM description of the scale set's workers.
+func (s *scaleSetState) description() string {
+	of := ""
+	if s.targetURL != "" {
+		of = " of " + s.targetURL
+	}
+	return "Runner for scale set " + s.cfg.Name + of + ". Managed by proxmox-actions-runners; destroyed after one job."
 }
 
 // SessionOpened implements github.SessionObserver.

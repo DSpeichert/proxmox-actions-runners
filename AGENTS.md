@@ -211,8 +211,8 @@ expects, and the suite has already caught a missing privilege (`Pool.Audit`) tha
 - Use the standard Go layout. Put non-exported packages under `internal/`.
 - Make `context.Context` the first parameter of anything that does I/O or blocks, and respect cancellation.
 - Wrap errors with `fmt.Errorf("...: %w", err)`. Don't log an error and also return it.
-- Use `log/slog` for structured logging. Include `scaleSet`, `vmid`, `jobId`, and `runnerName` attributes where
-  relevant.
+- Use `log/slog` for structured logging. Include `target`, `scaleSet`, `vmid`, `jobId`, and `runnerName` attributes
+  where relevant.
 - Prefer table-driven tests. Unit tests must not call real Proxmox or GitHub APIs. Put those tests behind the
   `integration` build tag.
 - The worker firewall lives on the template: `parcon` gives a new template its firewall before `qm template`, and

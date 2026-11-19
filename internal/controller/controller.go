@@ -119,8 +119,10 @@ type Controller struct {
 	githubTimeout     time.Duration
 	runnerCheckBudget time.Duration
 
-	// scaleSets holds each configured scale set's state, by name.
-	scaleSets map[string]*scaleSetState
+	// scaleSets holds each configured scale set's state, by target and name.
+	scaleSets map[ssKey]*scaleSetState
+	// defaultTarget is the key of the first target, which workers from before several targets belong to.
+	defaultTarget string
 	// wake asks the loop to run a pass now.
 	wake chan struct{}
 	// slots bounds concurrent VM operations.
@@ -172,7 +174,7 @@ func New(opts Options) (*Controller, error) {
 		agentPoll:         agentPollInterval,
 		githubTimeout:     githubTimeout,
 		runnerCheckBudget: runnerCheckBudget,
-		scaleSets:         map[string]*scaleSetState{},
+		scaleSets:         map[ssKey]*scaleSetState{},
 		wake:              make(chan struct{}, 1),
 		busy:              map[int]string{},
 		foreign:           map[int]bool{},
@@ -191,8 +193,11 @@ func New(opts Options) (*Controller, error) {
 		parallelism = defaultParallelism
 	}
 	c.slots = make(chan struct{}, parallelism)
+	target := config.TargetKey(c.cfg.GitHub.ConfigURL)
+	c.defaultTarget = target
 	for _, s := range c.cfg.ScaleSets {
-		c.scaleSets[s.Name] = newScaleSetState(s, c.gh, c.trigger, c.now)
+		key := ssKey{target: target, name: s.Name}
+		c.scaleSets[key] = newScaleSetState(key, c.cfg.GitHub.ConfigURL, s, c.gh, c.trigger, c.now)
 	}
 	return c, nil
 }
@@ -267,11 +272,11 @@ func (c *Controller) register(ctx context.Context, s *scaleSetState) bool {
 			RunnerGroup: s.cfg.RunnerGroup})
 		if err == nil {
 			s.setScaleSetID(ss.ID)
-			c.logger.InfoContext(ctx, "scale set registered", slog.String("scaleSet", s.cfg.Name),
+			c.logger.InfoContext(ctx, "scale set registered", slog.String("target", s.targetURL), slog.String("scaleSet", s.cfg.Name),
 				slog.Int("scaleSetId", ss.ID))
 			return true
 		}
-		c.logger.WarnContext(ctx, "registering scale set failed; retrying", slog.String("scaleSet", s.cfg.Name),
+		c.logger.WarnContext(ctx, "registering scale set failed; retrying", slog.String("target", s.targetURL), slog.String("scaleSet", s.cfg.Name),
 			slog.Duration("backoff", backoff), slog.String("error", err.Error()))
 		if !sleep(ctx, backoff) {
 			return false

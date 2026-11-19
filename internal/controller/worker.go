@@ -15,7 +15,7 @@ import (
 
 const (
 	opRetire = "retire"
-	// opCreatePrefix is followed by the scale set name.
+	// opCreatePrefix is followed by the scale set's key.
 	opCreatePrefix = "create:"
 
 	// retireTimeout bounds one retirement. Retirements outlive a canceled controller context so shutdown doesn't
@@ -46,12 +46,12 @@ func (c *Controller) isBusy(vmid int) bool {
 }
 
 // creatingFor counts the creations in flight for a scale set.
-func (c *Controller) creatingFor(scaleSet string) int {
+func (c *Controller) creatingFor(key ssKey) int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	n := 0
 	for _, op := range c.busy {
-		if op == opCreatePrefix+scaleSet {
+		if op == opCreatePrefix+key.String() {
 			n++
 		}
 	}
@@ -226,7 +226,7 @@ func (c *Controller) removeRunner(ctx context.Context, gh GitHub, name string) e
 
 // startCreate creates a worker in the background.
 func (c *Controller) startCreate(ctx context.Context, s *scaleSetState, template proxmox.VM, vmid int) {
-	c.startOp(ctx, vmid, opCreatePrefix+s.cfg.Name, func(ctx context.Context) error {
+	c.startOp(ctx, vmid, opCreatePrefix+s.key.String(), func(ctx context.Context) error {
 		err := c.create(ctx, s, template, vmid)
 		if err != nil && !errors.Is(err, context.Canceled) {
 			s.backOff(c.now().Add(c.retryBackoff))
@@ -241,7 +241,7 @@ func (c *Controller) startCreate(ctx context.Context, s *scaleSetState, template
 func (c *Controller) create(ctx context.Context, s *scaleSetState, template proxmox.VM, vmid int) (err error) {
 	created := c.now().Truncate(time.Second)
 	name := workerName(vmid, created)
-	log := c.logger.With(slog.String("scaleSet", s.cfg.Name), slog.Int("vmid", vmid), slog.String("runnerName", name))
+	log := c.logger.With(slog.String("target", s.targetURL), slog.String("scaleSet", s.cfg.Name), slog.Int("vmid", vmid), slog.String("runnerName", name))
 	log.InfoContext(ctx, "creating worker", slog.Int("templateVmid", template.VMID))
 
 	p := c.cfg.Proxmox
@@ -252,7 +252,7 @@ func (c *Controller) create(ctx context.Context, s *scaleSetState, template prox
 		Pool:        p.Pool,
 		Full:        !p.UseLinkedClone(),
 		Storage:     p.Storage,
-		Description: "Runner for scale set " + s.cfg.Name + ". Managed by proxmox-actions-runners; destroyed after one job.",
+		Description: s.description(),
 	})
 	if proxmox.IsVMIDInUse(cloneErr) {
 		// Taken by a VM the token can't see. Never try this ID again.
@@ -286,7 +286,7 @@ func (c *Controller) create(ctx context.Context, s *scaleSetState, template prox
 
 	w := s.cfg.Worker
 	settings := map[string]string{
-		"tags":   proxmox.FormatTags(workerTags(s.cfg.Name, created, template.VMID, false)),
+		"tags":   proxmox.FormatTags(workerTags(s.key, created, template.VMID, false)),
 		"cores":  strconv.Itoa(w.Cores),
 		"memory": strconv.Itoa(w.MemoryMiB),
 		// The worker firewall, copied from the template, applies only with firewall=1 on the NIC.
@@ -331,7 +331,7 @@ func (c *Controller) create(ctx context.Context, s *scaleSetState, template prox
 		return fmt.Errorf("signal JIT config: %w", err)
 	}
 	if err := c.pve.SetConfig(ctx, vmid, map[string]string{
-		"tags": proxmox.FormatTags(workerTags(s.cfg.Name, created, template.VMID, true)),
+		"tags": proxmox.FormatTags(workerTags(s.key, created, template.VMID, true)),
 	}); err != nil {
 		return fmt.Errorf("mark ready: %w", err)
 	}

@@ -148,6 +148,7 @@ The controller keeps no state it can't rebuild. Everything durable is in each wo
 | `par-managed` | Owned by this project. VMs without it are never touched |
 | `par-worker` | A worker VM |
 | `par-ss-<name>` | The worker's scale set |
+| `par-tg-<key>` | The organization or repository its scale set serves: the owner, or `owner.repo`, in lowercase. Every target has a scale set of the same name, so the two tags together name it. A worker without it, from before several targets, belongs to the first target |
 | `par-created-<unix>` | Creation time, for `maxLifetime` and the boot timeout |
 | `par-ready` | The runner has its JIT config. Added only as the last step of creation |
 
