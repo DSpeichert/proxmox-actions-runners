@@ -308,6 +308,15 @@ func TestInstallationTarget(t *testing.T) {
 		got != "https://github.com/me/b" {
 		t.Errorf("several, chosen by flag = %q, %v", got, err)
 	}
+	// GitHub compares names without regard to case; a different case must not fall through to a guess.
+	if got, err := installationTarget(several, "https://github.com/Me/B", &term.Scripted{}); err != nil ||
+		got != "https://github.com/me/b" {
+		t.Errorf("several, chosen by flag in another case = %q, %v", got, err)
+	}
+	if _, err := installationTarget(several, "https://github.com/me/c", &term.Scripted{Answers: []string{"1"}}); err == nil ||
+		!strings.Contains(err.Error(), "doesn't reach https://github.com/me/c") {
+		t.Errorf("several, a repository the installation doesn't reach: %v", err)
+	}
 	if got, err := installationTarget(several, "", &term.Scripted{Answers: []string{"1"}}); err != nil ||
 		got != "https://github.com/me/a" {
 		t.Errorf("several, chosen on the terminal = %q, %v", got, err)

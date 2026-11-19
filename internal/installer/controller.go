@@ -349,10 +349,15 @@ func installationTarget(inst installation, wanted string, t term.Terminal) (stri
 	case 1:
 		return base + "/" + inst.Repositories[0], nil
 	}
+	// GitHub compares names without regard to case.
 	for _, r := range inst.Repositories {
-		if wanted == base+"/"+r {
-			return wanted, nil
+		if wanted != "" && config.TargetKey(wanted) == config.TargetKey(base+"/"+r) {
+			return base + "/" + r, nil
 		}
+	}
+	if _, repo, _ := config.ParseGitHubURL(wanted); repo != "" {
+		return "", fmt.Errorf("the App's installation on %s doesn't reach %s; add the repository to it on GitHub "+
+			"and run this again", inst.Account, wanted)
 	}
 	i, err := t.Choose(fmt.Sprintf("    The App can reach several of %s's repositories. Which one do the runners "+
 		"serve?", inst.Account), inst.Repositories)
