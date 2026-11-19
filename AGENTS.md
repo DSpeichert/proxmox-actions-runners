@@ -32,13 +32,17 @@ behind the invariants and the alternatives that were rejected.
   CI builds with Packer and publishes with each release. Nothing is built on the node.
 - **Controller VM**: the VM `parcon install` creates to run the `parcon` controller. It lives in the `par-system` pool,
   outside the token's reach.
-- **Worker network**: the isolated Proxmox SDN VNet (`parnet` in the simple zone `parzone`) that workers attach to.
-  It has no uplink, no host IP, and no host SNAT or DHCP.
-- **Gateway VM**: the VM `parcon install` creates in `par-system` with one NIC on the LAN and one on the worker network.
-  It is the worker network's only way out: it provides DHCP, DNS, and NAT to the internet, and blocks the LAN.
+- **Worker network**: the Proxmox SDN VNet (`parnet` in the simple zone `parzone`) that workers attach to. Its one
+  subnet has the host as gateway, with SNAT, and SDN DHCP (`dnsmasq@parzone`) hands out the rest with the host's DNS
+  server.
+- **Worker firewall**: the Proxmox firewall on each worker's NIC (`firewall=1`), copied from its template: inbound
+  DROP, DHCP allowed, and the datacenter security group `par-worker`, which allows DNS to the host's resolver and
+  drops SDN's IP set of the worker subnet (`+sdn/parnet-all`) and the IP set `par-blocked` (private, CGNAT, and
+  link-local ranges, the LAN, the host, the controller). Rules use scoped references (`+sdn/`, `+dc/`), which a
+  worker's own IP sets can't shadow. It applies only while the datacenter firewall is on, which the user turns on.
 - **Host commands**: `parcon install`, `status`, `config`, `update`, `check`, and `uninstall`, run as root on the
-  Proxmox VE 9 node (`internal/installer`). They are the user's interface: the gateway and controller VMs need no
-  logins, and `parcon` reaches into them through the guest agent. `install/install.sh` is the bootstrap that
+  Proxmox VE 9 node (`internal/installer`). They are the user's interface: the controller VM needs no login, and
+  `parcon` reaches into it through the guest agent. `install/install.sh` is the bootstrap that
   downloads and verifies the release's `parcon` and runs `parcon install`. See [docs/install.md](docs/install.md).
 - **Host settings**: `/etc/proxmox-actions-runners/settings.yaml` on the host (`internal/settings`), the source of
   truth for the install. `parcon` renders the controller VM's `config.yaml` from it. It holds nothing secret.
@@ -81,8 +85,9 @@ Keep these true. If a change needs to break one, discuss it first.
    lives in the runner pool. The controller must never modify or delete an untagged VM. It must never modify an
    existing template: a new runner image is imported as a new template instead, and the controller deletes an old
    one only once no worker uses it. The smoke-test clones of `parcon install` and `parcon check network` (`par-build`,
-   in the reserved VMIDs) belong to `parcon`, which destroys them, including ones a failed run left. The Proxmox token's ACLs enforce the same
-   limit, and the controller and gateway VMs sit in `par-system`, outside the token's reach.
+   in the reserved VMIDs) belong to `parcon`, which destroys them, including ones a failed run left. The Proxmox
+   token's ACLs enforce the same limit: the controller VM sits in `par-system`, and the firewall's datacenter objects
+   are outside the token's reach too.
 6. **GitHub-matching defaults.** Default worker hardware is 2 vCPU, 8 GiB RAM, and 14 GiB of free disk space,
    matching `ubuntu-latest` for private repositories. The free space is added on top of the template's disk size,
    because a clone's disk can grow but never shrink below its template's. The defaults are defined in exactly one
@@ -92,20 +97,23 @@ Keep these true. If a change needs to break one, discuss it first.
    JIT configs to the running VM only through the QEMU guest agent. Cloud-init carries only non-secret settings.
 8. **Minimal host footprint.** `parcon` changes the Proxmox host only where the project needs it: itself
    (`/usr/local/bin/parcon`) and its settings (`/etc/proxmox-actions-runners/settings.yaml`), what the runners run
-   on (pools, role, user, token, ACLs, VMs, and the worker network's SDN zone and VNet, through `pveum`, `qm`,
-   `pvesh`, and `pvesm`), and host tuning the runners can't work well without, such as turning off the LAN NIC's
+   on (pools, role, user, token, ACLs, VMs, the worker network's SDN zone, VNet, and subnet, and the worker
+   firewall's IP set, security group, and host DHCP rule, through `pveum`, `qm`, `pvesh`, and `pvesm`), and host
+   tuning the runners can't work well without, such as turning off the LAN NIC's
    offloads and KVM's async page faults on a node that is itself a VM. A change that is merely convenient doesn't
-   qualify, and whatever can run inside the controller or gateway VM runs there. `parcon` runs no service on the
-   host, installs no packages, never reboots it, and doesn't edit files that Proxmox or the user manages, such as
+   qualify, and whatever can run inside the controller VM runs there. `parcon` runs no service on the host,
+   installs no packages, never reboots it, and doesn't edit files that Proxmox or the user manages, such as
    `/etc/network/interfaces` or `storage.cfg`: a change outside Proxmox's tools goes in a file of its own, named as
    ours. The one exception is `/etc/kernel/cmdline`, which has no room for a file of ours: on a systemd-boot node
-   that is itself a VM on KVM, `parcon` adds `no-kvm-apf` to it and `parcon uninstall` takes it out. The worker network has no host IP, SNAT, or
-   DHCP, so the host never routes worker traffic. Every host change must appear in the plan `parcon` prints before
-   it changes anything, and `parcon uninstall` must remove it.
-9. **Workers are isolated.** Workers attach only to the worker network. Their only way out is the gateway VM, which
-   allows DHCP, DNS, and outbound internet traffic and drops everything else, including the LAN, the Proxmox host,
-   the controller VM, and private and link-local ranges. The controller reaches workers only through the Proxmox API
-   and the guest agent, never over the network.
+   that is itself a VM on KVM, `parcon` adds `no-kvm-apf` to it and `parcon uninstall` takes it out. What the user
+   sets up first stays the user's: `parcon` checks that `dnsmasq` is installed (Proxmox's prerequisite for SDN DHCP)
+   and that the datacenter firewall is on, says how, and changes neither. Every host change must appear in the plan
+   `parcon` prints before it changes anything, and `parcon uninstall` must remove it.
+9. **Workers are isolated.** Workers attach only to the worker network, and every worker's NIC has the worker
+   firewall: inbound DROP, and outbound only DHCP, DNS to the host's resolver, and the internet, never the LAN, the
+   Proxmox host, the controller VM, other workers, or private and link-local ranges. The controller starts no worker
+   whose firewall isn't on with that group, and `parcon status` fails while the datacenter firewall is off. The
+   controller reaches workers only through the Proxmox API and the guest agent, never over the network.
 
 ## Repository layout (planned)
 
@@ -129,7 +137,6 @@ internal/vmtags/       the Proxmox tags that hold the project's state, shared by
 install/               install.sh, the bootstrap that verifies and runs parcon install; fill-release.sh; bats tests
 images/common/         what every image build shares: the Ubuntu and plugin pins, base and cleanup steps, boot test
 images/controller/     Packer (qemu builder): the controller VM image with parcon, shipped as a release asset
-images/gateway/        Packer (qemu builder): the gateway VM image (nftables, dnsmasq), shipped as a release asset
 images/runner/         Packer (qemu builder): the runner template image, shipped as a release asset
 deploy/                example config, systemd unit for the controller VM
 .devcontainer/         development container with every tool below, at pinned versions
@@ -186,15 +193,13 @@ aren't checked (only their commit messages are), and the release workflow's chec
 the same image, stops a broken `main` from being released. When you change an image, also build it. Each build runs
 its scripts twice (they must be idempotent) and checks the result; the runner build also runs the one-job flow with
 a stand-in runner. The boot test then boots the finished image the way Proxmox first
-boots a VM made from it: net0 at Proxmox's PCI slot with a cloud-init network config that names it `eth0` by MAC,
-and, for the gateway, net1 at its slot. It checks the console for failed units, ordering cycles, a network that
+boots a VM made from it: net0 at Proxmox's PCI slot with a cloud-init network config that names it `eth0` by MAC. It checks the console for failed units, ordering cycles, a network that
 timed out, cloud-init finishing within 90 seconds, and each image's own lines. A
 build needs `/dev/kvm` and 2 to 4 GiB of free memory. `build-image.sh` builds one image and boot-tests it, the same
 way the release workflow does; run one build at a time:
 
 ```bash
 .github/scripts/build-image.sh runner dev       # output-runner/par-runner-dev.qcow2
-.github/scripts/build-image.sh gateway dev      # output-gateway/par-gateway-dev.qcow2
 .github/scripts/build-image.sh controller dev   # output-controller/parcon-dev.qcow2, with bin/parcon built first
 ```
 
@@ -210,6 +215,9 @@ expects, and the suite has already caught a missing privilege (`Pool.Audit`) tha
   relevant.
 - Prefer table-driven tests. Unit tests must not call real Proxmox or GitHub APIs. Put those tests behind the
   `integration` build tag.
+- The worker firewall lives on the template: `parcon` gives a new template its firewall before `qm template`, and
+  clones copy it. The controller checks each clone's firewall (`proxmox.Firewall`, `proxmox.firewallGroup`) before
+  it registers a runner, and destroys a worker without it. Never start a worker without that check.
 - Proxmox tasks (clone, destroy, and others) are asynchronous. Always wait for the task to finish and check its exit
   status. Don't assume success when the call returns.
 - Take new VMIDs only from the configured `vmidRange`, and treat a "VMID already exists" clone failure as a retryable
@@ -237,12 +245,12 @@ expects, and the suite has already caught a missing privilege (`Pool.Audit`) tha
 
 See [docs/install.md](docs/install.md) for the full design.
 
-- Keep invariant 8. If a feature seems to need a new host change, first see whether it can live in the controller or
-  gateway VM. If it can't, and the runners need it, make it idempotent, list it in the plan, report it in
+- Keep invariant 8. If a feature seems to need a new host change, first see whether it can live in the controller
+  VM. If it can't, and the runners need it, make it idempotent, list it in the plan, report it in
   `parcon check` and `parcon status`, and undo it in `uninstall`.
 - Preflight checks come first and change nothing. They include root, Proxmox VE 9.x, KVM, standalone node, clock
-  sync, tools, storage, space, the LAN bridge and its NIC's offloads, KVM async page faults, SDN support, worker subnet overlap, and name or
-  ID clashes. Add a check whenever a later step could fail on host state.
+  sync, tools, storage, space, the LAN bridge and its NIC's offloads, KVM async page faults, SDN support, `dnsmasq`
+  for SDN DHCP, the datacenter firewall, the host's DNS server, worker subnet overlap, and name or ID clashes. Add a check whenever a later step could fail on host state.
 - Show the plan and ask before any change; `--dry-run` stops at the plan and `--yes` answers the question. Without
   a terminal, a question fails and names `--yes`: never guess an answer.
 - Send every change through `pvecli.Changer` (commands, and files with `WriteFile` and `Remove`), which logs it and
@@ -296,24 +304,23 @@ See [docs/install.md](docs/install.md) for the full design.
 - The template contract, which `parcon` follows when it imports the image and the controller relies on: the
   root disk on `scsi0`, a cloud-init drive (for `ipconfig0`), the guest agent enabled, the VM in the runner pool,
   and the tags `par-managed`, `par-template`, `par-tv-<import time in Unix seconds>`, and
-  `par-rv-<actions/runner version>` (`internal/vmtags`). The controller clones the newest `par-tv`, tags each worker
-  `par-tpl-<template VMID>`, and destroys older templates that no worker references.
+  `par-rv-<actions/runner version>` (`internal/vmtags`), and the worker firewall: `net0` with `firewall=1`, the
+  options `enable`, `dhcp`, `policy_in DROP`, `policy_out ACCEPT`, and the rule `GROUP par-worker`. The controller
+  clones the newest `par-tv`, tags each worker `par-tpl-<template VMID>`, and destroys older templates that no worker
+  references.
 - Templates go in the reserved VMIDs, the last `config.ReservedVMIDs` IDs of the range, never in the worker IDs
   (`config.VMIDRange.Workers`). A new template reports `template: 0` for about 10s, and in the worker IDs it would
   look like a half-created worker clone and be destroyed.
 
-## Gateway and controller image guidelines (`images/gateway/`, `images/controller/`)
+## Controller image guidelines (`images/controller/`)
 
-- Both start from the same pinned Ubuntu 26.04 cloud image and build VM as the runner (`images/common/ubuntu.pkr.hcl`,
-  linked into each image directory) and run `images/common/base.sh` (the guest agent) and
+- It starts from the same pinned Ubuntu 26.04 cloud image and build VM as the runner (`images/common/ubuntu.pkr.hcl`,
+  linked into each image directory) and runs `images/common/base.sh` (the guest agent) and
   `images/common/auto-updates.sh` (`unattended-upgrades`) first.
-  Unlike workers, these VMs are long-lived and patch themselves. They hold no machine identity either:
+  Unlike workers, the controller VM is long-lived and patches itself. It holds no machine identity either:
   `images/common/cleanup.sh` runs last.
-- Keep their disks small: 6 GiB, both VMs' disk size. A built image holds about 2.5 GiB, but a kernel update needs
-  room for two kernels and a new initramfs, which 4 GiB can't hold.
-- The gateway holds no secrets and no state beyond `/etc/par-gateway/config`. `par-gateway-configure` renders
-  everything else from it, and running it again with the same input changes nothing. The worker NIC is always
-  `net1` (Proxmox's `net1`, named by its PCI slot), so the rules never depend on MACs.
+- Keep its disk small: 6 GiB, the VM's disk size. A built image holds about 2.5 GiB, but a kernel update needs room for
+  two kernels and a new initramfs, which 4 GiB can't hold.
 - Every image boots with `net.ifnames=0` (`images/common/base.sh`), so the first NIC is `eth0`, the name Proxmox's
   cloud-init network config gives it. With predictable names, the dracut initrd brings it up as `ens18` before
   cloud-init can rename it, netplan's config for `eth0` never applies (a static address is lost), and every boot
@@ -362,9 +369,9 @@ commit messages are the release process. Follow these rules exactly.
     X.Y.Z*, with the next version (`.release-please-manifest.json`) and `CHANGELOG.md`. Its configuration is
     `release-please-config.json`.
   - When that pull request is merged, release-please creates release `vX.Y.Z` as a **draft**, with its tag. The
-    **images** job builds the three images on KVM, each boot-tested; **assemble** builds `parcon-<ver>-linux-amd64`
+    **images** job builds the two images on KVM, each boot-tested; **assemble** builds `parcon-<ver>-linux-amd64`
     and fills `install.sh`; **publish** signs `SHA256SUMS`, uploads `par-runner-<ver>.qcow2`, `par-runner-<ver>.json`,
-    `par-gateway-<ver>.qcow2`, `parcon-<ver>.qcow2`, `parcon-<ver>-linux-amd64`, `install.sh`, `SHA256SUMS`, and
+    `parcon-<ver>.qcow2`, `parcon-<ver>-linux-amd64`, `install.sh`, `SHA256SUMS`, and
     `SHA256SUMS.sig`, and only then publishes the draft. `releases/latest` never points at a release without its
     files.
 - **The procedure to release**: merge the pull requests that belong in it, wait for the release pull request to

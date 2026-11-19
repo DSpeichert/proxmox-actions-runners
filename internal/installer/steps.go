@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/netip"
 	"os"
 	"slices"
 	"strconv"
@@ -83,19 +84,55 @@ func (in *Installer) grantACLs(ctx context.Context, s *settings.Settings) error 
 	return nil
 }
 
-// createNetwork creates the worker network: a simple SDN zone and a VNet with no subnet, so the host has no address
-// on it and never routes worker traffic.
-func (in *Installer) createNetwork(ctx context.Context) error {
+// createNetwork creates or corrects the worker network: a simple SDN zone with SDN's DHCP (dnsmasq) and IPAM, and a
+// VNet with one subnet. The host takes the subnet's first address as the workers' gateway and SNATs their traffic;
+// DHCP hands out the rest, with the host's DNS server. The worker firewall decides where that traffic may go.
+func (in *Installer) createNetwork(ctx context.Context, s *settings.Settings) error {
 	in.Out.Step("Worker network")
+	w, err := workerNetwork(s)
+	if err != nil {
+		return err
+	}
+	dns, err := in.hostDNS(ctx, s)
+	if err != nil {
+		return err
+	}
 	changed := false
-	if !in.PVE.SDNExists(ctx, "zones/"+Zone) {
-		if err := in.run(ctx, "pvesh", "create", "/cluster/sdn/zones", "--type", "simple", "--zone", Zone); err != nil {
+	if zone, err := in.PVE.SDNObject(ctx, "zones/"+Zone); err != nil {
+		if err := in.run(ctx, "pvesh", "create", "/cluster/sdn/zones", "--type", "simple", "--zone", Zone,
+			"--dhcp", "dnsmasq", "--ipam", "pve"); err != nil {
+			return err
+		}
+		changed = true
+	} else if zone["dhcp"] != "dnsmasq" || zone["ipam"] != "pve" {
+		if err := in.run(ctx, "pvesh", "set", "/cluster/sdn/zones/"+Zone, "--dhcp", "dnsmasq", "--ipam", "pve"); err != nil {
 			return err
 		}
 		changed = true
 	}
 	if !in.PVE.SDNExists(ctx, "vnets/"+VNet) {
 		if err := in.run(ctx, "pvesh", "create", "/cluster/sdn/vnets", "--vnet", VNet, "--zone", Zone); err != nil {
+			return err
+		}
+		changed = true
+	}
+	subnets, err := in.PVE.Subnets(ctx, VNet)
+	if err != nil && !in.Change.DryRun {
+		return err
+	}
+	args := []string{"--gateway", w.gateway.String(), "--snat", "1", "--dhcp-range", w.dhcpRange(),
+		"--dhcp-dns-server", dns.String()}
+	i := slices.IndexFunc(subnets, func(sn pvecli.Subnet) bool { return sn.CIDR == w.subnet.String() })
+	switch {
+	case i < 0:
+		if err := in.run(ctx, "pvesh", append([]string{"create", "/cluster/sdn/vnets/" + VNet + "/subnets",
+			"--type", "subnet", "--subnet", w.subnet.String()}, args...)...); err != nil {
+			return err
+		}
+		changed = true
+	case subnetDrift(subnets[i], w, dns) != "":
+		if err := in.run(ctx, "pvesh", append([]string{"set", "/cluster/sdn/vnets/" + VNet + "/subnets/" +
+			subnets[i].ID}, args...)...); err != nil {
 			return err
 		}
 		changed = true
@@ -119,10 +156,55 @@ func (in *Installer) createNetwork(ctx context.Context) error {
 	return nil
 }
 
+// subnetDrift says how the worker subnet differs from what createNetwork sets up, or returns "".
+func subnetDrift(sn pvecli.Subnet, w workerNet, dns netip.Addr) string {
+	switch {
+	case sn.Gateway != w.gateway.String():
+		return "its gateway is " + sn.Gateway + ", not " + w.gateway.String()
+	case sn.SNAT != 1:
+		return "SNAT is off"
+	case len(sn.DHCPRange) != 1 || sn.DHCPRange[0] != (pvecli.DHCPRange{Start: w.first.String(), End: w.last.String()}):
+		return "its DHCP range isn't " + w.first.String() + "-" + w.last.String()
+	case sn.DNSServer != dns.String():
+		return "its DNS server is " + sn.DNSServer + ", not the host's " + dns.String()
+	}
+	return ""
+}
+
+// networkDrift returns what differs between the worker network and what createNetwork sets up, or nothing.
+func (in *Installer) networkDrift(ctx context.Context, s *settings.Settings) []string {
+	w, err := workerNetwork(s)
+	if err != nil {
+		return []string{err.Error()}
+	}
+	dns, err := in.hostDNS(ctx, s)
+	if err != nil {
+		return []string{err.Error()}
+	}
+	zone, err := in.PVE.SDNObject(ctx, "zones/"+Zone)
+	if err != nil {
+		return []string{"SDN zone " + Zone + " is missing"}
+	}
+	if zone["dhcp"] != "dnsmasq" || zone["ipam"] != "pve" {
+		return []string{"SDN zone " + Zone + " doesn't use SDN DHCP"}
+	}
+	subnets, err := in.PVE.Subnets(ctx, VNet)
+	if err != nil {
+		return []string{"SDN VNet " + VNet + " is missing"}
+	}
+	i := slices.IndexFunc(subnets, func(sn pvecli.Subnet) bool { return sn.CIDR == w.subnet.String() })
+	if i < 0 {
+		return []string{"the worker subnet " + w.subnet.String() + " is missing"}
+	}
+	if d := subnetDrift(subnets[i], w, dns); d != "" {
+		return []string{"the worker subnet: " + d}
+	}
+	return nil
+}
+
 // Asset names of a release.
 func runnerImage(v release.Version) string     { return "par-runner-" + v.String() + ".qcow2" }
 func runnerManifest(v release.Version) string  { return "par-runner-" + v.String() + ".json" }
-func gatewayImage(v release.Version) string    { return "par-gateway-" + v.String() + ".qcow2" }
 func controllerImage(v release.Version) string { return "parcon-" + v.String() + ".qcow2" }
 
 // BinaryAsset is the release's parcon binary.
@@ -236,15 +318,18 @@ func (in *Installer) importTemplate(ctx context.Context, s *settings.Settings, a
 	for _, args := range [][]string{
 		{"create", id, "--name", "par-runner-" + strings.ReplaceAll(in.Version.String(), ".", "-"), "--pool",
 			RunnerPool, "--memory", "2048", "--cores", "2", "--cpu", "host", "--ostype", "l26", "--scsihw",
-			"virtio-scsi-single", "--net0", "virtio,bridge=" + VNet, "--agent", "enabled=1", "--serial0", "socket",
-			"--vga", "serial0", "--tags", tags},
+			"virtio-scsi-single", "--net0", "virtio,bridge=" + VNet + ",firewall=1", "--agent", "enabled=1",
+			"--serial0", "socket", "--vga", "serial0", "--tags", tags},
 		{"set", id, "--scsi0", s.Proxmox.Storage + ":0,import-from=" + image},
 		{"set", id, "--ide2", s.Proxmox.Storage + ":cloudinit", "--boot", "order=scsi0", "--ipconfig0", "ip=dhcp"},
-		{"template", id},
 	} {
 		if err := in.run(ctx, "qm", args...); err != nil {
 			return err
 		}
 	}
-	return nil
+	// Before it becomes a template: clones copy its firewall, and the controller starts no worker without it.
+	if err := in.templateFirewall(ctx, id); err != nil {
+		return err
+	}
+	return in.run(ctx, "qm", "template", id)
 }

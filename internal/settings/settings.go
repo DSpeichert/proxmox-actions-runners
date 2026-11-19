@@ -29,7 +29,7 @@ import (
 const DefaultPath = "/etc/proxmox-actions-runners/settings.yaml"
 
 // Version is the settings file's format version.
-const Version = 1
+const Version = 2
 
 // DHCP is the value of an address setting that asks for DHCP.
 const DHCP = "dhcp"
@@ -45,20 +45,20 @@ type Settings struct {
 	Worker config.Worker `yaml:"worker,omitempty"`
 }
 
-// Network is the LAN side of the gateway and controller VMs, and the worker network behind the gateway.
+// Network is the controller VM's LAN side, and the worker network.
 type Network struct {
-	// Bridge is the LAN bridge the gateway and controller VMs attach to.
+	// Bridge is the LAN bridge the controller VM attaches to.
 	Bridge string `yaml:"bridge"`
 	// VLAN is the VLAN tag on the bridge; 0 means none.
 	VLAN int `yaml:"vlan,omitempty"`
 	// PVEAddress is the address the controller reaches the API on. Empty means the host's first address on Bridge.
 	PVEAddress string `yaml:"pveAddress,omitempty"`
-	// GatewayIP and ControllerIP are "dhcp" or a static address with its prefix, such as 192.0.2.10/24.
-	GatewayIP    string `yaml:"gatewayIP"`
+	// ControllerIP is "dhcp" or a static address with its prefix, such as 192.0.2.10/24.
 	ControllerIP string `yaml:"controllerIP"`
 	// LANGateway is the LAN's router, needed with a static address.
 	LANGateway string `yaml:"lanGateway,omitempty"`
-	// WorkerSubnet is the worker network's IPv4 subnet.
+	// WorkerSubnet is the worker network's IPv4 subnet. The host takes its first address, and SDN DHCP hands out
+	// the rest.
 	WorkerSubnet string `yaml:"workerSubnet"`
 }
 
@@ -102,7 +102,6 @@ func Default() Settings {
 		Version: Version,
 		Network: Network{
 			Bridge:       config.DefaultBridge,
-			GatewayIP:    DHCP,
 			ControllerIP: DHCP,
 			WorkerSubnet: config.DefaultWorkerSubnet,
 		},
@@ -134,6 +133,15 @@ func Load(path string) (*Settings, error) {
 
 // Parse decodes and validates settings. Unknown fields are errors.
 func Parse(data []byte) (*Settings, error) {
+	// The version comes first: an older version's fields would fail the strict decode below.
+	var v struct {
+		Version int `yaml:"version"`
+	}
+	if yaml.Unmarshal(data, &v) == nil && v.Version == 1 {
+		// Version 1 is the gateway VM's layout. Its install can't be updated in place.
+		return nil, errors.New("these settings are from a release with a gateway VM, which this release replaces " +
+			"with the Proxmox firewall; run parcon uninstall, then parcon install")
+	}
 	var s Settings
 	dec := yaml.NewDecoder(bytes.NewReader(data))
 	dec.KnownFields(true)
@@ -200,6 +208,12 @@ var (
 	slugPattern        = regexp.MustCompile(`^[a-z0-9][a-z0-9-]*$`)
 )
 
+// DHCPLeases is how many addresses a worker subnet's DHCP range holds: all but the network address, the host's
+// gateway address, and the broadcast address.
+func DHCPLeases(subnet netip.Prefix) int {
+	return 1<<(32-subnet.Bits()) - 3
+}
+
 // Validate checks every setting and reports every problem.
 func (s *Settings) Validate() error {
 	var p []string
@@ -215,17 +229,10 @@ func (s *Settings) Validate() error {
 	if a, err := netip.ParseAddr(n.PVEAddress); n.PVEAddress != "" && (err != nil || !a.Is4()) {
 		add("network.pveAddress", "%q must be an IPv4 address", n.PVEAddress)
 	}
-	static := false
-	for _, a := range []struct{ field, value string }{
-		{"network.gatewayIP", n.GatewayIP}, {"network.controllerIP", n.ControllerIP},
-	} {
-		if a.value == DHCP {
-			continue
-		}
-		static = true
-		if p, err := netip.ParsePrefix(a.value); err != nil || !p.Addr().Is4() {
-			add(a.field, "%q must be dhcp or an IPv4 address with its prefix, such as 192.0.2.10/24", a.value)
-		}
+	static := n.ControllerIP != DHCP
+	if p, err := netip.ParsePrefix(n.ControllerIP); static && (err != nil || !p.Addr().Is4()) {
+		add("network.controllerIP", "%q must be dhcp or an IPv4 address with its prefix, such as 192.0.2.10/24",
+			n.ControllerIP)
 	}
 	if a, err := netip.ParseAddr(n.LANGateway); static && (err != nil || !a.Is4()) {
 		add("network.lanGateway", "the LAN router's IPv4 address is required with a static address")
@@ -235,6 +242,9 @@ func (s *Settings) Validate() error {
 	} else if sub.Bits() < 8 || sub.Bits() > 29 || sub.Masked() != sub {
 		add("network.workerSubnet", "%q must be a network address with a /8 to /29 prefix, such as %s",
 			n.WorkerSubnet, sub.Masked())
+	} else if leases := DHCPLeases(sub); leases < s.ScaleSet.MaxRunners+config.ReservedVMIDs {
+		add("network.workerSubnet", "%s has %d DHCP addresses but needs %d: maxRunners plus %d reserved",
+			n.WorkerSubnet, leases, s.ScaleSet.MaxRunners+config.ReservedVMIDs, config.ReservedVMIDs)
 	}
 
 	if !idPattern.MatchString(s.Proxmox.Storage) {

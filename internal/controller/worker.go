@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strconv"
 	"time"
 
@@ -278,10 +279,11 @@ func (c *Controller) create(ctx context.Context, s *scaleSetState, template prox
 
 	w := s.cfg.Worker
 	settings := map[string]string{
-		"tags":      proxmox.FormatTags(workerTags(s.cfg.Name, created, template.VMID, false)),
-		"cores":     strconv.Itoa(w.Cores),
-		"memory":    strconv.Itoa(w.MemoryMiB),
-		"net0":      "virtio,bridge=" + p.VNet,
+		"tags":   proxmox.FormatTags(workerTags(s.cfg.Name, created, template.VMID, false)),
+		"cores":  strconv.Itoa(w.Cores),
+		"memory": strconv.Itoa(w.MemoryMiB),
+		// The worker firewall, copied from the template, applies only with firewall=1 on the NIC.
+		"net0":      "virtio,bridge=" + p.VNet + ",firewall=1",
 		"ipconfig0": "ip=dhcp",
 		"onboot":    "0",
 		// The controller reaches workers only through the guest agent.
@@ -295,6 +297,9 @@ func (c *Controller) create(ctx context.Context, s *scaleSetState, template prox
 	}
 	if err := c.pve.GrowDisk(ctx, vmid, rootDisk, w.FreeDiskGiB); err != nil {
 		return fmt.Errorf("grow disk: %w", err)
+	}
+	if err := c.checkFirewall(ctx, vmid); err != nil {
+		return err
 	}
 
 	ghCtx, cancel := c.withGitHubTimeout(ctx)
@@ -326,6 +331,25 @@ func (c *Controller) create(ctx context.Context, s *scaleSetState, template prox
 	log.InfoContext(ctx, "worker ready", slog.Duration("took", c.now().Sub(created)))
 	return nil
 }
+
+// checkFirewall makes sure the worker's firewall, copied from its template, is on, drops what comes in, and uses
+// the worker security group, which keeps it off the LAN and the host. A worker without it never starts.
+func (c *Controller) checkFirewall(ctx context.Context, vmid int) error {
+	fw, err := c.pve.Firewall(ctx, vmid)
+	if err != nil {
+		return fmt.Errorf("check firewall: %w", err)
+	}
+	group := c.cfg.Proxmox.FirewallGroup
+	if !fw.Enabled || fw.PolicyIn != "DROP" || !slices.Contains(fw.Groups, group) {
+		return fmt.Errorf("%w: worker %d's firewall is %+v, want it on, policy_in DROP, and group %s; its template "+
+			"lacks the firewall parcon gives it: run parcon update --force on the host", errNoFirewall, vmid, fw,
+			group)
+	}
+	return nil
+}
+
+// errNoFirewall means a worker lacks the worker firewall.
+var errNoFirewall = errors.New("worker firewall missing")
 
 // waitForAgent pings the worker's guest agent until it answers or deadline passes.
 func (c *Controller) waitForAgent(ctx context.Context, vmid int, deadline time.Time) error {

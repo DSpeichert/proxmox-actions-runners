@@ -35,6 +35,7 @@ func TestMarshalRoundTrips(t *testing.T) {
 	}
 	want := *in
 	want.Proxmox.Zone = DefaultZone
+	want.Proxmox.FirewallGroup = WorkerFirewallGroup
 	want.Worker.FreeDiskGiB = DefaultFreeDiskGiB
 	want.ScaleSets = []ScaleSet{in.ScaleSets[0]}
 	want.ScaleSets[0].RunnerGroup = DefaultRunnerGroup

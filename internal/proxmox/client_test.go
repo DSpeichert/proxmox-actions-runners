@@ -585,6 +585,26 @@ func TestStorageStatus(t *testing.T) {
 	}
 }
 
+func TestFirewall(t *testing.T) {
+	f := newFakePVE(t)
+	f.reply(http.MethodGet, "/nodes/pve1/qemu/10000/firewall/options", reply{Data: map[string]any{
+		"enable": 1, "dhcp": 1, "policy_in": "DROP", "policy_out": "ACCEPT",
+	}})
+	f.reply(http.MethodGet, "/nodes/pve1/qemu/10000/firewall/rules", reply{Data: []map[string]any{
+		{"pos": 0, "type": "group", "action": "par-worker", "enable": 1},
+		{"pos": 1, "type": "group", "action": "disabled-group", "enable": 0},
+		{"pos": 2, "type": "in", "action": "ACCEPT", "enable": 1},
+	}})
+	got, err := f.client().Firewall(context.Background(), 10000)
+	if err != nil {
+		t.Fatalf("Firewall: %v", err)
+	}
+	want := Firewall{Enabled: true, PolicyIn: "DROP", Groups: []string{"par-worker"}}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("Firewall = %+v, want %+v", got, want)
+	}
+}
+
 func TestPermissions(t *testing.T) {
 	f := newFakePVE(t)
 	f.reply(http.MethodGet, "/access/permissions", reply{Data: map[string]any{

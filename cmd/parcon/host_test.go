@@ -35,7 +35,7 @@ func TestSettingsFlags(t *testing.T) {
 	}
 
 	s, sf, err = parseSettingsFlags(t, "--bridge", "vmbr1", "--vlan", "20", "--vmid-range", "20000-20099",
-		"--scale-set", "big", "--labels", "big,linux", "--gateway-ip", "192.0.2.10/24", "--lan-gateway", "192.0.2.1",
+		"--scale-set", "big", "--labels", "big,linux", "--controller-ip", "192.0.2.10/24", "--lan-gateway", "192.0.2.1",
 		"--github-url", "https://github.com/my-org/", "--set", "runners.max=4", "--set", "worker.memory=16GiB",
 		"--app", "manual", "--client-id", "Iv23liEXAMPLE")
 	if err != nil || !sf.given {
@@ -63,7 +63,7 @@ func TestSettingsFlagsRefuse(t *testing.T) {
 		{[]string{"--set", "worker.memory=16GB"}, "use GiB or MiB"},
 		{[]string{"--set", "worker.disk=1"}, "unknown key"},
 		{[]string{"--app", "browser"}, "--app must be manifest or manual"},
-		{[]string{"--gateway-ip", "192.0.2.10/24"}, "network.lanGateway"},
+		{[]string{"--controller-ip", "192.0.2.10/24"}, "network.lanGateway"},
 	} {
 		if _, _, err := parseSettingsFlags(t, tt.args...); err == nil || !strings.Contains(err.Error(), tt.want) {
 			t.Errorf("%v: %v, want %q", tt.args, err, tt.want)

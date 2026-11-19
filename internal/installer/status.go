@@ -21,7 +21,7 @@ import (
 )
 
 // StatusSchema is the version of `parcon status --json`'s format.
-const StatusSchema = 1
+const StatusSchema = 2
 
 // StatusLevel is how a status line is judged.
 type StatusLevel string
@@ -52,7 +52,6 @@ type Report struct {
 	LatestError string `json:"latestError,omitempty"`
 
 	Host       []Finding                   `json:"host"`
-	Gateway    *SystemVMStatus             `json:"gateway,omitempty"`
 	Controller *SystemVMStatus             `json:"controller,omitempty"`
 	GitHub     []Finding                   `json:"github"`
 	ScaleSets  []controller.ScaleSetStatus `json:"scaleSets,omitempty"`
@@ -64,7 +63,7 @@ type Report struct {
 	SettingsWarnings []string `json:"settingsWarnings,omitempty"`
 }
 
-// SystemVMStatus is the gateway or controller VM.
+// SystemVMStatus is the controller VM.
 type SystemVMStatus struct {
 	VMID     int       `json:"vmid"`
 	Running  bool      `json:"running"`
@@ -101,10 +100,8 @@ type SettingStatus struct {
 // Failed reports whether anything in the report failed.
 func (r *Report) Failed() bool {
 	all := slices.Concat(r.Host, r.GitHub)
-	for _, vm := range []*SystemVMStatus{r.Gateway, r.Controller} {
-		if vm != nil {
-			all = append(all, vm.Findings...)
-		}
+	if r.Controller != nil {
+		all = append(all, r.Controller.Findings...)
 	}
 	return slices.ContainsFunc(all, func(f Finding) bool { return f.Level == FAIL })
 }
@@ -170,13 +167,6 @@ func (in *Installer) Status(ctx context.Context) (*Report, error) {
 		r.Host = in.hostFindings(ctx, s)
 		return worst(r.Host)
 	})
-	gateway, hasGateway := findSystemVM(vms, vmtags.Gateway)
-	if hasGateway {
-		part(fmt.Sprintf("gateway VM %d", gateway.VMID), func() StatusLevel {
-			r.Gateway = in.gatewayStatus(ctx, gateway)
-			return worst(r.Gateway.Findings)
-		})
-	}
 	var snapshot *controller.Status
 	ctrl, hasController := findSystemVM(vms, vmtags.Controller)
 	if hasController {
@@ -206,8 +196,9 @@ func (in *Installer) Status(ctx context.Context) (*Report, error) {
 	wg.Wait()
 	progress("")
 
-	if !hasGateway {
-		r.Host = append(r.Host, Finding{FAIL, "there is no gateway VM; run parcon install"})
+	if gateway, ok := findSystemVM(vms, vmtags.Gateway); ok {
+		r.Host = append(r.Host, Finding{FAIL, fmt.Sprintf("gateway VM %d is from an older release, which this "+
+			"release can't update; run parcon uninstall, then parcon install", gateway.VMID)})
 	}
 	if !hasController {
 		r.Host = append(r.Host, Finding{FAIL, "there is no controller VM; run parcon install"})
@@ -273,6 +264,7 @@ func (in *Installer) hostFindings(ctx context.Context, s *settings.Settings) []F
 	} else {
 		f = append(f, Finding{OK, fmt.Sprintf("pools, role, token, and the worker network %s/%s", Zone, VNet)})
 	}
+	f = append(f, in.networkFindings(ctx, s)...)
 	for _, c := range []struct {
 		name string
 		r    result
@@ -285,6 +277,25 @@ func (in *Installer) hostFindings(ctx context.Context, s *settings.Settings) []F
 			level = WARN
 		}
 		f = append(f, Finding{level, c.name + ": " + c.r.reason})
+	}
+	return f
+}
+
+// networkFindings judges the worker network and firewall: without the datacenter firewall, workers reach the LAN.
+func (in *Installer) networkFindings(ctx context.Context, s *settings.Settings) []Finding {
+	var f []Finding
+	if on, err := in.PVE.ClusterFirewall(ctx); err != nil || !on {
+		f = append(f, Finding{FAIL, "the datacenter firewall is off: workers can reach the LAN and the host. " +
+			"Turn it on under Datacenter > Firewall > Options"})
+	}
+	if drift := append(in.networkDrift(ctx, s), in.firewallDrift(ctx, s)...); len(drift) > 0 {
+		f = append(f, Finding{FAIL, strings.Join(drift, "; ") + "; run parcon update to correct it"})
+	} else {
+		f = append(f, Finding{OK, fmt.Sprintf("worker subnet %s with SNAT and DHCP; firewall group %s and IP set %s",
+			s.Network.WorkerSubnet, FirewallGroup, BlockedIPSet)})
+	}
+	if !in.Sys.ServiceActive(ctx, "dnsmasq@"+Zone+".service") {
+		f = append(f, Finding{FAIL, "dnsmasq@" + Zone + " isn't active: workers get no DHCP lease"})
 	}
 	return f
 }
@@ -309,24 +320,6 @@ func (in *Installer) systemVMStatus(ctx context.Context, vm proxmox.VM) *SystemV
 	}
 	if a, ok := in.agentIPv4(ctx, vm.VMID); ok {
 		st.Address = a.String()
-	}
-	return st
-}
-
-func (in *Installer) gatewayStatus(ctx context.Context, vm proxmox.VM) *SystemVMStatus {
-	st := in.systemVMStatus(ctx, vm)
-	if len(st.Findings) > 0 {
-		// It holds no state, so replacing it is always safe; a stopped update can leave it without a disk.
-		st.Findings = append(st.Findings, Finding{FAIL, "parcon update --force replaces it"})
-		return st
-	}
-	st.Findings = append(st.Findings, Finding{OK, fmt.Sprintf("running, release %s, %s", orNone(st.Release), orNone(st.Address))})
-	out, err := in.guest(ctx, vm.VMID, "systemctl", "is-active", "dnsmasq.service", "nftables.service")
-	if err != nil {
-		st.Findings = append(st.Findings, Finding{FAIL, "dnsmasq or nftables isn't active (" +
-			strings.ReplaceAll(out, "\n", ", ") + "): workers get no network"})
-	} else {
-		st.Findings = append(st.Findings, Finding{OK, "DHCP, DNS, and NAT for the worker network are active"})
 	}
 	return st
 }
@@ -514,15 +507,9 @@ func (r *Report) Render(w io.Writer, now time.Time) {
 	for _, f := range r.Host {
 		line(f)
 	}
-	for _, vm := range []struct {
-		name string
-		st   *SystemVMStatus
-	}{{"Gateway", r.Gateway}, {"Controller", r.Controller}} {
-		if vm.st == nil {
-			continue
-		}
-		p("\n%s VM %d", vm.name, vm.st.VMID)
-		for _, f := range vm.st.Findings {
+	if r.Controller != nil {
+		p("\nController VM %d", r.Controller.VMID)
+		for _, f := range r.Controller.Findings {
 			line(f)
 		}
 	}

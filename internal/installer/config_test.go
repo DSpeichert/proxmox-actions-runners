@@ -41,7 +41,7 @@ func TestSetConfig(t *testing.T) {
 	}
 	for _, want := range []string{"parcon check config -config /etc/proxmox-actions-runners/config.yaml.new",
 		"systemctl try-restart parcon.service", "journalctl -u parcon.service"} {
-		if !ti.node.ran("qm guest exec 101") || !strings.Contains(strings.Join(ti.node.lines(), "\n"), want) {
+		if !ti.node.ran("qm guest exec 100") || !strings.Contains(strings.Join(ti.node.lines(), "\n"), want) {
 			t.Errorf("didn't run %s", want)
 		}
 	}
@@ -147,8 +147,8 @@ func TestStatus(t *testing.T) {
 	if !strings.HasPrefix(progress, "Collecting the status of each part:\n") {
 		t.Errorf("progress:\n%s", progress)
 	}
-	for _, want := range []string{"ok    node pve1, its settings, and its VMs (", "ok    gateway VM 100 (",
-		"ok    controller VM 101 (", "ok    the latest release on GitHub (",
+	for _, want := range []string{"ok    node pve1, its settings, and its VMs (",
+		"ok    controller VM 100 (", "ok    the latest release on GitHub (",
 		"ok    the host's Proxmox objects and tuning (",
 		"ok    the runner template against actions/runner's latest release ("} {
 		if !strings.Contains(progress, want) {
@@ -161,8 +161,8 @@ func TestStatus(t *testing.T) {
 		"proxmox-actions-runners 0.2.0 on pve1",
 		"up to date with the latest release, 0.2.0",
 		"ok    pools, role, token, and the worker network parzone/parnet",
-		"Gateway VM 100", "DHCP, DNS, and NAT for the worker network are active",
-		"Controller VM 101", "parcon.service is active", "its config matches the settings",
+		"ok    worker subnet 10.251.0.0/22 with SNAT and DHCP; firewall group par-worker and IP set par-blocked",
+		"Controller VM 100", "parcon.service is active", "its config matches the settings",
 		"scale set proxmox-ubuntu-26.04 (ID 3): listening for jobs for 2h",
 		"jobs: 1 waiting, 1 running; runners: 1 (1 busy, 0 idle)",
 		"template 10096 has actions/runner 2.338.0, the latest",
@@ -187,6 +187,19 @@ func TestStatus(t *testing.T) {
 	s.ScaleSet.MaxRunners = 1
 	must(t, s.Save(ti.SettingsPath))
 
+	// A datacenter firewall that was turned off, and SDN's DHCP that stopped, fail.
+	ti.node.clusterFW = false
+	ti.node.services["dnsmasq@parzone.service"] = false
+	r, _ = ti.Status(context.Background())
+	out.Reset()
+	r.Render(&out, ti.Now())
+	if !r.Failed() || !strings.Contains(out.String(), "FAIL  the datacenter firewall is off") ||
+		!strings.Contains(out.String(), "FAIL  dnsmasq@parzone isn't active") {
+		t.Errorf("status:\n%s", out.String())
+	}
+	ti.node.clusterFW = true
+	ti.node.services["dnsmasq@parzone.service"] = true
+
 	// A stopped controller, a config that drifted, and a stale runner fail or warn.
 	c.files[config.DefaultPath] = "# edited by hand\n"
 	latestRunnerRelease = func(context.Context) (github.RunnerRelease, error) {
@@ -208,7 +221,7 @@ func TestSetConfigMaxLifetime(t *testing.T) {
 	if err != nil || cfg.ScaleSets[0].MaxLifetime != 36*time.Hour {
 		t.Fatalf("controller config: %+v, %v", cfg, err)
 	}
-	if !ti.node.ran("qm guest exec 101 --timeout 480 -- systemctl try-restart parcon.service") {
+	if !ti.node.ran("qm guest exec 100 --timeout 480 -- systemctl try-restart parcon.service") {
 		t.Error("the controller wasn't restarted")
 	}
 	if out := ti.stdout.String(); !strings.Contains(out, "worker.maxLifetime: 6h -> 36h, which applies to every "+

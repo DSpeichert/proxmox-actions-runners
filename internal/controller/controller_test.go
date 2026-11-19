@@ -61,7 +61,7 @@ func TestScaleUpCreatesReadyWorkers(t *testing.T) {
 		if vm.vm.Name != name || vm.vm.Status != "running" || vm.vm.Pool != testPool {
 			t.Errorf("VM %d = %+v", vmid, vm.vm)
 		}
-		want := map[string]string{"cores": "2", "memory": "8192", "net0": "virtio,bridge=parnet",
+		want := map[string]string{"cores": "2", "memory": "8192", "net0": "virtio,bridge=parnet,firewall=1",
 			"ipconfig0": "ip=dhcp", "onboot": "0", "agent": "1", "ciupgrade": "0"}
 		for k, v := range want {
 			if vm.config[k] != v {
@@ -389,12 +389,43 @@ func TestWorkerWithoutRunnerIsRetired(t *testing.T) {
 	}
 }
 
+// A template without the worker firewall, such as one imported by hand, never yields a running worker: the clone is
+// destroyed before it registers a runner or boots.
+func TestWorkerWithoutFirewallNeverStarts(t *testing.T) {
+	for name, fw := range map[string]proxmox.Firewall{
+		"off":             {PolicyIn: "DROP", Groups: []string{"par-worker"}},
+		"accepts inbound": {Enabled: true, PolicyIn: "ACCEPT", Groups: []string{"par-worker"}},
+		"no group":        {Enabled: true, PolicyIn: "DROP"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			h := newHarness(t, testConfig())
+			h.pve.addTemplate(testTemplateID, 1)
+			h.pve.vms[testTemplateID].firewall = fw
+			h.want(1)
+			h.pass()
+			if got := h.pve.ids(); !reflect.DeepEqual(got, []int{testTemplateID}) {
+				t.Errorf("VMs left = %v, want the clone destroyed", got)
+			}
+			calls := strings.Join(h.pve.calls, "\n")
+			if strings.Contains(calls, "start ") {
+				t.Errorf("a worker without its firewall was started:\n%s", calls)
+			}
+			h.gh.mu.Lock()
+			defer h.gh.mu.Unlock()
+			if len(h.gh.runners) != 0 {
+				t.Errorf("%d runners registered", len(h.gh.runners))
+			}
+		})
+	}
+}
+
 func TestFailedCreationIsCleanedUp(t *testing.T) {
 	tests := []struct {
 		name     string
 		sabotage func(h *harness)
 	}{
 		{"configure fails", func(h *harness) { h.pve.fail["configure"] = errors.New("storage full") }},
+		{"firewall check fails", func(h *harness) { h.pve.fail["firewall"] = errors.New("API down") }},
 		{"start fails", func(h *harness) { h.pve.fail["start"] = errors.New("no memory") }},
 		{"JIT delivery fails", func(h *harness) { h.pve.fail["write"] = errors.New("agent error") }},
 		{"runner registration fails", func(h *harness) { h.gh.jitErr = errors.New("GitHub is down") }},

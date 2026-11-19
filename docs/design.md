@@ -205,7 +205,7 @@ workers alone, so restarting or upgrading it doesn't cancel jobs.
   token's ACLs. ([User Management](https://pve.proxmox.com/wiki/User_Management))
 - **Scope everything to a resource pool.** Grant the VM privileges on the runner pool only (the templates live there
   too), and the datastore and SDN privileges on the target storage and the worker VNet only. The token then can't
-  touch any other VM on the cluster, including the controller and gateway VMs in `par-system`.
+  touch any other VM on the cluster, including the controller VM in `par-system`, or the datacenter firewall.
 - **Guest-agent privileges** changed between releases. PVE 9 splits them into `VM.GuestAgent.Audit`, `FileRead`,
   `FileWrite`, `FileSystemMgmt`, and `Unrestricted`. Earlier releases gate the agent behind `VM.Monitor`. The
   controller needs only `Audit` for `agent/ping` and `FileWrite` for `agent/file-write` (JIT delivery). Without
@@ -242,22 +242,34 @@ controller's metrics are the signals to watch.
 
 Workers run untrusted code and should be treated as hostile to everything around them. Home labs and company
 networks differ too much to rely on the user's bridges, VLANs, or router rules, so the project brings its own
-network:
+network and enforces isolation with the Proxmox firewall at each worker's NIC:
 
-- Workers attach only to an isolated SDN VNet with no uplink and no host IP. The host acts as a switch for it and
-  never routes worker traffic.
-- A small gateway VM with one NIC on the LAN and one on the worker network is the only way out. It serves DHCP and
-  DNS, NATs outbound traffic, and drops traffic to the LAN, the Proxmox host, the controller VM, and private and
-  link-local ranges.
-- The controller never talks to workers over the network. It uses the Proxmox API and the guest agent.
+- Workers attach only to an SDN VNet with one subnet. The host is its gateway and SNATs worker traffic out of its
+  own uplink; SDN DHCP hands out addresses with the host's DNS server.
+- Each worker's own firewall, copied from its template, drops everything inbound that the worker didn't start and
+  sends outbound traffic through the security group `par-worker`: DNS to the host's resolver, then drop the worker
+  subnet, through the IP set SDN generates for the VNet (`+sdn/parnet-all`), and the IP set `par-blocked` (private,
+  CGNAT, and link-local ranges, the LAN, every address of the host, and the controller VM). Its rules use the
+  firewall's scoped references (`+sdn/`, `+dc/`, from Proxmox VE 8.3), so SDN keeps the subnet's set current and no
+  IP set of the same name elsewhere can shadow either one. The firewall sits in the host's bridge, where a job with root in its VM can't change it.
+- The controller never talks to workers over the network. It uses the Proxmox API and the guest agent, and it starts
+  no worker whose firewall isn't on with that group.
+
+The user installs `dnsmasq` (Proxmox's prerequisite for SDN DHCP) and turns on the datacenter firewall, without
+which no guest firewall applies. `parcon` checks both but changes neither: turning on the datacenter firewall also
+filters the host's own traffic, and only the user can tell whether that locks someone out.
 
 Alternatives considered:
 
 | Option | Why not |
 | ------ | ------- |
+| A gateway VM on the LAN and the worker network, with dnsmasq and nftables (releases up to 0.4) | One more VM to build, release, patch, and replace on every update, and a single point of failure. It kept the host from routing worker traffic, but didn't stop workers from reaching each other |
 | Workers on an existing bridge or VLAN | Isolation depends on the user's switch and router setup, which `parcon` can't check |
-| SDN simple zone with SNAT, with the host as gateway | The host routes untrusted traffic, isolation depends on the host's firewall setup, and host DHCP needs the `dnsmasq` package |
 | Route through the controller VM | Puts hostile traffic next to the VM that holds the secrets |
+
+The trade-off accepted with the firewall: the host routes untrusted traffic, and isolation holds only while the
+datacenter firewall is on. `parcon status` and `parcon check` fail while it is off, and `parcon update` refuses to
+run.
 
 Don't bake reusable credentials (VPN keys, registry passwords, cloud keys) into the template. Jobs that need network
 access should get short-lived credentials at run time, for example through GitHub OIDC. See
@@ -271,19 +283,17 @@ which repositories and workflows may use each scale set. One-job VMs already sto
 data.
 
 All scale sets share one worker network and one runner pool. Separate networks or pools per scale set were
-considered and dropped: they would multiply the gateway and SDN setup.
+considered and dropped: they would multiply the SDN and firewall setup.
 
-The gateway controls only traffic that leaves the worker network. Workers running at the same time share one
-layer-2 segment, so a hostile job can connect to services on other workers, answer their DHCP, or answer ARP for
-the gateway's address and intercept their traffic. Isolating workers from each other through the Proxmox firewall is
-planned: per-worker MAC and IP filters and an inbound DROP policy, enforced in the host's bridge, where a job can't
-turn them off. GitHub gets the same guarantees from Azure's network, which has no layer-2 broadcast and filters
-spoofed traffic, and it tells customers whose runners share a network to block all inbound connections. Until then,
-run jobs that must be protected from untrusted code on a separate node.
+The firewall drops traffic from one worker to another, since the group drops the worker subnet, and nothing
+reaches a worker that it didn't start. Workers running at the same time still share one layer-2 segment, so a
+hostile job could answer ARP for another worker's address; MAC filtering keeps it from sending from another MAC.
+GitHub gets stronger guarantees from Azure's network, which has no layer-2 broadcast and filters spoofed traffic.
+Run jobs that must be protected from untrusted code on a separate node.
 
 ## Managing the install from the host
 
-`parcon` on the Proxmox host installs and manages everything; the gateway and controller VMs need no logins. The
+`parcon` on the Proxmox host installs and manages everything; the controller VM needs no login. The
 first design had a Bash installer that did the install and upgrades, and left day-to-day changes to editing the
 controller's config inside its VM. That made the VMs something users had to log into, split the logic between Bash
 and Go, and kept the only record of how the node was set up in the controller VM's config.
@@ -310,7 +320,7 @@ Alternatives that were rejected:
 | Option | Why not |
 | ------ | ------- |
 | Keep the Bash installer and add a host CLI | Two implementations of the same steps, in two languages, drifting apart |
-| Keep the settings in the controller VM | Network settings (the gateway's subnet, the VMs' addresses) have no place there, and every command would need the VM to answer |
+| Keep the settings in the controller VM | Network settings (the worker subnet, the controller's address) have no place there, and every command would need the VM to answer |
 | Secrets on the host too | Makes the controller VM easy to replace, but puts the App's private key on the host's disk |
 | A root API token for the host | A credential stored on the host for what the local tools do without one |
 | A host service or timer | Invariant 8: nothing on the host runs unless the user runs it |

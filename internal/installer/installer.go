@@ -42,15 +42,14 @@ const (
 
 // Sizes, in GiB unless named otherwise.
 const (
-	// GatewayGiB and ControllerGiB are the gateway and controller images' and VMs' disks. Each image holds about 2.5
-	// GiB when built, but a kernel update (unattended-upgrades) briefly needs two kernels and a new initramfs.
-	GatewayGiB    = 6
+	// ControllerGiB is the controller image's and VM's disk. The image holds about 2.5 GiB when built, but a kernel
+	// update (unattended-upgrades) briefly needs two kernels and a new initramfs.
 	ControllerGiB = 6
-	// FreeGiB is what the VM storage needs for the default install: the gateway, controller, and template disks,
-	// and room for a worker.
+	// FreeGiB is what the VM storage needs for the default install: the controller and template disks, and room
+	// for a worker.
 	FreeGiB = 50
 	// DownloadDir holds the images between download and import, on the host's root filesystem; DownloadGiB is
-	// what the three need, with room to grow.
+	// what the two need, with room to grow.
 	DownloadDir = "/var/tmp"
 	DownloadGiB = 6
 )
@@ -208,7 +207,7 @@ func tagged(vms []proxmox.VM, pool, tag string) []proxmox.VM {
 	return out
 }
 
-// systemVM returns the gateway or controller VM, by its tag.
+// systemVM returns a VM in the system pool by its tag: the controller, or an older release's gateway.
 func (in *Installer) systemVM(ctx context.Context, tag string) (proxmox.VM, bool, error) {
 	vms, err := in.vms(ctx)
 	if err != nil {

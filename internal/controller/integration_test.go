@@ -21,6 +21,7 @@ import (
 //
 //	PAR_PVE_TEST_VMID             the tests use the 10 VMIDs after it; the proxmox package's test uses this one
 //	PAR_PVE_VNET                  the worker VNet; defaults to parnet
+//	PAR_PVE_FIREWALL_GROUP        the security group the templates' firewalls use; defaults to par-worker
 //	PAR_PVE_IMAGE_POOL            optional: a pool holding the real runner image as its only template
 //	PAR_PVE_IMAGE_TEMPLATE_VMID   that template's VMID
 //
@@ -198,10 +199,11 @@ func newLive(t *testing.T, poolVar string) *live {
 	linked := true
 	h.cfg = &config.Config{
 		Proxmox: config.Proxmox{
-			Node:    h.env("PAR_PVE_NODE", ""),
-			Pool:    h.env(poolVar, ""),
-			Storage: h.env("PAR_PVE_STORAGE", ""),
-			VNet:    h.env("PAR_PVE_VNET", "parnet"),
+			Node:          h.env("PAR_PVE_NODE", ""),
+			Pool:          h.env(poolVar, ""),
+			Storage:       h.env("PAR_PVE_STORAGE", ""),
+			VNet:          h.env("PAR_PVE_VNET", "parnet"),
+			FirewallGroup: h.env("PAR_PVE_FIREWALL_GROUP", config.WorkerFirewallGroup),
 			// Start above PAR_PVE_TEST_VMID, which the proxmox package's lifecycle test may be using right now:
 			// go test runs packages in parallel.
 			VMIDRange:   config.VMIDRange{Start: first + 1, End: first + 10},

@@ -176,6 +176,40 @@ func (c *Client) Clone(ctx context.Context, opts CloneOptions) error {
 	return nil
 }
 
+// Firewall is a VM's own firewall: its options and the security groups its rules use.
+type Firewall struct {
+	Enabled  bool
+	PolicyIn string
+	// Groups are the security groups of the VM's enabled group rules.
+	Groups []string
+}
+
+// Firewall returns a VM's firewall. It needs VM.Audit.
+func (c *Client) Firewall(ctx context.Context, vmid int) (Firewall, error) {
+	var opts struct {
+		Enable   pveBool `json:"enable"`
+		PolicyIn string  `json:"policy_in"`
+	}
+	if err := c.get(ctx, c.vmPath(vmid, "firewall", "options"), nil, &opts); err != nil {
+		return Firewall{}, fmt.Errorf("firewall options of VM %d: %w", vmid, err)
+	}
+	var rules []struct {
+		Type   string  `json:"type"`
+		Action string  `json:"action"`
+		Enable pveBool `json:"enable"`
+	}
+	if err := c.get(ctx, c.vmPath(vmid, "firewall", "rules"), nil, &rules); err != nil {
+		return Firewall{}, fmt.Errorf("firewall rules of VM %d: %w", vmid, err)
+	}
+	fw := Firewall{Enabled: bool(opts.Enable), PolicyIn: opts.PolicyIn}
+	for _, r := range rules {
+		if r.Type == "group" && bool(r.Enable) {
+			fw.Groups = append(fw.Groups, r.Action)
+		}
+	}
+	return fw, nil
+}
+
 // SetConfig changes VM options, such as cores, memory, net0, ipconfig0, or tags, and removes the options listed in
 // del. Proxmox applies the change synchronously. Values must never contain secrets: VM config is readable by
 // anyone with VM.Audit.

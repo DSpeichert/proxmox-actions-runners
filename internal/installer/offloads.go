@@ -14,8 +14,8 @@ import (
 )
 
 // On a node that is itself a VM, the LAN bridge's port is a virtio NIC, and its offloads are on by default. The NIC
-// merges incoming packets (GRO) that the bridge then forwards to the gateway VM, and workers' downloads stall at a
-// few KB/s while the host's own run at full speed. parcon turns those offloads off, now with ethtool and at each
+// merges incoming packets (GRO) that the host then routes to the worker network, and workers' downloads stall at
+// a few KB/s while the host's own run at full speed. parcon turns those offloads off, now with ethtool and at each
 // boot through a udev rule of its own, and uninstall turns them back on.
 
 // offloads are the offloads turned off: their names in `ethtool -K`, and in `ethtool -k`.

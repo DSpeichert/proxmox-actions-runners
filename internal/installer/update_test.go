@@ -43,7 +43,6 @@ func (s *signedSource) publish(t *testing.T, key ed25519.PrivateKey, version str
 	assets := map[string]string{
 		runnerImage(v):     "runner image " + version,
 		runnerManifest(v):  `{"builds":[{"custom_data":{"runner_version":"2.339.0"}}]}`,
-		gatewayImage(v):    "gateway image " + version,
 		controllerImage(v): "controller image " + version,
 		BinaryAsset(v):     "parcon " + version,
 	}
@@ -111,8 +110,6 @@ func TestUpgradeBringsTheNodeToTheRelease(t *testing.T) {
 	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
 	src := &signedSource{files: map[string][]byte{}}
 	v := src.publish(t, priv, "0.3.0")
-	oldGateway := ti.node.vmsTagged(vmtags.Gateway)[0]
-	gatewayNICs := ti.node.vms[oldGateway].config["net0"] + " " + ti.node.vms[oldGateway].config["net1"]
 	ti.Source, ti.Keys, ti.Assets, ti.Version, ti.Yes = src, []ed25519.PublicKey{pub}, "", v, true
 	ti.Self = ti.BinaryPath // the new parcon, as an update runs it
 	ti.node.guest = func(vm *fakeVM, argv []string, _ []byte) (int, string, string, bool) {
@@ -129,22 +126,18 @@ func TestUpgradeBringsTheNodeToTheRelease(t *testing.T) {
 	installedV, _ := release.ParseVersion("0.2.0")
 	must(t, ti.Upgrade(context.Background(), installedV, true, false))
 	out := ti.stdout.String()
-	for _, want := range []string{"import the 0.3.0 runner template", "replace gateway VM 100 with the new image",
-		"replace parcon 0.2.0 in controller VM 101 with 0.3.0", "render the controller's config",
-		"tag controller VM 101 with release 0.3.0"} {
+	for _, want := range []string{"import the 0.3.0 runner template",
+		"replace parcon 0.2.0 in controller VM 100 with 0.3.0", "render the controller's config",
+		"tag controller VM 100 with release 0.3.0"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("plan lacks %q:\n%s", want, out)
 		}
 	}
 	n := ti.node
-	if tmpl := n.vmsTagged("par-release-0.3.0"); len(tmpl) != 3 { // the template, the gateway, the controller
+	if tmpl := n.vmsTagged("par-release-0.3.0"); len(tmpl) != 2 { // the template and the controller
 		t.Errorf("VMs of 0.3.0: %v", tmpl)
 	}
-	gw := n.vms[oldGateway]
-	if gw == nil || gw.config["net0"]+" "+gw.config["net1"] != gatewayNICs || !gw.running {
-		t.Errorf("the new gateway = %+v, want the old NICs %s", gw, gatewayNICs)
-	}
-	if !n.ran("qm guest exec 101 --timeout 480 -- systemctl try-restart parcon.service") {
+	if !n.ran("qm guest exec 100 --timeout 480 -- systemctl try-restart parcon.service") {
 		t.Errorf("the controller wasn't restarted: %v", n.lines())
 	}
 
@@ -152,7 +145,7 @@ func TestUpgradeBringsTheNodeToTheRelease(t *testing.T) {
 	n.calls = nil
 	ti.stdout.Reset()
 	must(t, ti.Upgrade(context.Background(), v, true, false))
-	if !strings.Contains(ti.stdout.String(), "nothing needs updating") || n.ran("qm stop") {
+	if !strings.Contains(ti.stdout.String(), "nothing needs updating") || n.ran("pvesh create") {
 		t.Errorf("second upgrade:\n%s", ti.stdout)
 	}
 }

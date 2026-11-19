@@ -1,10 +1,10 @@
 # Install and host commands
 
 `parcon`, run as root on a standalone Proxmox VE 9 node, installs and manages the whole project. `parcon install`
-checks the host, creates an isolated worker network with a gateway VM, creates a small controller VM, imports the
-runner template, and registers the scale set. After that, `parcon status`, `parcon config`, `parcon update`, and
-`parcon uninstall` are how the user runs it; the gateway and controller VMs need no logins, since `parcon` reaches
-into them through the guest agent. [`install/install.sh`](../install/install.sh) is only the bootstrap: it
+checks the host, creates the worker network and its firewall, creates a small controller VM, imports the runner
+template, and registers the scale set. After that, `parcon status`, `parcon config`, `parcon update`, and
+`parcon uninstall` are how the user runs it; the controller VM needs no login, since `parcon` reaches into it
+through the guest agent. [`install/install.sh`](../install/install.sh) is only the bootstrap: it
 downloads the release's `parcon`, checks it against the checksum written into it, and runs `parcon install`.
 
 `parcon` changes the host only where the project needs it, almost entirely through Proxmox's own tools, and it can
@@ -12,17 +12,22 @@ remove everything it created. It installs only from a signed release.
 
 ## Goals
 
-- **One download, one command.** No clone, no build tools, and no packages to install first.
+- **One download, one command.** No clone and no build tools. The one package to install first is Proxmox's own
+  prerequisite for SDN DHCP, `dnsmasq`, and the one setting to turn on first is the datacenter firewall: `parcon`
+  checks both and says how, but leaves them to the user.
 - **Headless.** `parcon` runs in a root shell with no browser. The only browser step, creating the GitHub App,
   happens on any other device, and the user copies one code back.
 - **Minimal host footprint.** The host gets `parcon` itself, its settings, Proxmox objects (pools, a role, a user
-  and token, ACLs, VMs, and an SDN zone and VNet), and host tuning only where the runners need it: on a node that is
+  and token, ACLs, VMs, an SDN zone, VNet, and subnet, and the worker firewall's IP set, security group, and one host
+  rule), and host tuning only where the runners need it: on a node that is
   itself a VM, a udev rule that turns off the LAN NIC's offloads (see *Host NIC offloads*) and, on KVM, the
-  `no-kvm-apf` kernel parameter (see *Host KVM async page faults*). No apt packages, no services, no reboots, no
+  `no-kvm-apf` kernel parameter (see *Host KVM async page faults*). No apt packages, no services of its own, no
+  reboots, no
   cloud-init snippets, and no edits to files Proxmox or the user manages, such as `/etc/network/interfaces` or
   `storage.cfg`, except `/etc/kernel/cmdline` on a systemd-boot node, which has no room for a file of ours.
-- **Independent of the LAN.** Workers never share a network with the host or the LAN. A gateway VM connects their
-  network to the internet, so the design works the same whatever the LAN, VLAN, or host firewall setup is.
+- **Independent of the LAN.** Workers never share a network with the host or the LAN. The host routes their network
+  to the internet with SNAT, and the Proxmox firewall, applied to each worker's NIC, keeps them off the LAN and the
+  host, whatever the LAN or VLAN setup is.
 - **No-touch VMs.** Everything the user does, they do with `parcon` on the host. The controller VM keeps the secrets,
   which never leave it; the host keeps the settings, which hold none.
 - **Safe to re-run.** A second `parcon install` continues an install that stopped, and `parcon update` continues an
@@ -59,12 +64,12 @@ bash install.sh --storage local-zfs --set runners.max=4 --set worker.memory=16Gi
 
 | Flag | Default | Setting |
 | ---- | ------- | ------- |
-| `--bridge` | `vmbr0` | LAN bridge for the controller and gateway VMs |
+| `--bridge` | `vmbr0` | LAN bridge for the controller VM |
 | `--vlan` | none | VLAN tag on the LAN bridge |
 | `--pve-address` | the host's address on the bridge | the address the controller reaches the API on |
-| `--gateway-ip`, `--controller-ip` | `dhcp` | the VMs' LAN addresses: `dhcp` or a CIDR such as `192.0.2.10/24` |
+| `--controller-ip` | `dhcp` | the controller VM's LAN address: `dhcp` or a CIDR such as `192.0.2.10/24` |
 | `--lan-gateway` | none | the LAN's router, needed with a static address |
-| `--worker-subnet` | `10.251.0.0/22` | the worker network |
+| `--worker-subnet` | `10.251.0.0/22` | the worker network; its DHCP range must hold `runners.max` plus 4 |
 | `--storage` | `local-lvm` | storage for VM disks |
 | `--vmid-range` | `10000-10099` | VMIDs for workers and templates |
 | `--scale-set` | `proxmox-ubuntu-26.04` | the scale set's name, used in `runs-on` |
@@ -90,32 +95,29 @@ After the install, `parcon` in `/usr/local/bin` does the rest:
 | `parcon config apply` | Push the settings to the controller again, for example after the API's pinned certificate was renewed |
 | `parcon update [--pre] [--force] [--yes] [--dry-run]` | Update to the newest release, or pre-release with `--pre`. `--force` runs every step, even those already done for the release |
 | `parcon check` | Every check below, and after an install, the controller's own checks |
-| `parcon check network` | The worker network check from step 14, on demand |
+| `parcon check network` | The worker network check from step 13, on demand |
 | `parcon check config\|proxmox\|github\|template` | One of the controller's checks, run in the controller VM |
 | `parcon uninstall [--yes] [--dry-run]` | Remove everything, `parcon` included |
 
 ## Architecture
 
 ```
- Proxmox VE 9 node (host: parcon, its settings, and Proxmox objects)
+ Proxmox VE 9 node (host: parcon, its settings, Proxmox objects, and the datacenter firewall)
  ┌──────────────────────────────────────────────────────────────────────────────────┐
  │  pool par-system                            pool par-runners                     │
  │  ┌──────────────────────┐   PVE API +       ┌─────────────────────────────────┐  │
  │  │ controller VM        │   guest agent     │ runner template (versioned)     │  │
  │  │  config + secrets    ├──────────────────►│   │ linked clone                │  │
  │  └──────────┬───────────┘                   │   ▼                             │  │
- │             │                               │ worker VMs (one job each)       │  │
+ │             │                               │ worker VMs (one job each), each │  │
+ │             │                               │ with firewall=1: in dropped,    │  │
+ │             │                               │ out through group par-worker    │  │
  │             │                               └───────────────┬─────────────────┘  │
- │             │                                               │                    │
- │             │                                               │ worker network:    │
- │             │                                               │ VNet parnet (no    │
- │             │                                               │ uplink, no host IP)│
- │             │           ┌──────────────────────┐            │                    │
- │             │           │ gateway VM           │ net1       │                    │
- │             │           │  DHCP, DNS, NAT,     ├────────────┘                    │
- │             │           │  firewall            │                                 │
- │             │           └──────────┬───────────┘                                 │
- │             │                      │ net0                                        │
+ │             │                                               │ VNet parnet,       │
+ │             │                                               │ subnet 10.251.0/22 │
+ │             │           host: 10.251.0.1, SDN DHCP          │                    │
+ │             │           (dnsmasq@parzone), SNAT  ◄──────────┘                    │
+ │             │                      │                                             │
  │  ───────────┴──────────────────────┴──── LAN bridge (e.g. vmbr0)                 │
  └─────────────────────────────┬────────────────────────────────────────────────────┘
                                ▼
@@ -125,16 +127,19 @@ After the install, `parcon` in `/usr/local/bin` does the rest:
 - The **controller VM** runs the controller as a systemd service and holds the config and secrets. It sits on the
   LAN because it needs the Proxmox API and GitHub. It has no NIC on the worker network and reaches workers only
   through the Proxmox API and the guest agent.
-- The **gateway VM** has one NIC on the LAN and one on the worker network. It is the workers' default gateway,
-  DHCP server, and DNS forwarder, and it NATs their traffic out through the LAN. Its firewall allows outbound
-  internet traffic and drops traffic to the LAN, the Proxmox host, the controller VM, and private and link-local
-  ranges. It holds no secrets.
-- The **worker network** is an SDN simple zone `parzone` with one VNet `parnet`. It has no subnet, host IP, SNAT, or
-  DHCP on the host, so the host is just a switch for it and never routes worker traffic.
-- The API token can act only on the `par-runners` pool. The controller and gateway VMs live in `par-system`, so a
-  compromised controller can't change or delete itself, the gateway, or any VM outside the runner pool.
+- The **worker network** is an SDN simple zone `parzone` with SDN DHCP, one VNet `parnet`, and one subnet. The host
+  has the subnet's first address, which is the workers' gateway, and SNATs their traffic out of its own uplink. SDN's
+  dnsmasq (`dnsmasq@parzone`) hands out the rest of the subnet, with the host's DNS server.
+- The **worker firewall** is Proxmox's own, applied at each worker's NIC in the host's bridge, where a job can't turn
+  it off. Each worker's firewall is on, drops everything inbound that the worker didn't start, allows DHCP, and uses
+  the datacenter security group `par-worker`: DNS to the host's resolver, then nothing on the worker subnet (SDN's
+  IP set `+sdn/parnet-all`) and nothing in the IP set `par-blocked` (RFC 1918, CGNAT, link-local, the LAN, every
+  address of the host, and the controller VM). The rest of the internet is allowed. It takes effect only with the datacenter firewall on, which the user turns on.
+- The API token can act only on the `par-runners` pool. The controller VM lives in `par-system`, so a compromised
+  controller can't change or delete itself, or any VM outside the runner pool. Nor can it change the firewall: the
+  token has no privileges on the datacenter firewall, and the controller starts no worker whose firewall isn't on.
 - **Workers** attach only to `parnet`.
-- **`parcon` on the host** drives Proxmox through `pvesh`, `pveum`, and `qm` as root, and the two VMs through
+- **`parcon` on the host** drives Proxmox through `pvesh`, `pveum`, and `qm` as root, and the controller VM through
   `qm guest exec`. It holds the settings but no secrets: the token's secret and the App's key go straight into the
   controller VM on a command's stdin.
 
@@ -150,7 +155,6 @@ published, and the release stays a draft until every file is uploaded.
 | `install.sh` | The bootstrap, with this release's version and `parcon`'s checksum written in | Release workflow |
 | `parcon-<ver>-linux-amd64` | `parcon`, for the host and the controller VM | Release workflow |
 | `parcon-<ver>.qcow2` | The controller VM: Ubuntu 26.04, `qemu-guest-agent`, `unattended-upgrades`, the `parcon` binary, user, and unit | Packer `qemu` builder in CI (`images/controller/`) |
-| `par-gateway-<ver>.qcow2` | The gateway VM: Ubuntu 26.04, `qemu-guest-agent`, `unattended-upgrades`, nftables, dnsmasq, `par-gateway-configure` | Packer `qemu` builder in CI (`images/gateway/`) |
 | `par-runner-<ver>.qcow2` | The runner template: Ubuntu 26.04, `qemu-guest-agent`, the `runner` user, a pinned `actions/runner`, Docker, and a few basics | Packer `qemu` builder in CI (`images/runner/`) |
 | `par-runner-<ver>.json` | The runner image's build manifest, including its `actions/runner` version | Packer `qemu` builder in CI |
 | `SHA256SUMS` | Checksums of all of the above | Release workflow |
@@ -197,16 +201,19 @@ saved settings, skips the free space an install needs, and also runs the control
 | Outbound HTTPS | `github.com`, `api.github.com`, and the release asset hosts (`objects.githubusercontent.com`, `release-assets.githubusercontent.com`) | hard |
 | Target storage | exists, active, and accepts `images` content | hard |
 | Linked-clone support | storage type is `lvmthin`, `zfspool`, `rbd`, or file-based with qcow2. Otherwise `linkedClone: false` | warn |
-| Free space | 50 GiB free on the VM storage: the gateway, controller, and template disks, and room for one worker | hard |
+| Free space | 50 GiB free on the VM storage: the controller and template disks, and room for workers | hard |
 | Download space | 6 GiB free in `/var/tmp`, on the host's root filesystem, where the images are downloaded before they are imported | hard |
 | Free memory and CPU | host RAM and threads against `maxRunners` × worker size plus existing VMs | warn |
-| LAN bridge | the bridge for the controller and gateway VMs exists. VLAN tag valid if set | hard |
+| LAN bridge | the bridge for the controller VM exists. VLAN tag valid if set | hard |
 | LAN NIC offloads | on a node that is itself a VM (a virtio NIC under the LAN bridge), its offloads are off, now and at boot. `parcon install` and `parcon update` turn them off; `parcon check` warns until they are | warn |
 | KVM async page faults | on a node that is a VM on KVM (`systemd-detect-virt --vm` prints `kvm`), the boot loader boots it with `no-kvm-apf`, and it booted with it. `parcon install` and `parcon update` set it; `parcon check` warns until they have and the node has rebooted | warn |
 | API certificate | how the controller will verify it: the node's CA, the system CAs, or a pinned fingerprint for a certificate from a CA the host doesn't trust | warn if pinned |
 | SDN available | `ifupdown2` installed and `/etc/network/interfaces` sources `/etc/network/interfaces.d/*`, so applying SDN works | hard |
-| Worker subnet free | the worker subnet doesn't overlap any route or address on the host, or the LAN subnet given for the gateway | hard |
-| SDN names free | zone `parzone` and VNet `parnet` are unused, or ours from an earlier run | hard |
+| dnsmasq for SDN DHCP | the `dnsmasq` package is installed and its own `dnsmasq.service` is off, as Proxmox's SDN docs ask (`apt install dnsmasq`, then `systemctl disable --now dnsmasq`). `parcon` installs no packages, so it says how | hard |
+| Datacenter firewall on | `/cluster/firewall/options` has `enable: 1`. Without it, no guest's firewall applies and workers would reach the LAN. Turning it on also filters the host's own traffic, so `parcon` leaves it to the user, who checks first that its rules let them in | hard |
+| DNS server for workers | the node has an IPv4 DNS server that isn't the node itself (System > DNS). SDN DHCP hands it to workers, and the firewall lets DNS through to it, even on the LAN | hard |
+| Worker subnet free | the worker subnet doesn't overlap any route or address on the host, other than our own VNet's, or the controller's static LAN subnet | hard |
+| SDN and firewall names free | zone `parzone`, VNet `parnet`, security group `par-worker`, and IP set `par-blocked` are unused, or ours from an earlier run | hard |
 | No name or ID clash | pools, user, role, and VMIDs are unused, or ours from an earlier run | hard |
 | Pending SDN changes | no SDN zone or VNet other than ours has pending changes, since applying ours would apply theirs too. Uninstall doesn't apply while any exist, and says so | hard |
 
@@ -224,7 +231,7 @@ The controller image, `parcon` on the host, and the controller agree on this lay
 - **Commands:** `parcon` on the host runs every `parcon` command in the VM as `parcon`, with
   `runuser -u parcon -- parcon …` through `qm guest exec`, so files that `parcon` writes get the right owner.
 - **Before the App exists:** `github.app` (`clientId`, `installationId`, `privateKeyFile`) may be left out of
-  `config.yaml`, because step 12 checks Proxmox before step 13 creates the App. `parcon check config`,
+  `config.yaml`, because step 11 checks Proxmox before step 12 creates the App. `parcon check config`,
   `parcon check proxmox`, and `parcon check template` work without it. `parcon run` and `parcon check github` fail
   with "the GitHub App isn't set up yet" until all three fields are set.
 - **Who writes the config:** only `parcon` on the host, which renders it from the host settings (see *Host
@@ -285,8 +292,8 @@ Adding a key means adding it to the registry in `internal/settings/keys.go`.
 
 1. **Preflight.** Run the checks above.
 2. **Collect settings** from the flags, or the defaults: scale set name and limits, storage, the LAN bridge and VLAN,
-   the controller and gateway LAN IPs (DHCP or static), the worker subnet (default `10.251.0.0/22`, changeable if it
-   clashes), and the VMID range. An earlier run's saved settings take their place.
+   the controller's LAN IP (DHCP or static), the worker subnet (default `10.251.0.0/22`, changeable if it clashes),
+   and the VMID range. An earlier run's saved settings take their place.
 3. **Show the plan.** List every object to be created or changed on the host, then ask for confirmation.
 4. **`parcon` on the host:** copy the running `parcon` to `/usr/local/bin/parcon` and save the settings.
 5. **Proxmox access objects** (`pveum`):
@@ -296,8 +303,13 @@ Adding a key means adding it to the registry in `internal/settings/keys.go`.
    - ACLs for that token on `/pool/par-runners`, the target storage, and `/sdn/zones/parzone/parnet`
    `parcon` holds the token secret only in memory and pipes it into the controller VM. It never reaches the host's
    disk, a command line, or the output.
-6. **Worker network** (`pvesh`): create the simple zone `parzone` and the VNet `parnet` with no subnet, then apply
-   the SDN config (`pvesh set /cluster/sdn`).
+6. **Worker network** (`pvesh`): create the simple zone `parzone` with SDN DHCP (`--dhcp dnsmasq --ipam pve`), the
+   VNet `parnet`, and its subnet: the host at the first address as the gateway, SNAT on, a DHCP range of every other
+   usable address, and the host's first IPv4 DNS server as the DNS server it hands out. Then apply the SDN config
+   (`pvesh set /cluster/sdn`). See *Networking*.
+   **Worker firewall** (`pvesh`): create the datacenter IP set `par-blocked` and the security group `par-worker`
+   (see *Networking*), and the host rule that lets DHCP in on `parnet`, in case the host firewall is on. Each
+   carries the comment `proxmox-actions-runners`.
 7. **Host NIC offloads**, only on a node that is itself a VM: see *Host NIC offloads*. Then **KVM async page
    faults**, only on a node that is a VM on KVM: see *Host KVM async page faults*.
 8. **Verify the release**: download `SHA256SUMS` and `SHA256SUMS.sig` and check the signature. Each image is then
@@ -305,21 +317,15 @@ Adding a key means adding it to the registry in `internal/settings/keys.go`.
    against `SHA256SUMS`.
 9. **Import the runner template** in `par-runners` from `par-runner-<ver>.qcow2` into the first free VMID of the
    reserved IDs at the end of the range (`qm create` + `qm set --scsi0 <storage>:0,import-from=<file>`), with a
-   cloud-init drive and the guest agent enabled. Tag it `par-managed`, `par-template`,
-   `par-tv-<import time in Unix seconds>`, `par-rv-<actions/runner version>` (from the image's manifest), and
-   `par-release-<ver>`, and convert it to a template. See *Runner image*.
-10. **Create the gateway VM** in `par-system` from `par-gateway-<ver>.qcow2`: 1 vCPU, 1 GiB RAM, a 6 GiB disk (the
-    image's size), `net0` on the LAN bridge, and `net1` on `parnet`. Use the built-in cloud-init drive for hostname
-    and the LAN address only, tag it `par-managed,par-gateway,par-release-<ver>`, and start it. Once it has finished
-    booting (the guest agent answers and `systemctl is-system-running --wait` returns), pipe the worker subnet and
-    the ranges to block (the LAN bridge's networks, every address the host has on any interface, and the controller
-    VM) into `par-gateway-configure` through `qm guest exec --pass-stdin` (see *Gateway and controller images*),
-    then check that it reaches the internet.
-11. **Create the controller VM** in `par-system` from `parcon-<ver>.qcow2`: 2 vCPU, 2 GiB RAM, a 6 GiB disk (the
+   cloud-init drive, the guest agent enabled, and `net0` on `parnet` with `firewall=1`. Give it the worker firewall
+   (options `enable`, `dhcp`, `policy_in DROP`, `policy_out ACCEPT`, and the rule `GROUP par-worker`), which every
+   clone copies. Tag it `par-managed`, `par-template`, `par-tv-<import time in Unix seconds>`,
+   `par-rv-<actions/runner version>` (from the image's manifest), and `par-release-<ver>`, and convert it to a
+   template. See *Runner image*.
+10. **Create the controller VM** in `par-system` from `parcon-<ver>.qcow2`: 2 vCPU, 2 GiB RAM, a 6 GiB disk (the
     image's size). Use Proxmox's built-in cloud-init drive for hostname and network only (no user data, no
-    snippets), tag it `par-managed,par-controller`, and start it. Once it has an address, configure the gateway again
-    to block it.
-12. **Configure the controller** through the guest agent once it has finished booting. Secrets go through
+    snippets), tag it `par-managed,par-controller`, and start it. Once it has an address, add it to `par-blocked`.
+11. **Configure the controller** through the guest agent once it has finished booting. Secrets go through
     `qm guest exec --pass-stdin`, so they never appear on a command line or on the host's disk:
     - `/etc/proxmox-actions-runners/config.yaml`, rendered from the settings, with no `github.app` yet (see
       *Controller VM contract*)
@@ -333,7 +339,7 @@ Adding a key means adding it to the registry in `internal/settings/keys.go`.
     warns about: after it is renewed, `parcon config apply` pins the new one. `parcon` then runs
     `parcon check proxmox` in the VM as `parcon`. It confirms the Proxmox VE version, that the token has every
     privilege it needs on the pool, storage, and VNet, and that the storage accepts VM disks.
-13. **Create the GitHub App** with the manifest flow described under *GitHub App setup*. The code the user pastes is
+12. **Create the GitHub App** with the manifest flow described under *GitHub App setup*. The code the user pastes is
     passed to `parcon github app create` in the controller VM, so the App's private key goes straight from GitHub
     into the controller VM and never passes through the host. `parcon` then waits for the user to install the App
     (`parcon github app wait-installation`), learns from the installation which organization or repository the
@@ -341,66 +347,30 @@ Adding a key means adding it to the registry in `internal/settings/keys.go`.
     Client ID as soon as the key is in the VM, so a re-run after a failure keeps waiting for the same App rather than
     creating another. It then runs `parcon check github` in the VM, which confirms that the App credentials produce
     an installation token and can reach the org or repo, and enables and starts `parcon.service`.
-14. **Worker network check** (also `parcon check network`). `parcon` clones one worker from the template into a
+13. **Worker network check** (also `parcon check network`). `parcon` clones one worker from the template into a
     reserved VMID, tagged `par-managed,par-build` so the reconcile loop leaves it alone, waits for it to finish
     booting, and confirms through `qm guest exec` that the worker got a DHCP lease, reaches GitHub, and can't reach
     the Proxmox API or the controller VM. It then destroys the clone, and waits for the controller to log
     `scale set session opened`, which it does once the scale set is registered and its listener session is open. A
     re-run first destroys a clone a failed run left.
-15. **Finish.** Tag the controller VM `par-release-<ver>`, which marks a finished install, and print the `runs-on:`
-    label, the controller and gateway VMs' IDs and IPs, and the `parcon` commands.
+14. **Finish.** Tag the controller VM `par-release-<ver>`, which marks a finished install, and print the `runs-on:`
+    label, the controller VM's ID and IP, and the `parcon` commands.
 
 If any step fails, `parcon` stops and says why; fix the cause and run `parcon install` again to continue from there.
 Each step checks for existing objects before it creates anything.
 
-## Gateway and controller images
+## Controller image
 
-Both images start from the same pinned Ubuntu 26.04 cloud image as the runner image, turn on `unattended-upgrades`,
-and include `qemu-guest-agent`, which is how `parcon` configures them. Both disks are 6 GiB, the VMs'
-size. A built image holds about 2.5 GiB and grows only by logs and OS updates, but a kernel update from
+The controller image starts from the same pinned Ubuntu 26.04 cloud image as the runner image, turns on
+`unattended-upgrades`, and includes `qemu-guest-agent`, which is how `parcon` configures it. Its disk is 6 GiB, the
+VM's size. A built image holds about 2.5 GiB and grows only by logs and OS updates, but a kernel update from
 `unattended-upgrades` briefly needs room for two kernels and a new initramfs, which 4 GiB can't hold.
-
-### Gateway
-
-The gateway runs dnsmasq for DHCP and DNS on `net1` and nftables for NAT and the firewall. The worker NIC is always
-called `net1` inside the VM: the image names it by the PCI slot Proxmox gives `net1`, so nothing depends on MACs.
-
-`parcon` configures it by piping `KEY=value` lines into `/usr/local/sbin/par-gateway-configure` through
-`qm guest exec --pass-stdin`:
-
-```
-WORKER_SUBNET=10.251.0.0/22
-BLOCK=192.0.2.0/24 192.0.2.10 192.0.2.11
-```
-
-| Key | Default | Meaning |
-| --- | ------- | ------- |
-| `WORKER_SUBNET` | `10.251.0.0/22` | The worker network's IPv4 subnet, a `/8` to a `/29` |
-| `BLOCK` | empty | Space-separated IPv4 addresses and CIDRs workers must not reach: the LAN, every address of the Proxmox host, and the controller VM |
-
-The command saves the settings to `/etc/par-gateway/config`, renders the config below from them, and reloads
-dnsmasq and nftables. Each run replaces the previous settings, so a key that is left out gets its default, and a
-second run with the same input changes nothing. Invalid input is refused before anything changes. The image ships
-configured with the defaults.
-
-- `net1` gets the subnet's first address. dnsmasq hands out the rest of the subnet with 1-hour leases and forwards
-  DNS to the gateway's own upstream resolvers. It binds only to `net1`, so it doesn't clash with systemd-resolved.
-- nftables (`/etc/nftables.conf`, loaded at boot):
-  - forwards only new IPv4 connections from `net1` out of the LAN NIC, masqueraded
-  - drops forwarded traffic to RFC 1918, CGNAT (`100.64.0.0/10`), link-local, and the `BLOCK` ranges
-  - accepts only DHCP and DNS from `net1` to the gateway itself
-  - forwards no IPv6, and IPv6 forwarding is off
-- Strict reverse-path filtering (`rp_filter = 1`) drops any packet whose source doesn't route back out the NIC it
-  arrived on, so workers can't spoof outside addresses. If the worker NIC ever isn't named `net1`, no `.network`
-  file matches it and it stays down.
-
-### Controller
 
 The controller image follows the *Controller VM contract*. On top of it:
 
 - `parcon` is statically linked and baked into the image at `/usr/local/bin/parcon`.
 - The image creates the `parcon` user and `/etc/proxmox-actions-runners`, and installs `parcon.service`
-  ([`deploy/parcon.service`](../deploy/parcon.service)) without enabling it; `parcon install` enables it in step 13.
+  ([`deploy/parcon.service`](../deploy/parcon.service)) without enabling it; `parcon install` enables it in step 12.
   The unit starts only once `/etc/proxmox-actions-runners/config.yaml` exists.
 - The image doesn't enforce the files' modes: `parcon` writes each one as `parcon` with `umask 077`, for example
   `runuser -u parcon -- sh -c 'umask 077; cat > FILE'`.
@@ -499,7 +469,7 @@ main, so `unattended-upgrades` patches it) runs in the controller VM and serves 
 - `parcon status` prints the certificate's SHA-256 fingerprint so Prometheus can be pointed at it with `ca_file`, or
   at least checked by hand.
 - There is no authentication for now. The endpoint exposes counts, latencies, and scale set names, but no secrets.
-  Workers can't reach it because the gateway blocks the LAN.
+  Workers can't reach it because the worker firewall blocks the LAN.
 - `/readyz` fails while the GitHub message session or the Proxmox API is unreachable. `/healthz` only checks that the
   process is running.
 
@@ -525,38 +495,59 @@ The controller logs a warning when the template has been behind the latest relea
 
 ## Networking
 
-There is one networking mode. Workers sit on a dedicated network, and the gateway VM is the only path between it and
-the LAN:
+There is one networking mode. Workers sit on a dedicated network that the host routes to the internet, and the
+Proxmox firewall at each worker's NIC decides where their traffic may go:
 
 | Piece | Where | Role |
 | ----- | ----- | ---- |
-| SDN zone `parzone`, VNet `parnet` | Proxmox host | An isolated layer-2 segment. No subnet, host IP, SNAT, or DHCP on the host |
-| Gateway VM `net1` | `parnet` | Workers' default gateway, DHCP server, and DNS forwarder (dnsmasq) for the worker subnet |
-| Gateway VM `net0` | LAN bridge | NATs worker traffic to the LAN's router, like any other LAN client |
-| Gateway firewall | Gateway VM (nftables) | Allows DHCP, DNS, and new outbound connections to the internet. Drops the LAN, the Proxmox host, the controller VM, RFC 1918, CGNAT, and link-local ranges, and any traffic to the gateway itself except DHCP and DNS |
+| SDN zone `parzone`, VNet `parnet`, subnet (default `10.251.0.0/22`) | Proxmox host | The host has the subnet's first address, the workers' gateway, and SNATs their traffic out of its uplink |
+| SDN DHCP (`dnsmasq@parzone`) | Proxmox host | Hands out the rest of the subnet, with the host's first IPv4 DNS server. IPAM (`pve`) keeps each worker's lease, freed when the worker is destroyed |
+| Worker firewall | Each worker's NIC (`firewall=1`), in the host's bridge | On; inbound policy DROP, so nothing reaches a worker that it didn't start; DHCP allowed; outbound through the security group `par-worker` |
+| Security group `par-worker` | Datacenter firewall | Accept DNS (UDP and TCP 53) to the host's DNS server, then drop `+sdn/parnet-all` and `+dc/par-blocked`. The rest of the internet is allowed by the outbound policy |
+| IP set `parnet-all` | SDN scope, generated by Proxmox | The worker VNet's subnets: other workers and the host's address on it. Proxmox keeps it current |
+| IP set `par-blocked` | Datacenter firewall | RFC 1918, CGNAT (`100.64.0.0/10`), and link-local ranges, the LAN bridge's networks, every address the host has outside the VNet, and the controller VM |
+| Host rule | Host firewall | Accept DHCP (UDP 67) in on `parnet`, so SDN's dnsmasq gets workers' requests when the host firewall is on |
+
+The user does two things first, which `parcon` checks and explains but doesn't do: install `dnsmasq` (and turn off
+its own service), which Proxmox's SDN DHCP needs, and turn on the datacenter firewall, without which no guest's
+firewall applies. Turning that firewall on also filters the host's own inbound traffic, by default allowing only
+SSH and the web UI from the host's own network, so only the user can judge whether it locks anyone out.
 
 Workers use DHCP (`ipconfig0: ip=dhcp` on the built-in cloud-init drive), so the controller keeps no address
-state. The gateway's leases are short, sized so the subnet can't run out at `maxRunners`.
+state. The subnet must hold `runners.max` workers plus the reserved IDs; settings validation checks it.
 
-Why a gateway VM rather than SNAT on the host (an SDN zone with SNAT and the host's own DHCP) or attaching workers to
-an existing bridge or VLAN:
+Every worker's firewall comes from its template, which `parcon` gives it before converting it, and every clone
+copies. The controller checks it before it registers a runner or boots a worker (on, inbound DROP, group
+`proxmox.firewallGroup`), and destroys a worker without it, so a template imported by hand can't put an open worker
+on the network. A firewall that is on for a VM still does nothing while the datacenter firewall is off, which the
+controller's token can't see: `parcon status` and `parcon check` fail then, and `parcon update` refuses to run.
 
-- The host never routes untrusted traffic, so worker isolation doesn't depend on the host's forwarding, firewall, or
-  `pve-firewall` setup, which varies from host to host.
-- SDN DHCP on the host needs the `dnsmasq` package, which invariant 8 rules out.
-- Attaching workers to an existing bridge makes isolation depend on the user's switch, router, and VLAN setup, which
-  `parcon` can't check.
+The firewall filters each worker's traffic where it leaves the worker's NIC, before the host routes it, so a job
+with root in its VM can't change it. Because the group drops the worker subnet, workers can't connect to each
+other. The group's references are scoped (`+sdn/`, `+dc/`, which Proxmox VE 8.3 added), so an IP set of the same
+name in a guest's own firewall can't shadow them. They still share one layer-2 segment, so a hostile job could answer ARP for another worker's address; MAC
+filtering (on by default) keeps it from sending from another MAC.
 
-The gateway is a single point of failure for worker networking. `parcon status` shows whether its DHCP, DNS, and
-NAT services run, and `parcon check network` tests the network end to end from a throwaway worker. Its OS updates
-itself with `unattended-upgrades`, and `parcon update` replaces it with the new release's image.
+Why the Proxmox firewall rather than a gateway VM (releases before this design ran one, with dnsmasq and nftables, as
+the workers' only way out), or attaching workers to an existing bridge or VLAN:
+
+- One VM fewer to build, boot-test, release, patch, and replace on every update, and no single point of failure
+  between the workers and the internet beyond the host itself.
+- Isolation is enforced in the host's bridge, per worker, which also blocks traffic between workers.
+- The cost: the host routes untrusted traffic, and isolation depends on the datacenter firewall staying on, which
+  `parcon status` reports. Attaching workers to an existing bridge would make isolation depend on the user's
+  switch, router, and VLAN setup instead, which `parcon` can't check at all.
+
+`parcon status` shows whether the datacenter firewall is on, whether the subnet, IP set, group, and host rule match
+what `parcon` sets up, and whether `dnsmasq@parzone` runs. `parcon check network` tests the network end to end from
+a throwaway worker. `parcon update` corrects whatever drifted, such as the host's DNS server changing.
 
 ### Host NIC offloads
 
 The node may itself be a VM, for example to keep the runners apart from a main Proxmox setup. Its NIC is then a
 virtio NIC under the LAN bridge, and its offloads (GRO, GSO, TSO, and TX checksumming) are on by default. The NIC
-merges incoming packets that the bridge then forwards to the gateway VM, which NATs them to the workers, and
-workers' downloads stall at a few KB/s while the host's own run at full speed.
+merges incoming packets that the host then routes to the workers, and workers' downloads stall at a few KB/s while
+the host's own run at full speed.
 
 On such a node (a port of the LAN bridge whose driver is `virtio_net`), `parcon install` and `parcon update` turn
 those offloads off with `ethtool -K`, and write `/etc/udev/rules.d/90-par-offloads.rules` so they stay off after a reboot. The rule
@@ -606,9 +597,9 @@ one with an unfinished install (the `par-system` pool exists), it continues it.
     release's, and runs it to do the rest, so each release's own code updates the node to it.
   - The release's runner image is imported as a new template, and the controller removes the old one once its
     workers are gone.
-  - The gateway VM holds no state beyond what the settings say, so `parcon` replaces it with the new image under the
-    same VMID, NICs, and address, and configures it with `par-gateway-configure`. Workers lose their network for the
-    minute or two this takes.
+  - The worker network and firewall are compared with what this release sets up, and corrected where they differ.
+  - An install from a release with a gateway VM can't be updated in place: `parcon update` refuses and says to run
+    `parcon uninstall`, then `parcon install`. Its settings (version 1) are refused the same way.
   - The controller VM downloads the release's `parcon-<ver>-linux-amd64` itself and checks it against the checksum
     from the verified `SHA256SUMS`, which `parcon` passes it through the guest agent. The binary is far too big for
     the guest agent to carry, and config and secrets never leave the VM. `parcon` then pushes the config the new
@@ -619,17 +610,17 @@ one with an unfinished install (the `par-system` pool exists), it continues it.
   - Each piece already at the release is left alone, so `parcon update` again continues an update that stopped. An
     install newer than the host's `parcon` is refused rather than downgraded.
   - `--force` runs every step, even one already done for the release, whether or not a newer release exists: it
-    imports the runner template again (the controller removes the old one once unused), replaces the gateway VM or
-    creates it if it is gone, reinstalls the controller's `parcon` and config, and runs the host tuning. It repairs
-    what the release tags can't show, such as a gateway whose replacement was killed after the VM was created and
-    tagged. The safety checks stay: the release's signature, the plan and its question, the lock, and the
+    imports the runner template again (the controller removes the old one once unused), sets up the worker network
+    and firewall again, reinstalls the controller's `parcon` and config, and runs the host tuning. It repairs what the
+    release tags can't show, such as a template imported by a run that was killed partway. The safety checks stay: the release's signature, the plan and its question, the lock, and the
     controller's check of its new config. The controller VM itself must be running, since an update never replaces
-    it; a broken one needs `parcon uninstall` and `parcon install`. A replaced system VM's disks all go, including
-    one an interrupted import left unattached (`qm destroy --destroy-unreferenced-disks 1`).
+    it; a broken one needs `parcon uninstall` and `parcon install`.
 - **Uninstall** (`parcon uninstall`) first stops the controller and deletes the scale set in GitHub
   (`parcon github scaleset delete` in the controller VM, which also unregisters its runners). It then destroys every
-  VM tagged `par-managed` in the two pools, clones before templates, removes the ACLs, token, user, role, and pools,
-  and removes the `parzone` zone and `parnet` VNet and applies the SDN config. On a node that is itself a VM, it
+  VM tagged `par-managed` in the two pools (an older release's gateway VM too), clones before templates, removes the
+  ACLs, token, user, role, and pools, the host rule, security group, and IP set, and the subnet, `parnet` VNet, and
+  `parzone` zone, and applies the SDN config. The datacenter firewall stays on, and `dnsmasq` stays installed: both
+  were the user's. On a node that is itself a VM, it
   removes the udev rule that keeps the LAN NIC's offloads off and turns them back on, and takes `no-kvm-apf` out of
   the kernel command line. Last, it removes the settings
   and `/usr/local/bin/parcon`. It doesn't touch anything it didn't create. The GitHub App stays; delete it in

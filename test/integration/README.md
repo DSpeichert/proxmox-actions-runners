@@ -3,7 +3,7 @@
 Runs the project against a real Proxmox VE 9 node. All it needs is root SSH access to a **throwaway** node: it
 creates its own test objects, runs the Go integration tests and the `parcon` checks, and can remove everything
 again. Given a runner image built from `images/runner`, it also runs a worker from that image, and given the
-gateway and controller images too, it runs `install/install.sh` on the node up to the GitHub App.
+controller image too, it runs `parcon install` on the node up to the GitHub App.
 
 GitHub itself is only partly covered: `parcon check template` looks up the latest `actions/runner` release on
 github.com, but the controller tests use the in-memory GitHub fake, so no real runner registers.
@@ -68,10 +68,12 @@ devcontainer exec --workspace-folder . ... \
 ### The installer
 
 `run.sh installer` tests `parcon`'s host commands on the node with locally built images and no GitHub App. It
-needs all three images, built with the same version, and a node with no install on it:
+needs both images, built with the same version, and a node with no install on it, but with what an install asks the
+user to set up first: `dnsmasq` installed with its own service off (`apt install dnsmasq`, then
+`systemctl disable --now dnsmasq`), and the datacenter firewall on. The suite checks both and doesn't change them:
+turning on the firewall could cut its own SSH off.
 
 ```bash
-packer init images/gateway && packer build -var version=it images/gateway
 CGO_ENABLED=0 go build -o bin/parcon ./cmd/parcon
 packer init images/controller && packer build -var version=it -var parcon_binary=bin/parcon images/controller
 ```
@@ -79,7 +81,6 @@ packer init images/controller && packer build -var version=it -var parcon_binary
 ```bash
 devcontainer exec --workspace-folder . ... \
   --remote-env PAR_IT_RUNNER_IMAGE=output-runner/par-runner-it.qcow2 \
-  --remote-env PAR_IT_GATEWAY_IMAGE=output-gateway/par-gateway-it.qcow2 \
   --remote-env PAR_IT_CONTROLLER_IMAGE=output-controller/parcon-it.qcow2 \
   test/integration/run.sh installer
 ```
@@ -90,10 +91,10 @@ It builds `parcon` and copies it and the images, as release assets with a `SHA25
 1. runs `parcon install --dry-run` with the local assets (`--assets`, which trusts their `SHA256SUMS` instead of a
    signed release), and checks that it changed nothing on the node or its files;
 2. runs `parcon install --stop-after configure`: parcon and its settings on the host, the Proxmox access objects, the
-   worker network, the runner template, the gateway and controller VMs, and the controller's configuration, which
+   worker network and firewall, the runner template, the controller VM, and the controller's configuration, which
    ends with `parcon check proxmox` inside the controller VM;
 3. runs `parcon check proxmox` on the host, which forwards it into the controller VM, and `parcon check network`: a
-   worker cloned from the template gets a DHCP lease from the gateway, reaches the internet, and can't reach the
+   worker cloned from the template gets a DHCP lease from SDN DHCP, reaches the internet, and can't reach the
    Proxmox API or the controller VM;
 4. stops the controller VM and runs `parcon uninstall --yes`, then checks that nothing of the install is left,
    `/usr/local/bin/parcon` and its settings included.

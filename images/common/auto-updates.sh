@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Automatic security updates for the gateway and controller images, after base.sh. These VMs are long-lived, unlike
-# workers, so they keep themselves patched with unattended-upgrades.
+# Automatic security updates for the controller image, after base.sh. The controller VM is long-lived, unlike
+# workers, so it keeps itself patched with unattended-upgrades.
 set -euo pipefail
 
 main() {

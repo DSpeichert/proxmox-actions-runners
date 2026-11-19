@@ -7,20 +7,18 @@
 # qemu-system-x86_64, qemu-img, and xorriso (all in the dev container) and KVM.
 #
 # The VM gets what Proxmox gives it: its first NIC at net0's PCI slot, with a known MAC, and a cloud-init network
-# config like the one Proxmox writes for ipconfig0=ip=dhcp, which names the NIC eth0 by that MAC. NICS=2 adds a
-# second NIC at net1's slot, as the gateway has. Cloud-init must finish within FINISH_SECONDS: an image whose NIC
-# names don't match the config waits two minutes for the network before it gives up.
+# config like the one Proxmox writes for ipconfig0=ip=dhcp, which names the NIC eth0 by that MAC. Cloud-init must
+# finish within FINISH_SECONDS: an image whose NIC names don't match the config waits two minutes for the network
+# before it gives up.
 #
 #   images/common/boot-test.sh output-runner/par-runner-dev.qcow2 'Started.*par-runner.path'
-#   NICS=2 images/common/boot-test.sh output-gateway/par-gateway-dev.qcow2
 set -euo pipefail
 
 BOOT_SECONDS=${BOOT_SECONDS:-150}
 FINISH_SECONDS=${FINISH_SECONDS:-90}
-NICS=${NICS:-1}
 TMP_DIR=""
-# Proxmox's i440fx machine puts net0 and net1 at these PCI slots.
-readonly NET0_SLOT=0x12 NET1_SLOT=0x13 NET0_MAC=bc:24:11:00:00:01
+# Proxmox's i440fx machine puts net0 at this PCI slot.
+readonly NET0_SLOT=0x12 NET0_MAC=bc:24:11:00:00:01
 
 main() {
   local image=${1:?usage: boot-test.sh IMAGE [PATTERN...]}
@@ -44,10 +42,6 @@ EOF
   qemu-img create -q -f qcow2 -F qcow2 -b "$(realpath "$image")" "$TMP_DIR/overlay.qcow2"
 
   local console=$TMP_DIR/console.log nics=(-netdev "user,id=n0" -device "virtio-net-pci,netdev=n0,addr=$NET0_SLOT,mac=$NET0_MAC")
-  if ((NICS == 2)); then
-    # The worker network: a NIC with a carrier and nothing on the other end.
-    nics+=(-netdev "socket,id=n1,udp=127.0.0.1:1,localaddr=127.0.0.1:0" -device "virtio-net-pci,netdev=n1,addr=$NET1_SLOT")
-  fi
   timeout "$BOOT_SECONDS" qemu-system-x86_64 -machine pc,accel=kvm -cpu host -smp 2 -m 2048 \
     -drive "file=$TMP_DIR/overlay.qcow2,if=none,id=d0,format=qcow2" -device virtio-scsi-pci -device scsi-hd,drive=d0 \
     -cdrom "$TMP_DIR/seed.iso" "${nics[@]}" \

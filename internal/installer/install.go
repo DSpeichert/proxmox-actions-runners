@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/netip"
 	"os"
 	"strings"
 	"time"
@@ -93,7 +94,10 @@ func (in *Installer) install(ctx context.Context, s *settings.Settings, opts Ins
 	if err := in.createAccess(ctx); err != nil {
 		return err
 	}
-	if err := in.createNetwork(ctx); err != nil {
+	if err := in.createNetwork(ctx, s); err != nil {
+		return err
+	}
+	if err := in.configureFirewall(ctx, s, netip.Addr{}); err != nil {
 		return err
 	}
 	if err := in.tuneOffloads(ctx, s); err != nil {
@@ -115,13 +119,7 @@ func (in *Installer) install(ctx context.Context, s *settings.Settings, opts Ins
 	if err := in.importTemplate(ctx, s, assets, false); err != nil {
 		return err
 	}
-	gateway, err := in.createGateway(ctx, s, func() (string, error) {
-		return in.get(ctx, assets, gatewayImage(in.Version))
-	})
-	if err != nil {
-		return err
-	}
-	controller, addr, err := in.createController(ctx, s, gateway, func() (string, error) {
+	controller, addr, err := in.createController(ctx, s, func() (string, error) {
 		return in.get(ctx, assets, controllerImage(in.Version))
 	})
 	if err != nil {
@@ -166,11 +164,11 @@ func (in *Installer) install(ctx context.Context, s *settings.Settings, opts Ins
 
   runs-on: %s
 
-Controller VM %d (%s), gateway VM %d.
+Controller VM %d (%s).
 Status:    parcon status
 Settings:  parcon config get --all
 Update:    parcon update
-Uninstall: parcon uninstall`, s.GitHub.ConfigURL, runsOn, controller, addr, gateway)
+Uninstall: parcon uninstall`, s.GitHub.ConfigURL, runsOn, controller, addr)
 	in.rebootNote(ctx)
 	return nil
 }
@@ -219,10 +217,22 @@ func (in *Installer) printPlan(ctx context.Context, s *settings.Settings, warnin
 	p("  pools %s and %s", SystemPool, RunnerPool)
 	p("  role %s, user %s, token %s!%s, and ACLs for them on /pool/%s,", Role, PVEUser, PVEUser, TokenName, RunnerPool)
 	p("    /storage/%s, and /sdn/zones/%s/%s", s.Proxmox.Storage, Zone, VNet)
-	p("  SDN zone %s and VNet %s (no subnet, no host address), then apply the SDN config", Zone, VNet)
-	p("  runner template in %s, VMIDs %d-%d reserved for templates", RunnerPool, r.End-config.ReservedVMIDs+1, r.End)
-	p("  gateway VM in %s: 1 vCPU, 1 GiB, %d GiB disk, LAN %s%s (%s), %s", SystemPool, GatewayGiB, s.Network.Bridge,
-		vlan, s.Network.GatewayIP, VNet)
+	wn, err := workerNetwork(s)
+	if err != nil {
+		return err
+	}
+	dns := "the node's DNS server"
+	if a, err := in.hostDNS(ctx, s); err == nil {
+		dns = a.String()
+	}
+	p("  SDN zone %s with SDN DHCP, VNet %s, and subnet %s: the host at %s with SNAT, DHCP for the rest,", Zone, VNet,
+		wn.subnet, wn.gateway)
+	p("    DNS %s; then apply the SDN config", dns)
+	p("  datacenter firewall: IP set %s (private, CGNAT, and link-local ranges, the LAN, this host, the", BlockedIPSet)
+	p("    controller) and security group %s (DNS to %s, then drop %s); host rule: DHCP in on %s", FirewallGroup,
+		dns, BlockedIPSet, VNet)
+	p("  runner template in %s, VMIDs %d-%d reserved for templates; its firewall: in dropped, group %s", RunnerPool,
+		r.End-config.ReservedVMIDs+1, r.End, FirewallGroup)
 	p("  controller VM in %s: 2 vCPU, 2 GiB, %d GiB disk, LAN %s%s (%s)", SystemPool, ControllerGiB, s.Network.Bridge,
 		vlan, s.Network.ControllerIP)
 	wk := s.EffectiveWorker()

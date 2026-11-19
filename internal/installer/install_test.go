@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"slices"
 	"strings"
@@ -20,6 +21,7 @@ import (
 	"time"
 
 	"github.com/klponce/proxmox-actions-runners/internal/config"
+	"github.com/klponce/proxmox-actions-runners/internal/pvecli"
 	"github.com/klponce/proxmox-actions-runners/internal/settings"
 	"github.com/klponce/proxmox-actions-runners/internal/vmtags"
 )
@@ -169,20 +171,55 @@ func TestInstall(t *testing.T) {
 		t.Errorf("tokens %v, acls %v", n.tokens, n.acls)
 	}
 
-	// VMs: a template in the reserved IDs, the gateway and controller outside the range, no smoke-test clone left.
+	// The worker network: SDN DHCP, and a subnet the host routes and SNATs, with the host's DNS server.
+	if o := n.zoneOpts[Zone]; o["dhcp"] != "dnsmasq" || o["ipam"] != "pve" {
+		t.Errorf("zone options = %v", o)
+	}
+	wantSubnet := pvecli.Subnet{ID: "parzone-10.251.0.0-22", CIDR: "10.251.0.0/22", Gateway: "10.251.0.1", SNAT: 1,
+		DHCPRange: []pvecli.DHCPRange{{Start: "10.251.0.2", End: "10.251.3.254"}}, DNSServer: "192.0.2.1"}
+	if len(n.subnets) != 1 || !reflect.DeepEqual(n.subnets[0], wantSubnet) {
+		t.Errorf("subnets = %+v", n.subnets)
+	}
+
+	// The worker firewall: what workers must not reach, including the LAN, the host, and the controller, and
+	// the group that lets DNS through to the host's resolver and drops the rest of it.
+	for _, want := range []string{"10.0.0.0/8", "192.168.0.0/16", "192.0.2.0/24", "192.0.2.5", "192.0.2.100"} {
+		if !slices.Contains(n.ipsets[BlockedIPSet], want) {
+			t.Errorf("IP set %s = %v, lacks %s", BlockedIPSet, n.ipsets[BlockedIPSet], want)
+		}
+	}
+	// The worker subnet is SDN's own IP set, not a copy.
+	if slices.Contains(n.ipsets[BlockedIPSet], "10.251.0.0/22") {
+		t.Errorf("IP set %s = %v, copies the worker subnet", BlockedIPSet, n.ipsets[BlockedIPSet])
+	}
+	if !sameRules(n.groups[FirewallGroup], workerRules(netipMust("192.0.2.1"))) {
+		t.Errorf("group rules = %+v", n.groups[FirewallGroup])
+	}
+	if len(n.hostRules) != 1 || !sameRule(n.hostRules[0], hostRule()) {
+		t.Errorf("host rules = %+v", n.hostRules)
+	}
+
+	// VMs: a template with the worker firewall in the reserved IDs, the controller outside the range, no
+	// smoke-test clone left.
 	tmpl := n.vmsTagged(vmtags.Template)
 	if len(tmpl) != 1 || tmpl[0] != 10096 || !n.vms[10096].template ||
 		!slices.Contains(n.vms[10096].tags, "par-rv-2.338.0") {
 		t.Errorf("templates %v", tmpl)
 	}
+	tv := n.vms[10096]
+	if tv.config["net0"] != "virtio,bridge=parnet,firewall=1" || tv.fwOptions["enable"] != "1" ||
+		tv.fwOptions["policy_in"] != "DROP" || tv.fwOptions["dhcp"] != "1" || len(tv.fwRules) != 1 ||
+		tv.fwRules[0].Type != "group" || tv.fwRules[0].Action != FirewallGroup {
+		t.Errorf("template firewall: net0 %q, options %v, rules %+v", tv.config["net0"], tv.fwOptions, tv.fwRules)
+	}
 	if len(n.vmsTagged(vmtags.Build)) != 0 {
 		t.Error("the smoke-test clone is left")
 	}
 	c := ti.controller(t)
-	if c.id != 101 || !slices.Contains(c.tags, "par-release-0.2.0") || c.config["net0"] != "virtio,bridge=vmbr0" {
+	if c.id != 100 || !slices.Contains(c.tags, "par-release-0.2.0") || c.config["net0"] != "virtio,bridge=vmbr0" {
 		t.Errorf("controller = %+v", c)
 	}
-	if g := n.vmsTagged(vmtags.Gateway); len(g) != 1 || n.vms[g[0]].config["net1"] != "virtio,bridge=parnet" {
+	if g := n.vmsTagged(vmtags.Gateway); len(g) != 0 {
 		t.Errorf("gateway = %v", g)
 	}
 
@@ -236,7 +273,8 @@ func TestInstallDryRunChangesNothing(t *testing.T) {
 		t.Error("dry run wrote the settings")
 	}
 	out := ti.stdout.String()
-	for _, want := range []string{"==> Plan", "install parcon as " + ti.BinaryPath, "gateway VM in par-system",
+	for _, want := range []string{"==> Plan", "install parcon as " + ti.BinaryPath,
+		"subnet 10.251.0.0/22: the host at 10.251.0.1 with SNAT", "DNS 192.0.2.1", "security group par-worker",
 		"at most 1, each 2 vCPU and 8GiB"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("plan lacks %q:\n%s", want, out)
@@ -371,10 +409,10 @@ func TestUninstall(t *testing.T) {
 
 	ti.Change.DryRun = true
 	must(t, ti.Uninstall(ctx))
-	if !strings.Contains(ti.stdout.String(), "now: 100 101 10000 10096") {
+	if !strings.Contains(ti.stdout.String(), "now: 100 10000 10096") {
 		t.Errorf("dry-run plan:\n%s", ti.stdout)
 	}
-	if len(ti.node.vms) != 5 {
+	if len(ti.node.vms) != 4 {
 		t.Error("the dry run destroyed VMs")
 	}
 
@@ -393,9 +431,14 @@ func TestUninstall(t *testing.T) {
 	}
 	n := ti.node
 	if len(n.pools) != 0 || len(n.roles) != 0 || len(n.users) != 0 || len(n.acls) != 0 ||
-		!slices.Equal(n.zones, []string{"other"}) || len(n.vnets) != 0 {
-		t.Errorf("left: pools %v roles %v users %v acls %v zones %v vnets %v", n.pools, n.roles, n.users, n.acls,
-			n.zones, n.vnets)
+		!slices.Equal(n.zones, []string{"other"}) || len(n.vnets) != 0 || len(n.subnets) != 0 {
+		t.Errorf("left: pools %v roles %v users %v acls %v zones %v vnets %v subnets %v", n.pools, n.roles,
+			n.users, n.acls, n.zones, n.vnets, n.subnets)
+	}
+	// The worker firewall goes; the datacenter firewall stays on.
+	if len(n.ipsets) != 0 || len(n.groups) != 0 || len(n.hostRules) != 0 || !n.clusterFW {
+		t.Errorf("left: IP sets %v, groups %v, host rules %v, datacenter firewall %v", n.ipsets, n.groups,
+			n.hostRules, n.clusterFW)
 	}
 	// Clones before templates, and the scale set is deleted before the VMs go.
 	lines := strings.Join(n.lines(), "\n")

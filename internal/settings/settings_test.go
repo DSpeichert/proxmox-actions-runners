@@ -46,7 +46,7 @@ func TestParseRejects(t *testing.T) {
 	for name, doc := range map[string]string{
 		"empty":         "",
 		"old version":   "version: 0\n",
-		"unknown field": "version: 1\nnetwork: {bridge: vmbr0, gatewayIP: dhcp, controllerIP: dhcp, workerSubnet: 10.251.0.0/22}\nsurprise: 1\n",
+		"unknown field": "version: 2\nnetwork: {bridge: vmbr0, controllerIP: dhcp, workerSubnet: 10.251.0.0/22}\nsurprise: 1\n",
 	} {
 		if _, err := Parse([]byte(doc)); err == nil {
 			t.Errorf("%s: no error", name)
@@ -54,11 +54,30 @@ func TestParseRejects(t *testing.T) {
 	}
 }
 
+func TestParseRefusesTheGatewayVMSettings(t *testing.T) {
+	doc := "version: 1\nnetwork: {bridge: vmbr0, gatewayIP: dhcp, controllerIP: dhcp, workerSubnet: 10.251.0.0/22}\n"
+	if _, err := Parse([]byte(doc)); err == nil || !strings.Contains(err.Error(), "parcon uninstall, then parcon install") {
+		t.Errorf("Parse = %v, want the reinstall message", err)
+	}
+}
+
+func TestValidateChecksTheDHCPRange(t *testing.T) {
+	s := Default()
+	s.Network.WorkerSubnet = "10.251.0.0/29" // 5 leases
+	s.ScaleSet.MaxRunners = 2
+	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "has 5 DHCP addresses but needs 6") {
+		t.Errorf("Validate = %v", err)
+	}
+	s.ScaleSet.MaxRunners = 1
+	if err := s.Validate(); err != nil {
+		t.Errorf("Validate = %v", err)
+	}
+}
+
 func TestValidateReportsEveryProblem(t *testing.T) {
 	s := Default()
 	s.Network.Bridge = "vmbr0; rm"
 	s.Network.VLAN = 5000
-	s.Network.GatewayIP = "192.0.2.10/24"
 	s.Network.ControllerIP = "banana"
 	s.Network.WorkerSubnet = "10.251.1.0/22"
 	s.Proxmox.Storage = "-bad"

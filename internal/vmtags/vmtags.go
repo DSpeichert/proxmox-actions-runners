@@ -24,7 +24,8 @@ const (
 	// Build marks a VM the installer creates and destroys itself, such as its smoke-test clone. It lives in the
 	// reserved VMIDs, which the controller never treats as workers or leftovers.
 	Build = "par-build"
-	// Gateway and Controller mark the gateway and controller VMs, which parcon creates in the system pool.
+	// Controller marks the controller VM, which parcon creates in the system pool. Gateway marks the gateway VM of
+	// releases before the worker firewall, which parcon only recognizes, to refuse updating or to remove it.
 	Gateway    = "par-gateway"
 	Controller = "par-controller"
 )

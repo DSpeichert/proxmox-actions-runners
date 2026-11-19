@@ -27,6 +27,61 @@ func check(t *testing.T, checks []Check, desc string) Check {
 	return Check{}
 }
 
+func TestPreflightNetworkAndFirewall(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		breakNode func(n *fakeNode)
+		check     string
+		reason    string
+	}{
+		{"no dnsmasq", func(n *fakeNode) { n.uninstalled["dnsmasq"] = true }, "dnsmasq for SDN DHCP",
+			"apt install dnsmasq"},
+		{"dnsmasq's own service runs", func(n *fakeNode) { n.services["dnsmasq.service"] = true },
+			"dnsmasq for SDN DHCP", "systemctl disable --now dnsmasq"},
+		{"datacenter firewall off", func(n *fakeNode) { n.clusterFW = false }, "datacenter firewall on",
+			"Datacenter > Firewall > Options"},
+		{"no DNS server", func(n *fakeNode) { n.dns = nil }, "DNS server for workers", "no IPv4 DNS server"},
+		{"only a local resolver", func(n *fakeNode) { n.dns = []string{"127.0.0.1", "::1"} }, "DNS server for workers",
+			"no IPv4 DNS server"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ti := newTestInstaller(t)
+			s := settings.Default()
+			if c := check(t, ti.Preflight(context.Background(), &s, ModeInstall), tt.check); !c.OK {
+				t.Fatalf("before: %+v", c)
+			}
+			tt.breakNode(ti.node)
+			checks := ti.Preflight(context.Background(), &s, ModeInstall)
+			if c := check(t, checks, tt.check); c.OK || c.Level != Hard || !strings.Contains(c.Reason, tt.reason) {
+				t.Errorf("%+v, want a hard failure saying %q", c, tt.reason)
+			}
+		})
+	}
+	// The second DNS server serves when the first is the node's own.
+	ti := newTestInstaller(t)
+	ti.node.dns = []string{"127.0.0.53", "192.0.2.53"}
+	s := settings.Default()
+	if c := check(t, ti.Preflight(context.Background(), &s, ModeInstall), "DNS server"); !c.OK ||
+		!strings.Contains(c.Reason, "192.0.2.53") {
+		t.Errorf("%+v", c)
+	}
+}
+
+func TestWorkerNetwork(t *testing.T) {
+	s := settings.Default()
+	for subnet, want := range map[string][3]string{
+		"10.251.0.0/22":   {"10.251.0.1", "10.251.0.2", "10.251.3.254"},
+		"192.0.2.0/29":    {"192.0.2.1", "192.0.2.2", "192.0.2.6"},
+		"198.51.100.0/24": {"198.51.100.1", "198.51.100.2", "198.51.100.254"},
+	} {
+		s.Network.WorkerSubnet = subnet
+		w, err := workerNetwork(&s)
+		if err != nil || [3]string{w.gateway.String(), w.first.String(), w.last.String()} != want {
+			t.Errorf("%s: %+v, %v, want %v", subnet, w, err, want)
+		}
+	}
+}
+
 func TestWorkerSubnetMustBeFree(t *testing.T) {
 	ti := newTestInstaller(t)
 	s := settings.Default()
@@ -36,8 +91,9 @@ func TestWorkerSubnetMustBeFree(t *testing.T) {
 		t.Errorf("host network: %+v", c)
 	}
 
-	// A route through our own VNet, from an earlier run, isn't a clash.
+	// Our own VNet's address and route, from an earlier run, aren't a clash.
 	ti.node.routes = `[{"dst":"10.251.0.0/22","dev":"parnet"}]`
+	ti.node.addrs = `[{"ifname":"parnet","addr_info":[{"local":"10.251.0.1","prefixlen":22}]}]`
 	s = settings.Default()
 	if c := check(t, ti.Preflight(context.Background(), &s, ModeInstall), "worker subnet"); !c.OK {
 		t.Errorf("our own route: %+v", c)
@@ -45,7 +101,7 @@ func TestWorkerSubnetMustBeFree(t *testing.T) {
 
 	// Nor may it overlap a static LAN address.
 	s.Network.WorkerSubnet = "198.51.100.0/24"
-	s.Network.GatewayIP, s.Network.LANGateway = "198.51.100.10/24", "198.51.100.1"
+	s.Network.ControllerIP, s.Network.LANGateway = "198.51.100.10/24", "198.51.100.1"
 	if c := check(t, ti.Preflight(context.Background(), &s, ModeInstall), "worker subnet"); c.OK ||
 		!strings.Contains(c.Reason, "overlaps the LAN") {
 		t.Errorf("static LAN: %+v", c)
@@ -57,10 +113,11 @@ func TestNamesInUseBySomeoneElse(t *testing.T) {
 	ti.node.zones = []string{Zone}
 	ti.node.roles[Role] = "VM.Audit"
 	ti.node.users = []string{PVEUser}
+	ti.node.groups[FirewallGroup] = nil
 	s := settings.Default()
 	c := check(t, ti.Preflight(context.Background(), &s, ModeInstall), "names free")
-	if c.OK || c.Reason != "already exist and weren't created by parcon: SDN zone parzone, role PARController, "+
-		"user par@pve" {
+	if c.OK || c.Reason != "already exist and weren't created by parcon: firewall security group par-worker, "+
+		"SDN zone parzone, role PARController, user par@pve" {
 		t.Errorf("%+v", c)
 	}
 	// An earlier run's objects are ours.
@@ -305,20 +362,40 @@ func TestManagedVMsOrder(t *testing.T) {
 	}
 }
 
-func TestGatewayBlock(t *testing.T) {
+func TestBlocked(t *testing.T) {
 	ti := newTestInstaller(t)
 	ti.node.addrs = `[{"ifname":"lo","addr_info":[{"local":"127.0.0.1","prefixlen":8}]},
 		{"ifname":"vmbr0","addr_info":[{"local":"192.0.2.5","prefixlen":24}]},
-		{"ifname":"vmbr1","addr_info":[{"local":"198.51.100.7","prefixlen":24}]}]`
+		{"ifname":"vmbr1","addr_info":[{"local":"198.51.100.7","prefixlen":24}]},
+		{"ifname":"parnet","addr_info":[{"local":"10.251.0.1","prefixlen":22}]}]`
 	s := settings.Default()
 	s.Network.ControllerIP, s.Network.LANGateway = "192.0.2.11/24", "192.0.2.1"
-	block, err := ti.gatewayBlock(context.Background(), &s, netipMust("192.0.2.12"))
+	// The worker subnet and the host's address on it aren't listed: the group drops them through SDN's own IP set.
+	block, err := ti.blocked(context.Background(), &s, netipMust("192.0.2.12"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"192.0.2.0/24", "192.0.2.11", "192.0.2.12", "192.0.2.5", "198.51.100.7"}
+	want := []string{"10.0.0.0/8", "100.64.0.0/10", "169.254.0.0/16", "172.16.0.0/12",
+		"192.0.2.0/24", "192.0.2.11", "192.0.2.12", "192.0.2.5", "192.168.0.0/16", "198.51.100.7"}
 	if !slices.Equal(block, want) {
 		t.Errorf("block = %v", block)
+	}
+}
+
+func TestWorkerRulesUseScopedReferences(t *testing.T) {
+	rules := workerRules(netipMust("192.0.2.1"))
+	var drops []string
+	for _, r := range rules {
+		if r.Action == "DROP" {
+			drops = append(drops, r.Dest)
+		}
+	}
+	if !slices.Equal(drops, []string{"+sdn/parnet-all", "+dc/par-blocked"}) {
+		t.Errorf("drops = %v", drops)
+	}
+	// DNS to the host's resolver comes first, so it passes even when the resolver is on the LAN.
+	if rules[0].Action != "ACCEPT" || rules[0].Dest != "192.0.2.1" || rules[0].Dport != "53" {
+		t.Errorf("first rule = %+v", rules[0])
 	}
 }
 

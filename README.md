@@ -33,14 +33,15 @@ bash install.sh
 
 `install.sh` only downloads the release's `parcon`, checks it against the checksum written into the script, and runs
 `parcon install`. `parcon` first runs preflight checks: it must be root on a PVE 9.x node with KVM, a synchronized
-clock, enough storage, and outbound HTTPS, among other checks. It then shows the full plan and asks for
+clock, enough storage, outbound HTTPS, `dnsmasq` installed for SDN DHCP, and the datacenter firewall on, among other
+checks (see *Requirements*). It then shows the full plan and asks for
 confirmation, and changes nothing before that (`--dry-run` stops at the plan). After that it:
 
 - installs itself as `/usr/local/bin/parcon`, with its settings in `/etc/proxmox-actions-runners/settings.yaml`
 
 - creates the Proxmox pools, role, user, API token, and ACLs
-- creates an isolated **worker network** (a Proxmox SDN VNet with no uplink) and a small **gateway VM** that is its
-  only way out to the internet
+- creates the **worker network**, a Proxmox SDN VNet with SDN DHCP that the host routes to the internet with SNAT,
+  and the **worker firewall**, Proxmox's own, which keeps workers off your LAN, the host, and each other
 - creates a small **controller VM** that runs the controller
 - creates your **GitHub App**: it prints a link that you open in a browser on any device, where you choose your
   organization or personal account and create the App on GitHub. You paste one line back, install the App with
@@ -53,19 +54,20 @@ confirmation, and changes nothing before that (`--dry-run` stops at the plan). A
 `--set worker.memory=16GiB`. If a step fails, fix the cause and run `parcon install` again: it continues where it
 stopped.
 
-The host itself is barely touched: `parcon`, its settings, Proxmox objects, and, on a node that is itself a VM, a
-udev rule for its NIC and a kernel parameter. No packages or services are added, and `parcon uninstall` removes all of it. The host
-doesn't route worker traffic, so the design doesn't depend on how your LAN, firewall, or host networking is set
-up. See [docs/install.md](docs/install.md) for the full design.
+The host itself is barely touched: `parcon`, its settings, Proxmox objects (the worker firewall's IP set, security
+group, and one host rule among them), and, on a node that is itself a VM, a udev rule for its NIC and a kernel
+parameter. `parcon` adds no packages or services, and `parcon uninstall` removes all of it. Isolation comes from the
+Proxmox firewall at each worker's NIC, so it doesn't depend on how your LAN or VLANs are set up. See
+[docs/install.md](docs/install.md) for the full design.
 
 ## Managing it
 
-`parcon` on the Proxmox host is how you manage the runners. The gateway and controller VMs need no logins: `parcon`
+`parcon` on the Proxmox host is how you manage the runners. The controller VM needs no login: `parcon`
 reaches into them through the guest agent for what it does.
 
 | Command | What it does |
 | ------- | ------------ |
-| `parcon status` | The state of the whole install: host, gateway, controller, GitHub session and jobs, template, workers, settings. `--json` for scripts |
+| `parcon status` | The state of the whole install: host, worker network and firewall, controller, GitHub session and jobs, template, workers, settings. `--json` for scripts |
 | `parcon config get --all` | Every setting you can change, with its value and default |
 | `parcon config set worker.memory 16GiB` | Change a setting. The controller restarts with it; running jobs keep going |
 | `parcon config describe worker.memory` | Which values a setting takes, and when a change applies |
@@ -228,21 +230,29 @@ GitHub stops accepting a self-hosted runner that doesn't update itself 30 days a
 keep up with releases. The controller checks for new `actions/runner` releases and logs a warning when the template
 has been behind for 7 days and an error after 21. `parcon status` and `parcon check template` show the same.
 
-## Gateway and controller VMs
+## Controller VM
 
-`parcon install` creates both VMs from images published with each release, built with Packer from `images/gateway/`
-and `images/controller/` on the same Ubuntu 26.04 base as the runner image. Unlike workers, they are long-lived and
-install security updates with `unattended-upgrades`.
+`parcon install` creates the controller VM from an image published with each release, built with Packer from
+`images/controller/` on the same Ubuntu 26.04 base as the runner image. Unlike workers, it is long-lived and installs
+security updates with `unattended-upgrades`. It has the `parcon` binary in `/usr/local/bin`, the `parcon` system user
+it runs as, and its unit, [`deploy/parcon.service`](deploy/parcon.service). Only `parcon` can read its config and
+secrets in `/etc/proxmox-actions-runners`. `parcon install` enables the unit once the GitHub App exists, and
+`parcon update` has the VM download the new release's `parcon`, checked against the release's signed checksums.
 
-- The **gateway** image has dnsmasq, nftables, and `par-gateway-configure`, which `parcon` runs through the guest
-  agent to set the worker subnet and the addresses to block. `parcon update` replaces the gateway with the new
-  release's image.
-- The **controller** image has the `parcon` binary in `/usr/local/bin`, the `parcon` system user it runs as, and
-  its unit, [`deploy/parcon.service`](deploy/parcon.service). Only `parcon` can read its config and secrets in
-  `/etc/proxmox-actions-runners`. `parcon install` enables the unit once the GitHub App exists, and `parcon update`
-  has the VM download the new release's `parcon`, checked against the release's signed checksums.
+See [docs/install.md](docs/install.md#controller-image) for the details.
 
-See [docs/install.md](docs/install.md#gateway-and-controller-images) for the details.
+## Worker network and firewall
+
+Workers attach only to the SDN VNet `parnet`. The host has the subnet's first address, routes the workers' traffic,
+and SNATs it to the internet; SDN DHCP hands out addresses, with the host's DNS server. Each worker's NIC has the
+Proxmox firewall on: nothing comes in that the worker didn't start, and the security group `par-worker` lets DNS
+through to the host's resolver, then drops the worker subnet (SDN's own IP set for the VNet) and everything in the IP
+set `par-blocked`, which holds private, CGNAT, and link-local ranges, your LAN, every address of the host, and the
+controller VM. Workers reach the
+internet, and nothing else. The controller refuses to start a worker whose firewall isn't on.
+
+The firewall applies only while the datacenter firewall is on. `parcon status` and `parcon check` fail if it is
+turned off. See [docs/install.md](docs/install.md#networking) for the details.
 
 ## Requirements
 
@@ -250,10 +260,16 @@ See [docs/install.md](docs/install.md#gateway-and-controller-images) for the det
   *Limitations*.
 - **Clone storage** that supports linked clones: LVM-thin, ZFS, RBD, or qcow2/raw files. Plain LVM and iSCSI need
   `linkedClone: false`.
-- **A LAN bridge with internet egress** (usually `vmbr0`) for the controller and gateway VMs. Workers never attach
-  to it: they get a dedicated network behind the gateway VM, which the installer creates.
+- **A LAN bridge with internet egress** (usually `vmbr0`) for the controller VM. Workers never attach to it: they
+  get a dedicated network that the host routes, which the installer creates.
 - **Proxmox SDN** available, which it is by default on PVE 9 (`ifupdown2` and the `source /etc/network/interfaces.d/*`
-  line in `/etc/network/interfaces`).
+  line in `/etc/network/interfaces`), and **SDN DHCP** set up as Proxmox's
+  [SDN docs](https://pve.proxmox.com/pve-docs/chapter-pvesdn.html) say: `apt install dnsmasq`, then
+  `systemctl disable --now dnsmasq`.
+- **The datacenter firewall on** (Datacenter > Firewall > Options). Workers' firewalls apply only with it on. It also
+  filters the host's own inbound traffic, allowing SSH and the web UI from the host's own network by default, so check
+  its rules before you turn it on. `parcon` doesn't turn it on for you.
+- **An IPv4 DNS server** in the node's DNS settings (System > DNS) that isn't the node itself. Workers use it.
 - **A GitHub organization or personal account** where you can create and install a GitHub App: an organization's
   runners serve all its repositories, and a personal account's serve one repository, which GitHub requires. The App
   is created in your account with only the permission it needs:
@@ -303,9 +319,11 @@ These are deliberate. The project supports exactly the setup `parcon install` cr
   outside its VM. The repository is public, so you are welcome to fork it for other setups.
 - **One worker network.** Every scale set shares the same worker network and runner pool. Keep jobs with different
   trust levels apart with separate scale sets and GitHub runner groups.
-- **Workers can reach each other.** Workers running at the same time share one network segment, so a hostile job
-  can connect to other workers, answer their DHCP, or impersonate the gateway. Isolating workers through the Proxmox
-  firewall is planned. Until then, run jobs that must be protected from untrusted code on a separate node.
+- **Workers share a network segment.** The firewall stops workers from connecting to each other, but workers running
+  at the same time share one layer-2 segment, so a hostile job could still answer ARP for another worker's address.
+  Run jobs that must be protected from untrusted code on a separate node.
+- **Isolation depends on the datacenter firewall.** If someone turns it off, workers can reach your LAN and the
+  host. `parcon status` and `parcon check` fail while it is off.
 - **amd64 only**, and workers run **Ubuntu 26.04 only**.
 - **A lean runner image, not GitHub's.** Workers don't have the preinstalled toolset of GitHub-hosted runners, which
   is tens of GB. Workflows install what they need with `setup-*` actions, or you extend the Packer build in
@@ -333,7 +351,6 @@ internal/vmtags/       the Proxmox tags that hold the controller's state
 install/               install.sh, the bootstrap that runs parcon install, and its bats tests
 images/common/         what the image builds share: Ubuntu pin, base and cleanup steps, boot test
 images/controller/     Packer build of the controller VM image with parcon (CI)
-images/gateway/        Packer build of the gateway VM image: DHCP, DNS, NAT, firewall (CI)
 images/runner/         Packer build of the runner template image (CI)
 .github/               CI, the release build, and the daily actions/runner check
 deploy/                example config, systemd unit for the controller VM
@@ -346,9 +363,10 @@ docs/                  design notes
 - Every job runs in a fresh VM that is destroyed afterward, so no state carries over between jobs.
 - Self-hosted runners run untrusted code. Be very careful before using them with **public** repositories,
   where anyone who opens a pull request can run code on your infrastructure.
-- Workers sit on their own network. The gateway VM gives them DHCP, DNS, and outbound internet and drops traffic to
-  the LAN, the Proxmox host, the controller VM, and private and link-local ranges. The host doesn't route worker
-  traffic. Don't bake reusable credentials into the template.
+- Workers sit on their own network, which the host routes to the internet. The Proxmox firewall at each worker's NIC
+  drops traffic to the LAN, the Proxmox host, the controller VM, other workers, and private and link-local ranges,
+  and everything inbound the worker didn't start. It needs the datacenter firewall on. Don't bake reusable
+  credentials into the template.
 - The Proxmox token is scoped to the runner pool, so the controller can't modify other VMs.
 - The GitHub App's private key goes straight from GitHub into the controller VM and never touches the Proxmox host.
   Neither does the Proxmox token's secret: `parcon` pipes it into the controller VM when it creates it. The host's

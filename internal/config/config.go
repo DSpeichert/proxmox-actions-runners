@@ -70,6 +70,9 @@ type Proxmox struct {
 	Zone string `yaml:"zone,omitempty"`
 	// VNet is the worker network's SDN VNet.
 	VNet string `yaml:"vnet"`
+	// FirewallGroup is the datacenter firewall's security group every worker's own firewall must use; the
+	// controller starts no worker without it. Empty means WorkerFirewallGroup, the group the installer creates.
+	FirewallGroup string `yaml:"firewallGroup,omitempty"`
 	// VMIDRange is the range new VMs take their IDs from.
 	VMIDRange VMIDRange `yaml:"vmidRange"`
 	// LinkedClone chooses linked clones over full clones. Nil means DefaultLinkedClone; Parse always sets it.

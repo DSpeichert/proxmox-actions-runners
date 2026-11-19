@@ -239,6 +239,12 @@ func (s System) PackageInstalled(ctx context.Context, pkg string) bool {
 	return err == nil && strings.Contains(string(out), "install ok installed")
 }
 
+// ServiceActive reports whether a systemd unit is active.
+func (s System) ServiceActive(ctx context.Context, unit string) bool {
+	_, err := s.Exec.Run(ctx, pvecli.C("systemctl", "is-active", "--quiet", unit))
+	return err == nil
+}
+
 // ErrNoEthtool means ethtool isn't installed.
 var ErrNoEthtool = errors.New("ethtool isn't installed")
 

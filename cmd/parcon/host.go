@@ -90,12 +90,11 @@ type settingsFlags struct {
 func (f *settingsFlags) register(fs *flag.FlagSet) {
 	f.s = settings.Default()
 	n := &f.s.Network
-	fs.StringVar(&n.Bridge, "bridge", n.Bridge, "LAN bridge for the controller and gateway VMs")
+	fs.StringVar(&n.Bridge, "bridge", n.Bridge, "LAN bridge for the controller VM")
 	fs.IntVar(&n.VLAN, "vlan", 0, "VLAN tag on the LAN bridge (default none)")
 	fs.StringVar(&n.PVEAddress, "pve-address", "", "this node's address the controller uses for the API "+
 		"(default: its address on the bridge)")
-	fs.StringVar(&n.GatewayIP, "gateway-ip", n.GatewayIP, "gateway VM's LAN address: dhcp or a CIDR such as 192.0.2.10/24")
-	fs.StringVar(&n.ControllerIP, "controller-ip", n.ControllerIP, "controller VM's LAN address: dhcp or a CIDR")
+	fs.StringVar(&n.ControllerIP, "controller-ip", n.ControllerIP, "controller VM's LAN address: dhcp or a CIDR such as 192.0.2.10/24")
 	fs.StringVar(&n.LANGateway, "lan-gateway", "", "LAN router, needed with a static address")
 	fs.StringVar(&n.WorkerSubnet, "worker-subnet", n.WorkerSubnet, "worker network")
 	fs.StringVar(&f.s.Proxmox.Storage, "storage", f.s.Proxmox.Storage, "storage for VM disks")

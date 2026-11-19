@@ -28,6 +28,7 @@ type Proxmox interface {
 	Destroy(ctx context.Context, vmid int) error
 	AgentPing(ctx context.Context, vmid int) error
 	AgentWriteFile(ctx context.Context, vmid int, path string, content []byte) error
+	Firewall(ctx context.Context, vmid int) (proxmox.Firewall, error)
 }
 
 // GitHub is what the controller needs from GitHub. *github.Client implements it.

@@ -8,7 +8,8 @@ set -euo pipefail
 # Names of everything the suite creates on the node. They differ from a real install's (parzone, parnet,
 # par-runners), so the suite can't touch one. The runner image gets its own pool: the controller prunes every
 # template in its pool but the newest, so the test template and the image can't share one.
-readonly POOL=par-it IMAGE_POOL=par-it-image ROLE=PARIntegration USER=par-it@pve TOKEN=it ZONE=parit VNET=paritnet
+readonly POOL=par-it IMAGE_POOL=par-it-image ROLE=PARIntegration USER=par-it@pve TOKEN=it ZONE=parit VNET=paritnet \
+	GROUP=par-it-worker
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 ROOT=$(cd "$HERE/../.." && pwd)
@@ -37,9 +38,9 @@ environment:
   PAR_IT_RUNNER_IMAGE    optional: a par-runner-<version>.qcow2 built from images/runner, with its .json manifest
                          next to it; the suite imports it and runs a worker from it
   PAR_IT_IMAGE_TEMPLATE_VMID  the runner image template's VMID (default 9001)
-  PAR_IT_GATEWAY_IMAGE   for installer: par-gateway-<version>.qcow2 built from images/gateway
   PAR_IT_CONTROLLER_IMAGE  for installer: parcon-<version>.qcow2 built from images/controller
-                         installer also needs PAR_IT_RUNNER_IMAGE, all three built with the same version
+                         installer also needs PAR_IT_RUNNER_IMAGE, both built with the same version, and a node
+                         with dnsmasq installed (its own service off) and the datacenter firewall on
   PAR_IT_STATE           private working directory (default .agents/integration, which git ignores)
 EOF
 }
@@ -151,7 +152,8 @@ cmd_setup() {
 	preflight
 
 	log "fixtures"
-	node_script fixtures.sh "ZONE=$ZONE" "VNET=$VNET" "POOL=$POOL" "ROLE=$ROLE" "USER=$USER" "PRIVS=$(privileges)"
+	node_script fixtures.sh "ZONE=$ZONE" "VNET=$VNET" "POOL=$POOL" "ROLE=$ROLE" "USER=$USER" "GROUP=$GROUP" \
+		"PRIVS=$(privileges)"
 	if [[ -n $RUNNER_IMAGE ]]; then
 		node "pveum pool list --output-format json | grep -q '\"poolid\":\"$IMAGE_POOL\"' ||
 			pveum pool add '$IMAGE_POOL' --comment 'proxmox-actions-runners integration suite: runner image'"
@@ -184,6 +186,7 @@ cmd_setup() {
 	log "template $TEMPLATE_VMID"
 	node_script template.sh "VMID=$TEMPLATE_VMID" "POOL=$POOL" "STORAGE=$STORAGE" "BRIDGE=$BUILD_BRIDGE" \
 		"VNET=$VNET" "REBUILD=${PAR_IT_REBUILD_TEMPLATE:-0}"
+	node_script firewall.sh "VMID=$TEMPLATE_VMID" "GROUP=$GROUP"
 
 	# parcon check template compares the template's runner version with the latest release, so tag the test template
 	# with the latest one for a result that doesn't depend on when the suite runs.
@@ -223,6 +226,7 @@ import_runner_image() {
 	fi
 	node_script import-image.sh "VMID=$IMAGE_TEMPLATE_VMID" "POOL=$IMAGE_POOL" "STORAGE=$STORAGE" "VNET=$VNET" \
 		"IMAGE=$remote" "TAGS=$tags"
+	node_script firewall.sh "VMID=$IMAGE_TEMPLATE_VMID" "GROUP=$GROUP"
 	IMAGE_RUNNER=${tags##*par-rv-}
 }
 
@@ -242,6 +246,7 @@ PAR_PVE_NODE=$name
 PAR_PVE_STORAGE=$STORAGE
 PAR_PVE_POOL=$POOL
 PAR_PVE_VNET=$VNET
+PAR_PVE_FIREWALL_GROUP=$GROUP
 PAR_PVE_TEMPLATE_VMID=$TEMPLATE_VMID
 PAR_PVE_TEST_VMID=$TEST_VMID
 EOF
@@ -274,6 +279,7 @@ proxmox:
   storage: $STORAGE
   zone: $ZONE
   vnet: $VNET
+  firewallGroup: $GROUP
   vmidRange: { start: $((TEST_VMID + 1)), end: $((TEST_VMID + 10)) }
 github:
   configUrl: https://github.com/my-org/my-repo
@@ -375,14 +381,21 @@ readonly INSTALLER_DIR=/var/tmp/par-it-installer
 # install on it, and it uninstalls even when a step fails.
 cmd_installer() {
 	require_throwaway
-	[[ -n $RUNNER_IMAGE && -f ${PAR_IT_GATEWAY_IMAGE:-} && -f ${PAR_IT_CONTROLLER_IMAGE:-} ]] ||
-		die "installer needs PAR_IT_RUNNER_IMAGE, PAR_IT_GATEWAY_IMAGE, and PAR_IT_CONTROLLER_IMAGE"
+	[[ -n $RUNNER_IMAGE && -f ${PAR_IT_CONTROLLER_IMAGE:-} ]] ||
+		die "installer needs PAR_IT_RUNNER_IMAGE and PAR_IT_CONTROLLER_IMAGE"
 	local version
 	version=$(basename "$RUNNER_IMAGE" .qcow2)
 	version=${version#par-runner-}
-	[[ $(basename "$PAR_IT_GATEWAY_IMAGE") == "par-gateway-$version.qcow2" &&
-		$(basename "$PAR_IT_CONTROLLER_IMAGE") == "parcon-$version.qcow2" ]] ||
-		die "the images must share one version: par-runner-$version, par-gateway-$version, parcon-$version"
+	[[ $(basename "$PAR_IT_CONTROLLER_IMAGE") == "parcon-$version.qcow2" ]] ||
+		die "the images must share one version: par-runner-$version, parcon-$version"
+	# What the operator sets up before parcon install, which the suite leaves to them: turning on the datacenter
+	# firewall could cut the suite's own SSH off.
+	# shellcheck disable=SC2016 # ${Status} is dpkg-query's field, expanded by neither shell.
+	node 'dpkg-query -W -f "\${Status}" dnsmasq 2>/dev/null | grep -q "install ok installed" &&
+		! systemctl is-active --quiet dnsmasq.service' ||
+		die "the node needs dnsmasq for SDN DHCP: apt install dnsmasq, then systemctl disable --now dnsmasq"
+	node 'pvesh get /cluster/firewall/options --output-format json | grep -q "\"enable\":1"' ||
+		die "the node needs the datacenter firewall on (Datacenter > Firewall > Options)"
 	# Release versions are X.Y.Z; images built with -var version=it get one here.
 	local release=$version
 	[[ $release =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]] || release=0.0.0-$version
@@ -397,7 +410,6 @@ cmd_installer() {
 	scp -q "${SSH_OPTS[@]}" "$STATE/parcon-host" "$PAR_IT_SSH:$INSTALLER_DIR/parcon"
 	scp -q "${SSH_OPTS[@]}" "$RUNNER_IMAGE" "$PAR_IT_SSH:$INSTALLER_DIR/assets/par-runner-$release.qcow2"
 	scp -q "${SSH_OPTS[@]}" "$IMAGE_MANIFEST" "$PAR_IT_SSH:$INSTALLER_DIR/assets/par-runner-$release.json"
-	scp -q "${SSH_OPTS[@]}" "$PAR_IT_GATEWAY_IMAGE" "$PAR_IT_SSH:$INSTALLER_DIR/assets/par-gateway-$release.qcow2"
 	scp -q "${SSH_OPTS[@]}" "$PAR_IT_CONTROLLER_IMAGE" "$PAR_IT_SSH:$INSTALLER_DIR/assets/parcon-$release.qcow2"
 	node "cd $INSTALLER_DIR/assets && sha256sum -- * >SHA256SUMS"
 
@@ -423,7 +435,7 @@ cmd_installer() {
 	printf '%s\n' "$objects"
 	local want
 	for want in "pool par-runners" "pool par-system" "role PARController" "user par@pve" "zone parzone" \
-		"vnet parnet" "par-gateway" "par-controller" "par-runner-"; do
+		"vnet parnet" "subnet parzone-" "group par-worker" "ipset par-blocked" "par-controller" "par-runner-"; do
 		grep -qF -- "$want" <<<"$objects" || die "the install has no $want"
 	done
 	node "test -x /usr/local/bin/parcon && test -f /etc/proxmox-actions-runners/settings.yaml" ||
@@ -464,7 +476,8 @@ cmd_teardown() {
 	require_throwaway
 	log "teardown on $HOST"
 	# Always both pools: the image pool may be left from an earlier run with PAR_IT_RUNNER_IMAGE.
-	node_script teardown.sh "ZONE=$ZONE" "VNET=$VNET" "POOLS=$POOL $IMAGE_POOL" "ROLE=$ROLE" "USER=$USER"
+	node_script teardown.sh "ZONE=$ZONE" "VNET=$VNET" "POOLS=$POOL $IMAGE_POOL" "ROLE=$ROLE" "USER=$USER" \
+		"GROUP=$GROUP"
 	rm -f "$STATE/env" "$STATE/token" "$STATE/config.yaml" "$STATE/config-image.yaml" "$STATE/github-app.pem" \
 		"$STATE/parcon" "$STATE/parcon-host"
 }

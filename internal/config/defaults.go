@@ -43,7 +43,8 @@ const (
 	// DefaultStorage and DefaultBridge are a fresh Proxmox VE install's VM storage and LAN bridge.
 	DefaultStorage = "local-lvm"
 	DefaultBridge  = "vmbr0"
-	// DefaultWorkerSubnet is the worker network behind the gateway VM: a /22 out of the way of common LANs.
+	// DefaultWorkerSubnet is the worker network: a /22 out of the way of common LANs. The host routes and SNATs it,
+	// and the Proxmox firewall limits where workers may go.
 	DefaultWorkerSubnet = "10.251.0.0/22"
 	// DefaultVMIDStart and DefaultVMIDEnd bound the IDs of workers and templates.
 	DefaultVMIDStart = 10000
@@ -53,6 +54,11 @@ const (
 	// both created by the installer.
 	DefaultPool = "par-runners"
 	DefaultVNet = "parnet"
+	// WorkerFirewallGroup is the datacenter firewall's security group that every worker's firewall uses, and
+	// BlockedIPSet the IP set of what workers must not reach. The installer creates both; the controller starts
+	// only a worker whose firewall uses the group (proxmox.firewallGroup).
+	WorkerFirewallGroup = "par-worker"
+	BlockedIPSet        = "par-blocked"
 	// DefaultTokenID is the controller's API token, which the installer creates.
 	DefaultTokenID = "par@pve!controller"
 )
@@ -89,6 +95,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Proxmox.Zone == "" {
 		c.Proxmox.Zone = DefaultZone
+	}
+	if c.Proxmox.FirewallGroup == "" {
+		c.Proxmox.FirewallGroup = WorkerFirewallGroup
 	}
 	if c.Proxmox.LinkedClone == nil {
 		linked := DefaultLinkedClone

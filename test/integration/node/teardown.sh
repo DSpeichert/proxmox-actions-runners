@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # Runs on the test node as root, sent by run.sh. Removes everything the integration suite created: every VM in its
-# pools, the pools, the user (with its token and ACLs), the role, the SDN zone and VNet, the template snippet and
-# images, and the snippets content type it added to the local storage. Missing objects are skipped.
+# pools, the pools, the user (with its token and ACLs), the role, the firewall security group, the SDN zone and VNet,
+# the template snippet and images, and the snippets content type it added to the local storage. Missing objects are
+# skipped.
 #
-# Environment: ZONE VNET POOLS (space-separated) ROLE USER
+# Environment: ZONE VNET POOLS (space-separated) ROLE USER GROUP
 set -euo pipefail
 
 readonly IMG=/var/lib/vz/import/ubuntu-26.04-server-cloudimg-amd64.img
@@ -12,7 +13,7 @@ readonly SNIPPET=/var/lib/vz/snippets/par-it-agent.yaml
 readonly CONTENT_MARKER=/root/.par-it-local-content
 
 main() {
-	: "${ZONE:?}" "${VNET:?}" "${POOLS:?}" "${ROLE:?}" "${USER:?}"
+	: "${ZONE:?}" "${VNET:?}" "${POOLS:?}" "${ROLE:?}" "${USER:?}" "${GROUP:?}"
 
 	local pool vmid
 	for pool in $POOLS; do
@@ -55,6 +56,12 @@ main() {
 	if pveum role list --output-format json | grep -q "\"roleid\":\"$ROLE\""; then
 		echo "== role $ROLE"
 		pveum role delete "$ROLE"
+	fi
+
+	# After the VMs: their firewalls used it.
+	if pvesh get /cluster/firewall/groups --output-format json | grep -q "\"group\":\"$GROUP\""; then
+		echo "== firewall security group $GROUP"
+		pvesh delete "/cluster/firewall/groups/$GROUP"
 	fi
 
 	local changed=0

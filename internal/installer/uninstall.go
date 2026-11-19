@@ -44,8 +44,9 @@ func vmids(vms []proxmox.VM) string {
 	return strings.Join(ids, " ")
 }
 
-// Uninstall removes everything parcon and the controller created: the scale set in GitHub, the VMs, the Proxmox
-// objects, the worker network, the offload rule, no-kvm-apf, the settings, and parcon itself, last. The GitHub App stays.
+// Uninstall removes everything parcon and the controller created: the scale set in GitHub, the VMs (an older
+// release's gateway VM too), the Proxmox objects, the worker firewall and network, the offload rule, no-kvm-apf,
+// the settings, and parcon itself, last. The GitHub App stays.
 func (in *Installer) Uninstall(ctx context.Context) error {
 	vms, err := in.vms(ctx)
 	if err != nil {
@@ -70,7 +71,9 @@ func (in *Installer) Uninstall(ctx context.Context) error {
 		vmids(managed))
 	in.Out.Say("  remove pools %s and %s, role %s, user %s with its token and ACLs", SystemPool, RunnerPool, Role,
 		PVEUser)
-	in.Out.Say("  remove SDN VNet %s and zone %s, then apply the SDN config", VNet, Zone)
+	in.Out.Say("  remove firewall security group %s, IP set %s, and the host's DHCP rule for %s (the datacenter "+
+		"firewall stays on)", FirewallGroup, BlockedIPSet, VNet)
+	in.Out.Say("  remove SDN subnet, VNet %s, and zone %s, then apply the SDN config", VNet, Zone)
 	if line := in.offloadRemovePlan(); line != "" {
 		in.Out.Say("  %s", line)
 	}
@@ -119,6 +122,9 @@ func (in *Installer) Uninstall(ctx context.Context) error {
 	}
 
 	if err := in.removeAccess(ctx); err != nil {
+		return err
+	}
+	if err := in.removeFirewall(ctx); err != nil {
 		return err
 	}
 	if err := in.removeNetwork(ctx); err != nil {
@@ -209,6 +215,15 @@ func (in *Installer) removeAccess(ctx context.Context) error {
 func (in *Installer) removeNetwork(ctx context.Context) error {
 	in.Out.Step("Worker network")
 	changed := false
+	// A VNet with a subnet can't be removed.
+	if subnets, err := in.PVE.Subnets(ctx, VNet); err == nil {
+		for _, sn := range subnets {
+			if err := in.run(ctx, "pvesh", "delete", "/cluster/sdn/vnets/"+VNet+"/subnets/"+sn.ID); err != nil {
+				return err
+			}
+			changed = true
+		}
+	}
 	for _, obj := range []string{"vnets/" + VNet, "zones/" + Zone} {
 		if in.PVE.SDNExists(ctx, obj) {
 			if err := in.run(ctx, "pvesh", "delete", "/cluster/sdn/"+obj); err != nil {

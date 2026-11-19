@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # First step of every image: an up-to-date system and the QEMU guest agent, which is how the controller reaches
-# workers and the installer configures the gateway and controller VMs. The runner image turns automatic updates off
-# (images/runner/scripts/base.sh); the long-lived gateway and controller turn them on (auto-updates.sh).
+# workers and the installer configures the controller VM. The runner image turns automatic updates off
+# (images/runner/scripts/base.sh); the long-lived controller turns them on (auto-updates.sh).
 set -euo pipefail
 
 main() {

@@ -51,10 +51,12 @@ type fakeVM struct {
 	files    map[string]string
 	// pings counts guest-agent pings since the VM started.
 	pings int
+	// firewall is the VM's own firewall, which a clone copies from its template.
+	firewall proxmox.Firewall
 }
 
 // fakeProxmox keeps VMs in memory and mimics the Proxmox behavior the controller relies on: clones copy the
-// template's tags, a running VM can't be destroyed, and the guest agent answers some pings after boot.
+// template's tags and firewall, a running VM can't be destroyed, and the guest agent answers some pings after boot.
 type fakeProxmox struct {
 	mu  sync.Mutex
 	vms map[int]*fakeVM
@@ -63,7 +65,8 @@ type fakeProxmox struct {
 	// onClone and onPing run on every clone and ping, for example to advance a clock.
 	onClone func()
 	onPing  func()
-	// fail maps an operation name ("clone", "configure", "grow", "start", "write", "destroy") to an error for it.
+	// fail maps an operation name ("clone", "configure", "grow", "firewall", "start", "write", "destroy") to an
+	// error for it.
 	fail  map[string]error
 	calls []string
 }
@@ -85,6 +88,9 @@ func (f *fakeProxmox) addTemplate(vmid int, version int64) {
 	f.add(proxmox.VM{VMID: vmid, Name: fmt.Sprintf("par-tpl-%d", version), Pool: testPool, Template: true,
 		Tags: []string{vmtags.Managed, vmtags.Template, fmt.Sprintf("%s%d", vmtags.TemplateVersionPrefix, version),
 			vmtags.RunnerVersionPrefix + "2.337.0"}})
+	f.mu.Lock()
+	f.vms[vmid].firewall = proxmox.Firewall{Enabled: true, PolicyIn: "DROP", Groups: []string{"par-worker"}}
+	f.mu.Unlock()
 }
 
 func (f *fakeProxmox) record(format string, args ...any) error {
@@ -180,8 +186,9 @@ func (f *fakeProxmox) Clone(_ context.Context, opts proxmox.CloneOptions) error 
 	f.vms[opts.NewVMID] = &fakeVM{
 		vm: proxmox.VM{VMID: opts.NewVMID, Name: opts.Name, Pool: opts.Pool, Status: "stopped",
 			Tags: append([]string(nil), src.vm.Tags...)},
-		config: map[string]string{"description": opts.Description},
-		files:  map[string]string{},
+		config:   map[string]string{"description": opts.Description},
+		files:    map[string]string{},
+		firewall: src.firewall,
 	}
 	return nil
 }
@@ -203,6 +210,19 @@ func (f *fakeProxmox) SetConfig(_ context.Context, vmid int, settings map[string
 		}
 	}
 	return nil
+}
+
+func (f *fakeProxmox) Firewall(_ context.Context, vmid int) (proxmox.Firewall, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.record("firewall %d", vmid); err != nil {
+		return proxmox.Firewall{}, err
+	}
+	vm, err := f.get(vmid)
+	if err != nil {
+		return proxmox.Firewall{}, err
+	}
+	return vm.firewall, nil
 }
 
 func (f *fakeProxmox) GrowDisk(_ context.Context, vmid int, disk string, addGiB int) error {
@@ -445,7 +465,7 @@ func testConfig(scaleSets ...config.ScaleSet) *config.Config {
 	}
 	return &config.Config{
 		Proxmox: config.Proxmox{Node: "pve1", Pool: testPool, Storage: "local-lvm", VNet: "parnet",
-			VMIDRange: config.VMIDRange{Start: 10000, End: 10009}, LinkedClone: &linked},
+			FirewallGroup: config.WorkerFirewallGroup, VMIDRange: config.VMIDRange{Start: 10000, End: 10009}, LinkedClone: &linked},
 		ScaleSets: scaleSets,
 	}
 }

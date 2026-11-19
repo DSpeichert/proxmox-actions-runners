@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"maps"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -43,6 +44,9 @@ type fakeVM struct {
 	config   map[string]string
 	// files are files in the guest, for the controller.
 	files map[string]string
+	// fwOptions and fwRules are the VM's own firewall, which a clone copies.
+	fwOptions map[string]string
+	fwRules   []pvecli.Rule
 }
 
 // fakeNode is a Proxmox node that interprets the commands parcon runs, keeping its state in memory.
@@ -51,19 +55,31 @@ type fakeNode struct {
 	mu  sync.Mutex
 	sys string // the fake sysfs /sys/class/net
 
-	pools   map[string]string // ID → comment
-	roles   map[string]string // ID → privileges
-	users   []string
-	tokens  []string
-	acls    []pvecli.ACL
-	zones   []string
-	vnets   []string
-	pending []map[string]string // pending SDN objects of others: {"zone": "other", "state": "new"}
-	vms     map[int]*fakeVM
-	nextID  int
-	storage pvecli.StorageStatus
-	addrs   string // ip -j -4 addr show
-	routes  string // ip -j -4 route show
+	pools  map[string]string // ID → comment
+	roles  map[string]string // ID → privileges
+	users  []string
+	tokens []string
+	acls   []pvecli.ACL
+	zones  []string
+	// zoneOpts are each zone's dhcp and ipam options.
+	zoneOpts map[string]map[string]string
+	vnets    []string
+	subnets  []pvecli.Subnet
+	// clusterFW is the datacenter firewall's enable option; dns the node's DNS servers.
+	clusterFW bool
+	dns       []string
+	ipsets    map[string][]string
+	groups    map[string][]pvecli.Rule
+	hostRules []pvecli.Rule
+	// services are the host's active systemd units, and uninstalled the Debian packages it lacks.
+	services    map[string]bool
+	uninstalled map[string]bool
+	pending     []map[string]string // pending SDN objects of others: {"zone": "other", "state": "new"}
+	vms         map[int]*fakeVM
+	nextID      int
+	storage     pvecli.StorageStatus
+	addrs       string // ip -j -4 addr show
+	routes      string // ip -j -4 route show
 	// offloadsOn are the NICs whose offloads are on.
 	offloadsOn map[string]bool
 	// kvmGuest makes the node a VM on KVM. update-grub writes grubCfg, with no-kvm-apf if grubDropIn exists.
@@ -82,6 +98,9 @@ func newFakeNode(t *testing.T, sysNet string) *fakeNode {
 	return &fakeNode{
 		t: t, sys: sysNet,
 		pools: map[string]string{}, roles: map[string]string{}, vms: map[int]*fakeVM{}, nextID: 100,
+		zoneOpts: map[string]map[string]string{}, clusterFW: true, dns: []string{"192.0.2.1"},
+		ipsets: map[string][]string{}, groups: map[string][]pvecli.Rule{},
+		services: map[string]bool{"dnsmasq@parzone.service": true}, uninstalled: map[string]bool{},
 		storage: pvecli.StorageStatus{Type: "lvmthin", Content: "images,rootdir", Active: 1, Enabled: 1,
 			Avail: 200 << 30},
 		addrs: `[{"ifname":"lo","addr_info":[{"local":"127.0.0.1","prefixlen":8}]},
@@ -178,13 +197,235 @@ func (n *fakeNode) run(c pvecli.Cmd) (string, error) {
 	case "proxmox-boot-tool":
 		return "", nil
 	case "dpkg-query":
+		if n.uninstalled[a[len(a)-1]] {
+			return "", fmt.Errorf("exit status 1")
+		}
 		return "install ok installed", nil
+	case "systemctl":
+		if n.services[a[len(a)-1]] {
+			return "", nil
+		}
+		return "", fmt.Errorf("exit status 3")
 	}
 	return "", fmt.Errorf("the fake node doesn't know %s", c)
 }
 
+// ruleOf reads a firewall rule from pvesh's arguments.
+func ruleOf(a []string) pvecli.Rule {
+	enable, _ := strconv.Atoi(flagOf(a, "--enable"))
+	return pvecli.Rule{Type: flagOf(a, "--type"), Action: flagOf(a, "--action"), Proto: flagOf(a, "--proto"),
+		Dport: flagOf(a, "--dport"), Dest: flagOf(a, "--dest"), Iface: flagOf(a, "--iface"),
+		Comment: flagOf(a, "--comment"), Enable: enable}
+}
+
+// rulesJSON numbers rules by position, as Proxmox lists them.
+func rulesJSON(rules []pvecli.Rule) string {
+	out := make([]pvecli.Rule, len(rules))
+	for i, r := range rules {
+		r.Pos = i
+		out[i] = r
+	}
+	return jsonOf(out)
+}
+
+// insertRule puts a rule at the top, where Proxmox puts a new rule, or at --pos.
+func insertRule(rules []pvecli.Rule, a []string) []pvecli.Rule {
+	pos, _ := strconv.Atoi(flagOf(a, "--pos"))
+	return slices.Insert(rules, min(pos, len(rules)), ruleOf(a))
+}
+
+// deleteRule removes the rule at the position that ends path.
+func deleteRule(rules []pvecli.Rule, path string) ([]pvecli.Rule, error) {
+	pos, err := strconv.Atoi(filepath.Base(path))
+	if err != nil || pos >= len(rules) {
+		return nil, fmt.Errorf("no rule at %s", path)
+	}
+	return slices.Delete(rules, pos, pos+1), nil
+}
+
+// firewall handles the datacenter, host, and VM firewall paths.
+func (n *fakeNode) firewall(a []string) (string, bool, error) {
+	path := a[1]
+	parts := strings.Split(strings.Trim(path, "/"), "/")
+	switch {
+	case a[0] == "get" && path == "/cluster/firewall/options":
+		on := 0
+		if n.clusterFW {
+			on = 1
+		}
+		return jsonOf(map[string]int{"enable": on}), true, nil
+	case a[0] == "get" && path == "/nodes/pve1/dns":
+		out := map[string]string{"search": "example.com"}
+		for i, d := range n.dns {
+			out[fmt.Sprintf("dns%d", i+1)] = d
+		}
+		return jsonOf(out), true, nil
+	case path == "/cluster/firewall/ipset":
+		if a[0] == "create" {
+			n.ipsets[flagOf(a, "--name")] = []string{}
+			return "", true, nil
+		}
+		var out []map[string]string
+		for name := range n.ipsets {
+			out = append(out, map[string]string{"name": name})
+		}
+		return jsonOf(out), true, nil
+	case strings.HasPrefix(path, "/cluster/firewall/ipset/"):
+		rest := strings.TrimPrefix(path, "/cluster/firewall/ipset/")
+		name, cidr, _ := strings.Cut(rest, "/")
+		set, ok := n.ipsets[name]
+		if !ok {
+			return "", true, fmt.Errorf("no such IPSet '%s'", name)
+		}
+		switch a[0] {
+		case "get":
+			var out []map[string]string
+			for _, c := range set {
+				out = append(out, map[string]string{"cidr": c})
+			}
+			return jsonOf(out), true, nil
+		case "create":
+			n.ipsets[name] = append(set, flagOf(a, "--cidr"))
+			return "", true, nil
+		case "delete":
+			if cidr == "" {
+				if len(set) > 0 && flagOf(a, "--force") != "1" {
+					return "", true, fmt.Errorf("IPSet '%s' is not empty", name)
+				}
+				delete(n.ipsets, name)
+				return "", true, nil
+			}
+			if !slices.Contains(set, cidr) {
+				return "", true, fmt.Errorf("no such entry %s", cidr)
+			}
+			n.ipsets[name] = slices.DeleteFunc(set, func(c string) bool { return c == cidr })
+			return "", true, nil
+		}
+	case path == "/cluster/firewall/groups":
+		if a[0] == "create" {
+			n.groups[flagOf(a, "--group")] = []pvecli.Rule{}
+			return "", true, nil
+		}
+		var out []map[string]string
+		for g := range n.groups {
+			out = append(out, map[string]string{"group": g})
+		}
+		return jsonOf(out), true, nil
+	case strings.HasPrefix(path, "/cluster/firewall/groups/"):
+		group := parts[3]
+		rules, ok := n.groups[group]
+		if !ok {
+			return "", true, fmt.Errorf("no such security group '%s'", group)
+		}
+		switch {
+		case a[0] == "get":
+			return rulesJSON(rules), true, nil
+		case a[0] == "create":
+			n.groups[group] = insertRule(rules, a)
+			return "", true, nil
+		case a[0] == "delete" && len(parts) == 4:
+			if len(rules) > 0 {
+				return "", true, fmt.Errorf("security group '%s' is not empty", group)
+			}
+			delete(n.groups, group)
+			return "", true, nil
+		case a[0] == "delete":
+			r, err := deleteRule(rules, path)
+			n.groups[group] = r
+			return "", true, err
+		}
+	case strings.HasPrefix(path, "/nodes/pve1/firewall/rules"):
+		var err error
+		switch a[0] {
+		case "get":
+			return rulesJSON(n.hostRules), true, nil
+		case "create":
+			n.hostRules = insertRule(n.hostRules, a)
+		case "delete":
+			n.hostRules, err = deleteRule(n.hostRules, path)
+		}
+		return "", true, err
+	case len(parts) >= 5 && parts[2] == "qemu" && parts[4] == "firewall":
+		vm, err := n.vm(parts[3])
+		if err != nil {
+			return "", true, err
+		}
+		switch {
+		case a[0] == "set" && parts[5] == "options":
+			if vm.fwOptions == nil {
+				vm.fwOptions = map[string]string{}
+			}
+			for i := 2; i+1 < len(a); i += 2 {
+				vm.fwOptions[strings.TrimPrefix(a[i], "--")] = a[i+1]
+			}
+			return "", true, nil
+		case a[0] == "create" && parts[5] == "rules":
+			vm.fwRules = insertRule(vm.fwRules, a)
+			return "", true, nil
+		}
+	}
+	return "", false, nil
+}
+
+// subnetOf reads a subnet's settings from pvesh's arguments into sn.
+func subnetOf(sn pvecli.Subnet, a []string) pvecli.Subnet {
+	if v := flagOf(a, "--gateway"); v != "" {
+		sn.Gateway = v
+	}
+	if v := flagOf(a, "--snat"); v != "" {
+		sn.SNAT, _ = strconv.Atoi(v)
+	}
+	if v := flagOf(a, "--dhcp-dns-server"); v != "" {
+		sn.DNSServer = v
+	}
+	if v := flagOf(a, "--dhcp-range"); v != "" {
+		start, end, _ := strings.Cut(v, ",")
+		sn.DHCPRange = []pvecli.DHCPRange{{Start: strings.TrimPrefix(start, "start-address="),
+			End: strings.TrimPrefix(end, "end-address=")}}
+	}
+	return sn
+}
+
+// sdnSubnets handles a VNet's subnets.
+func (n *fakeNode) sdnSubnets(a []string) (string, bool, error) {
+	path := a[1]
+	prefix := "/cluster/sdn/vnets/parnet/subnets"
+	if !strings.HasPrefix(path, prefix) {
+		return "", false, nil
+	}
+	if !slices.Contains(n.vnets, "parnet") {
+		return "", true, fmt.Errorf("no such vnet")
+	}
+	id := strings.TrimPrefix(strings.TrimPrefix(path, prefix), "/")
+	i := slices.IndexFunc(n.subnets, func(sn pvecli.Subnet) bool { return sn.ID == id })
+	switch {
+	case a[0] == "get" && id == "":
+		return jsonOf(n.subnets), true, nil
+	case a[0] == "create":
+		cidr := flagOf(a, "--subnet")
+		sn := subnetOf(pvecli.Subnet{ID: "parzone-" + strings.ReplaceAll(cidr, "/", "-"), CIDR: cidr}, a)
+		n.subnets = append(n.subnets, sn)
+		return "", true, nil
+	case i < 0:
+		return "", true, fmt.Errorf("no such subnet %s", id)
+	case a[0] == "set":
+		n.subnets[i] = subnetOf(n.subnets[i], a)
+		return "", true, nil
+	case a[0] == "delete":
+		n.subnets = slices.Delete(n.subnets, i, i+1)
+		return "", true, nil
+	}
+	return "", false, nil
+}
+
 func (n *fakeNode) pvesh(a []string) (string, error) {
 	path := a[1]
+	if out, ok, err := n.firewall(a); ok {
+		return out, err
+	}
+	if out, ok, err := n.sdnSubnets(a); ok {
+		return out, err
+	}
 	switch {
 	case a[0] == "get" && path == "/nodes":
 		return `[{"node":"pve1"}]`, nil
@@ -226,17 +467,24 @@ func (n *fakeNode) pvesh(a []string) (string, error) {
 		}
 		return jsonOf(out), nil
 	case a[0] == "get" && strings.HasPrefix(path, "/cluster/sdn/zones/"):
-		if slices.Contains(n.zones, filepath.Base(path)) {
-			return "{}", nil
+		if z := filepath.Base(path); slices.Contains(n.zones, z) {
+			out := map[string]string{"zone": z, "type": "simple"}
+			maps.Copy(out, n.zoneOpts[z])
+			return jsonOf(out), nil
 		}
 		return "", fmt.Errorf("no such zone")
+	case a[0] == "set" && strings.HasPrefix(path, "/cluster/sdn/zones/"):
+		n.zoneOpts[filepath.Base(path)] = map[string]string{"dhcp": flagOf(a, "--dhcp"), "ipam": flagOf(a, "--ipam")}
+		return "", nil
 	case a[0] == "get" && strings.HasPrefix(path, "/cluster/sdn/vnets/"):
 		if slices.Contains(n.vnets, filepath.Base(path)) {
 			return "{}", nil
 		}
 		return "", fmt.Errorf("no such vnet")
 	case a[0] == "create" && path == "/cluster/sdn/zones":
-		n.zones = append(n.zones, flagOf(a, "--zone"))
+		z := flagOf(a, "--zone")
+		n.zones = append(n.zones, z)
+		n.zoneOpts[z] = map[string]string{"dhcp": flagOf(a, "--dhcp"), "ipam": flagOf(a, "--ipam")}
 		return "", nil
 	case a[0] == "create" && path == "/cluster/sdn/vnets":
 		n.vnets = append(n.vnets, flagOf(a, "--vnet"))
@@ -250,6 +498,9 @@ func (n *fakeNode) pvesh(a []string) (string, error) {
 		n.zones = slices.DeleteFunc(n.zones, func(z string) bool { return z == filepath.Base(path) })
 		return "", nil
 	case a[0] == "delete" && strings.HasPrefix(path, "/cluster/sdn/vnets/"):
+		if len(n.subnets) > 0 {
+			return "", fmt.Errorf("cannot delete vnet with subnets")
+		}
 		n.vnets = slices.DeleteFunc(n.vnets, func(v string) bool { return v == filepath.Base(path) })
 		return "", nil
 	}
@@ -389,7 +640,8 @@ func (n *fakeNode) qm(a []string, stdin []byte) (string, error) {
 		}
 		id, _ := strconv.Atoi(a[2])
 		n.vms[id] = &fakeVM{id: id, name: flagOf(a, "--name"), pool: flagOf(a, "--pool"), tags: slices.Clone(src.tags),
-			config: map[string]string{"scsi0": "clone"}, files: map[string]string{}}
+			config: map[string]string{"scsi0": "clone"}, files: map[string]string{},
+			fwOptions: maps.Clone(src.fwOptions), fwRules: slices.Clone(src.fwRules)}
 		return "", nil
 	case "guest":
 		vm, err := n.vm(a[2])
@@ -445,7 +697,7 @@ func (n *fakeNode) exec(vm *fakeVM, argv []string, stdin []byte) (int, string, s
 		delete(vm.files, argv[2])
 		return 0, "", ""
 	case strings.HasPrefix(line, "parcon check"), line == "systemctl enable --now parcon.service",
-		line == "systemctl disable --now parcon.service", argv[0] == "/usr/local/sbin/par-gateway-configure":
+		line == "systemctl disable --now parcon.service":
 		return 0, "", ""
 	case line == "parcon github app create":
 		if strings.TrimSpace(string(stdin)) != manifestCode {
@@ -610,7 +862,6 @@ func writeAssets(t *testing.T, dir string, v release.Version) {
 	files := map[string]string{
 		runnerImage(v):     "runner image",
 		runnerManifest(v):  `{"builds":[{"custom_data":{"runner_version":"2.338.0"}}]}`,
-		gatewayImage(v):    "gateway image",
 		controllerImage(v): "controller image",
 		BinaryAsset(v):     "parcon " + v.String(),
 	}

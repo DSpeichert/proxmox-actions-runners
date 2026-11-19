@@ -100,6 +100,9 @@ func (in *Installer) Preflight(ctx context.Context, s *settings.Settings, mode M
 		{Warn, "KVM async page faults", func() result { return in.checkAsyncPF(ctx, mode) }},
 		{Warn, "API certificate", func() result { return in.checkTLS() }},
 		{Hard, "SDN available", func() result { return in.checkSDN(ctx) }},
+		{Hard, "dnsmasq for SDN DHCP", func() result { return in.checkDnsmasq(ctx) }},
+		{Hard, "datacenter firewall on", func() result { return in.checkClusterFirewall(ctx) }},
+		{Hard, "DNS server for workers", func() result { return in.checkHostDNS(ctx, s) }},
 		{Hard, "worker subnet " + s.Network.WorkerSubnet + " free", func() result { return in.checkWorkerSubnet(ctx, s) }},
 		{Hard, "names free", func() result { return in.checkNames(ctx, mode) }},
 		{Hard, fmt.Sprintf("VMIDs %d-%d free", s.Proxmox.VMIDRange.Start, s.Proxmox.VMIDRange.End),
@@ -292,8 +295,8 @@ func (in *Installer) checkDownloadSpace() result {
 	return result{avail >= DownloadGiB, fmt.Sprintf("%d GiB free, %d GiB needed", avail, DownloadGiB)}
 }
 
-// systemVMsMiB is the memory of the gateway and controller VMs.
-const systemVMsMiB = 1024 + 2048
+// systemVMsMiB is the memory of the controller VM.
+const systemVMsMiB = 2048
 
 func (in *Installer) checkMemory(ctx context.Context, s *settings.Settings) result {
 	total, err := in.Sys.MemTotalMiB()
@@ -306,7 +309,7 @@ func (in *Installer) checkMemory(ctx context.Context, s *settings.Settings) resu
 	}
 	var used int64
 	for _, vm := range vms {
-		// Our own gateway and controller are counted with systemVMsMiB, and workers come and go.
+		// Our own controller is counted with systemVMsMiB, and workers come and go.
 		if !vm.Template && vm.Pool != SystemPool && vm.Pool != RunnerPool {
 			used += vm.MaxMemBytes
 		}
@@ -356,6 +359,38 @@ func (in *Installer) checkSDN(ctx context.Context) result {
 	return pass("")
 }
 
+// checkDnsmasq checks the setup Proxmox's SDN DHCP docs ask for: the dnsmasq package, with its own service off.
+func (in *Installer) checkDnsmasq(ctx context.Context) result {
+	if !in.Sys.PackageInstalled(ctx, "dnsmasq") {
+		return fail("install it for SDN DHCP, as Proxmox's SDN docs say: apt install dnsmasq, then " +
+			"systemctl disable --now dnsmasq")
+	}
+	if in.Sys.ServiceActive(ctx, "dnsmasq.service") {
+		return fail("its default service runs and would clash with SDN's: systemctl disable --now dnsmasq")
+	}
+	return pass("")
+}
+
+func (in *Installer) checkClusterFirewall(ctx context.Context) result {
+	on, err := in.PVE.ClusterFirewall(ctx)
+	if err != nil {
+		return fail("%v", err)
+	}
+	if !on {
+		return fail("workers' firewalls only apply with it on: turn it on under Datacenter > Firewall > Options, " +
+			"after checking that its rules let you in (it allows SSH and the web UI from the node's own network)")
+	}
+	return pass("")
+}
+
+func (in *Installer) checkHostDNS(ctx context.Context, s *settings.Settings) result {
+	a, err := in.hostDNS(ctx, s)
+	if err != nil {
+		return fail("%v", err)
+	}
+	return pass("%s, which workers may reach on port 53", a)
+}
+
 func (in *Installer) checkWorkerSubnet(ctx context.Context, s *settings.Settings) result {
 	subnet, err := netip.ParsePrefix(s.Network.WorkerSubnet)
 	if err != nil {
@@ -371,10 +406,13 @@ func (in *Installer) checkWorkerSubnet(ctx context.Context, s *settings.Settings
 	}
 	var taken []netip.Prefix
 	for _, a := range addrs {
+		// Our own VNet's address and route, from an earlier run, are ours.
+		if a.Dev == VNet {
+			continue
+		}
 		taken = append(taken, a.Prefix)
 	}
 	for _, r := range routes {
-		// Our own VNet, from an earlier run, carries no address, but a route for it would be ours.
 		if r.Dev == VNet {
 			continue
 		}
@@ -385,10 +423,8 @@ func (in *Installer) checkWorkerSubnet(ctx context.Context, s *settings.Settings
 			return fail("%s overlaps %s on this host; choose another with --worker-subnet", subnet, p)
 		}
 	}
-	for _, v := range []string{s.Network.GatewayIP, s.Network.ControllerIP} {
-		if p, err := netip.ParsePrefix(v); err == nil && subnet.Overlaps(p) {
-			return fail("%s overlaps the LAN %s", subnet, p)
-		}
+	if p, err := netip.ParsePrefix(s.Network.ControllerIP); err == nil && subnet.Overlaps(p) {
+		return fail("%s overlaps the LAN %s", subnet, p)
 	}
 	return pass("")
 }
@@ -416,6 +452,12 @@ func (in *Installer) checkNames(ctx context.Context, mode Mode) result {
 		return pass("ours")
 	}
 	var taken []string
+	if groups, _ := in.PVE.Groups(ctx); slices.Contains(groups, FirewallGroup) {
+		taken = append(taken, "firewall security group "+FirewallGroup)
+	}
+	if sets, _ := in.PVE.IPSets(ctx); slices.Contains(sets, BlockedIPSet) {
+		taken = append(taken, "firewall IP set "+BlockedIPSet)
+	}
 	if in.PVE.SDNExists(ctx, "zones/"+Zone) {
 		taken = append(taken, "SDN zone "+Zone)
 	}

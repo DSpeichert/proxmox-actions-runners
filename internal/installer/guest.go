@@ -139,8 +139,7 @@ func (in *Installer) agentIPv4(ctx context.Context, vmid int) (netip.Addr, bool)
 		return netip.Addr{}, false
 	}
 	for _, i := range ifs {
-		// The gateway's worker NIC is net1; only the LAN address matters.
-		if i.Name == "lo" || i.Name == "net1" {
+		if i.Name == "lo" {
 			continue
 		}
 		for _, a := range i.Addrs {

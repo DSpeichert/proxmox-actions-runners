@@ -168,6 +168,138 @@ func (p PVE) PendingSDN(ctx context.Context, ours ...string) ([]string, error) {
 	return pending, nil
 }
 
+// SDNObject returns an SDN object's config, such as "zones/parzone".
+func (p PVE) SDNObject(ctx context.Context, path string) (map[string]any, error) {
+	var obj map[string]any
+	err := p.json(ctx, &obj, "pvesh", "get", "/cluster/sdn/"+path)
+	return obj, err
+}
+
+// DHCPRange is one of a subnet's DHCP ranges.
+type DHCPRange struct {
+	Start string `json:"start-address"`
+	End   string `json:"end-address"`
+}
+
+// Subnet is a VNet's subnet.
+type Subnet struct {
+	// ID is Proxmox's name for it, such as parzone-10.251.0.0-22.
+	ID        string      `json:"subnet"`
+	CIDR      string      `json:"cidr"`
+	Gateway   string      `json:"gateway"`
+	SNAT      int         `json:"snat"`
+	DHCPRange []DHCPRange `json:"dhcp-range"`
+	DNSServer string      `json:"dhcp-dns-server"`
+}
+
+// Subnets returns a VNet's subnets.
+func (p PVE) Subnets(ctx context.Context, vnet string) ([]Subnet, error) {
+	var subnets []Subnet
+	err := p.json(ctx, &subnets, "pvesh", "get", "/cluster/sdn/vnets/"+vnet+"/subnets")
+	return subnets, err
+}
+
+// ClusterFirewall reports whether the datacenter firewall is on. Without it, no guest's firewall rules apply.
+func (p PVE) ClusterFirewall(ctx context.Context) (bool, error) {
+	var opts struct {
+		Enable int `json:"enable"`
+	}
+	err := p.json(ctx, &opts, "pvesh", "get", "/cluster/firewall/options")
+	return opts.Enable == 1, err
+}
+
+// DNS returns the node's DNS servers, in order.
+func (p PVE) DNS(ctx context.Context, node string) ([]string, error) {
+	var dns map[string]any
+	if err := p.json(ctx, &dns, "pvesh", "get", "/nodes/"+node+"/dns"); err != nil {
+		return nil, err
+	}
+	var servers []string
+	for _, k := range []string{"dns1", "dns2", "dns3"} {
+		if s, _ := dns[k].(string); s != "" {
+			servers = append(servers, s)
+		}
+	}
+	return servers, nil
+}
+
+// Rule is a firewall rule, in a security group or on the host.
+type Rule struct {
+	Pos     int    `json:"pos"`
+	Type    string `json:"type"`
+	Action  string `json:"action"`
+	Proto   string `json:"proto,omitempty"`
+	Dport   string `json:"dport,omitempty"`
+	Dest    string `json:"dest,omitempty"`
+	Iface   string `json:"iface,omitempty"`
+	Comment string `json:"comment,omitempty"`
+	Enable  int    `json:"enable"`
+}
+
+// Groups returns the datacenter firewall's security groups.
+func (p PVE) Groups(ctx context.Context) ([]string, error) {
+	var groups []struct {
+		Group string `json:"group"`
+	}
+	if err := p.json(ctx, &groups, "pvesh", "get", "/cluster/firewall/groups"); err != nil {
+		return nil, err
+	}
+	names := make([]string, len(groups))
+	for i, g := range groups {
+		names[i] = g.Group
+	}
+	return names, nil
+}
+
+// GroupRules returns a security group's rules, in order.
+func (p PVE) GroupRules(ctx context.Context, group string) ([]Rule, error) {
+	return p.rules(ctx, "/cluster/firewall/groups/"+group)
+}
+
+// HostRules returns the node's host firewall rules, in order.
+func (p PVE) HostRules(ctx context.Context, node string) ([]Rule, error) {
+	return p.rules(ctx, "/nodes/"+node+"/firewall/rules")
+}
+
+func (p PVE) rules(ctx context.Context, path string) ([]Rule, error) {
+	var rules []Rule
+	if err := p.json(ctx, &rules, "pvesh", "get", path); err != nil {
+		return nil, err
+	}
+	slices.SortFunc(rules, func(a, b Rule) int { return a.Pos - b.Pos })
+	return rules, nil
+}
+
+// IPSets returns the datacenter firewall's IP sets.
+func (p PVE) IPSets(ctx context.Context) ([]string, error) {
+	var sets []struct {
+		Name string `json:"name"`
+	}
+	if err := p.json(ctx, &sets, "pvesh", "get", "/cluster/firewall/ipset"); err != nil {
+		return nil, err
+	}
+	names := make([]string, len(sets))
+	for i, s := range sets {
+		names[i] = s.Name
+	}
+	return names, nil
+}
+
+// IPSet returns the CIDRs in a datacenter IP set.
+func (p PVE) IPSet(ctx context.Context, name string) ([]string, error) {
+	var entries []struct {
+		CIDR string `json:"cidr"`
+	}
+	if err := p.json(ctx, &entries, "pvesh", "get", "/cluster/firewall/ipset/"+name); err != nil {
+		return nil, err
+	}
+	cidrs := make([]string, len(entries))
+	for i, e := range entries {
+		cidrs[i] = e.CIDR
+	}
+	return cidrs, nil
+}
+
 // StorageStatus is a storage's status on the node.
 type StorageStatus struct {
 	Type    string `json:"type"`

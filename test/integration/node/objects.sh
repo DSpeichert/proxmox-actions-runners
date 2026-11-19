@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Runs on the test node as root, sent by run.sh. Prints the objects a real install owns on the node, one per line and
-# sorted, so run.sh can compare before and after an install.sh command: the pools, role, user, SDN zone and VNet, and
-# every VM in the install's pools. The names are install.sh's, which the suite's own objects never use.
+# sorted, so run.sh can compare before and after an install.sh command: the pools, role, user, SDN zone, VNet, and
+# subnet, the worker firewall's security group, IP set, and host rule, and every VM in the install's pools. The names are install.sh's, which the suite's own objects never use.
 #
 # shellcheck disable=SC2016 # The Perl code is single-quoted on purpose.
 set -euo pipefail
@@ -23,6 +23,13 @@ main() {
 		list pveum user list -- 'print "user $_->{userid}\n" for grep { $_->{userid} eq "par\@pve" } @$d'
 		list pvesh get /cluster/sdn/zones -- 'print "zone $_->{zone}\n" for grep { $_->{zone} eq "parzone" } @$d'
 		list pvesh get /cluster/sdn/vnets -- 'print "vnet $_->{vnet}\n" for grep { $_->{vnet} eq "parnet" } @$d'
+		if pvesh get /cluster/sdn/vnets/parnet >/dev/null 2>&1; then
+			list pvesh get /cluster/sdn/vnets/parnet/subnets -- 'print "subnet $_->{subnet}\n" for @$d'
+		fi
+		list pvesh get /cluster/firewall/groups -- 'print "group $_->{group}\n" for grep { $_->{group} eq "par-worker" } @$d'
+		list pvesh get /cluster/firewall/ipset -- 'print "ipset $_->{name}\n" for grep { $_->{name} eq "par-blocked" } @$d'
+		list pvesh get "/nodes/$(hostname)/firewall/rules" -- '
+			print "host rule $_->{iface} $_->{proto} $_->{dport}\n" for grep { ($_->{comment} // "") eq "proxmox-actions-runners" } @$d'
 		list pvesh get /cluster/resources --type vm -- '
 			print "vm $_->{vmid} $_->{name}\n" for grep { ($_->{pool} // "") =~ /^par-(system|runners)$/ } @$d'
 	} | sort
