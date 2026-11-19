@@ -132,17 +132,88 @@ func (r VMIDRange) Workers() VMIDRange {
 	return VMIDRange{Start: r.Start, End: r.End - ReservedVMIDs}
 }
 
-// GitHub says which organization or repository the scale sets belong to and how to authenticate.
+// GitHub says which organizations and repositories the scale sets serve, and the GitHub Apps that authenticate for
+// them. Every scale set is registered with every target.
 type GitHub struct {
-	// ConfigURL is https://github.com/<org> or https://github.com/<owner>/<repo>.
+	// Apps are the GitHub Apps whose private keys the controller holds. A private App can only be installed on the
+	// account that owns it, so there is one per organization or personal account.
+	Apps []GitHubApp `yaml:"apps,omitempty"`
+	// Targets are the organizations and repositories the runners serve.
+	Targets []Target `yaml:"targets,omitempty"`
+
+	// ConfigURL and App are the format before several targets: one target and its App. Parse turns them into one
+	// App and one target, so a controller reads a config an older release rendered. Marshal never writes them.
 	ConfigURL string    `yaml:"configUrl,omitempty"`
-	App       GitHubApp `yaml:"app,omitempty"`
+	App       LegacyApp `yaml:"app,omitempty"`
 }
 
-// IsRepository reports whether ConfigURL names a repository rather than an organization.
-func (g GitHub) IsRepository() bool {
-	_, repo, err := ParseGitHubURL(g.ConfigURL)
+// GitHubApp is a GitHub App the controller authenticates as.
+type GitHubApp struct {
+	ClientID string `yaml:"clientId"`
+	// PrivateKeyFile is the App's private key (PEM), readable only by the controller.
+	PrivateKeyFile string `yaml:"privateKeyFile"`
+}
+
+// Target is an organization or repository the runners serve, and the App installation that reaches it.
+type Target struct {
+	// ConfigURL is https://github.com/<org> or https://github.com/<owner>/<repo>.
+	ConfigURL string `yaml:"configUrl"`
+	// ClientID names the App in Apps, and InstallationID is where it is installed. Both are empty until the installer
+	// learns them.
+	ClientID       string `yaml:"clientId,omitempty"`
+	InstallationID int64  `yaml:"installationId,omitempty"`
+}
+
+// IsRepository reports whether the target is a repository rather than an organization.
+func (t Target) IsRepository() bool {
+	_, repo, err := ParseGitHubURL(t.ConfigURL)
 	return err == nil && repo != ""
+}
+
+// Key returns the target's key (TargetKey).
+func (t Target) Key() string { return TargetKey(t.ConfigURL) }
+
+// LegacyApp is the App block of the format before several targets.
+type LegacyApp struct {
+	ClientID       string `yaml:"clientId,omitempty"`
+	InstallationID int64  `yaml:"installationId,omitempty"`
+	PrivateKeyFile string `yaml:"privateKeyFile,omitempty"`
+}
+
+func (g GitHub) legacy() bool { return g.ConfigURL != "" || g.App != LegacyApp{} }
+
+// normalize turns the format before several targets into one App and one target. A config that mixes the two
+// formats is left as it is, for validation to report.
+func (g *GitHub) normalize() {
+	if !g.legacy() || len(g.Apps) > 0 || len(g.Targets) > 0 {
+		return
+	}
+	if g.App.ClientID != "" || g.App.PrivateKeyFile != "" {
+		g.Apps = []GitHubApp{{ClientID: g.App.ClientID, PrivateKeyFile: g.App.PrivateKeyFile}}
+	}
+	if g.ConfigURL != "" {
+		g.Targets = []Target{{ConfigURL: g.ConfigURL, ClientID: g.App.ClientID, InstallationID: g.App.InstallationID}}
+	}
+	g.ConfigURL, g.App = "", LegacyApp{}
+}
+
+// AppFor returns the App with the client ID, if the config has it.
+func (g GitHub) AppFor(clientID string) (GitHubApp, bool) {
+	for _, a := range g.Apps {
+		if a.ClientID == clientID {
+			return a, true
+		}
+	}
+	return GitHubApp{}, false
+}
+
+// RunnerGroupFor returns the runner group the scale set uses for a target. GitHub has runner groups only for
+// organizations, so a repository's scale sets use the default group whatever the config says.
+func (s ScaleSet) RunnerGroupFor(t Target) string {
+	if t.IsRepository() {
+		return DefaultRunnerGroup
+	}
+	return s.RunnerGroup
 }
 
 // maxTargetKey is the longest TargetKey, so the worker tag that carries it stays well within what Proxmox accepts.
@@ -183,15 +254,6 @@ func ParseGitHubURL(raw string) (owner, repo string, err error) {
 		}
 	}
 	return "", "", fmt.Errorf("%q must be https://github.com/<org> or https://github.com/<owner>/<repo>", raw)
-}
-
-// GitHubApp holds the GitHub App credentials. The installer writes them once it has created the App; until then
-// they are empty (see RequireGitHubApp).
-type GitHubApp struct {
-	ClientID       string `yaml:"clientId,omitempty"`
-	InstallationID int64  `yaml:"installationId,omitempty"`
-	// PrivateKeyFile is the absolute path of the App's PEM private key.
-	PrivateKeyFile string `yaml:"privateKeyFile,omitempty"`
 }
 
 // Worker is a worker VM's hardware. A zero field means "not set" and is filled from the level above.

@@ -2,6 +2,7 @@ package config
 
 import (
 	"errors"
+	"reflect"
 	"regexp"
 	"strconv"
 	"strings"
@@ -25,12 +26,15 @@ func validDoc() map[string]any {
 			"vmidRange":       map[string]any{"start": 10000, "end": 10999},
 		},
 		"github": map[string]any{
-			"configUrl": "https://github.com/my-org",
-			"app": map[string]any{
+			"apps": []any{map[string]any{
+				"clientId":       "Iv23liEXAMPLE0000000",
+				"privateKeyFile": "/etc/proxmox-actions-runners/github-app-Iv23liEXAMPLE0000000.pem",
+			}},
+			"targets": []any{map[string]any{
+				"configUrl":      "https://github.com/my-org",
 				"clientId":       "Iv23liEXAMPLE0000000",
 				"installationId": 7890123,
-				"privateKeyFile": "/etc/proxmox-actions-runners/github-app.pem",
-			},
+			}},
 		},
 		"scaleSets": []any{
 			map[string]any{"name": "proxmox-ubuntu-26.04", "maxRunners": 3},
@@ -134,7 +138,7 @@ func TestParseDefaults(t *testing.T) {
 	if s.RunnerGroup != DefaultRunnerGroup {
 		t.Errorf("runnerGroup = %q, want %q", s.RunnerGroup, DefaultRunnerGroup)
 	}
-	if c.GitHub.IsRepository() {
+	if c.GitHub.Targets[0].IsRepository() {
 		t.Error("an organization URL is reported as a repository")
 	}
 	if c.Proxmox.Zone != DefaultZone {
@@ -192,9 +196,11 @@ func TestParseNormalizes(t *testing.T) {
 		},
 		{
 			name:  "trailing slash is removed from the GitHub URL",
-			path:  "github.configUrl",
+			path:  "github.targets.0.configUrl",
 			value: "https://github.com/my-org/my-repo/",
-			check: func(c *Config) (any, any) { return c.GitHub.ConfigURL, "https://github.com/my-org/my-repo" },
+			check: func(c *Config) (any, any) {
+				return c.GitHub.Targets[0].ConfigURL, "https://github.com/my-org/my-repo"
+			},
 		},
 		{
 			name:  "linked clones can be turned off",
@@ -251,7 +257,7 @@ func TestParseValid(t *testing.T) {
 		path  string
 		value any
 	}{
-		{"repository scope", "github.configUrl", "https://github.com/my-org/my.repo_1"},
+		{"repository scope", "github.targets.0.configUrl", "https://github.com/my-org/my.repo_1"},
 		{"no TLS fingerprint", "proxmox.tlsFingerprint", nil},
 		{"trusted CA", "proxmox.caCertFile", "/etc/proxmox-actions-runners/pve-ca.pem"},
 		{"server name for the certificate", "proxmox.tlsServerName", "pve1.example.com"},
@@ -295,11 +301,23 @@ func TestParseInvalid(t *testing.T) {
 		{"negative maxWorkers", "maxWorkers", -1, "maxWorkers: must not be negative"},
 		{"maxRunners above maxWorkers", "maxWorkers", 2, "scaleSets[0].maxRunners: 3 is more than maxWorkers 2"},
 
-		{"GitHub Enterprise Server", "github.configUrl", "https://ghes.example.com/my-org", "https://github.com/<org>"},
-		{"too deep GitHub URL", "github.configUrl", "https://github.com/a/b/c", "https://github.com/<org>"},
-		{"GitHub URL without owner", "github.configUrl", "https://github.com/", "https://github.com/<org>"},
-		{"negative installation ID", "github.app.installationId", -1, "github.app.installationId: must not be negative"},
-		{"relative private key", "github.app.privateKeyFile", "key.pem", "must be an absolute path"},
+		{"GitHub Enterprise Server", "github.targets.0.configUrl", "https://ghes.example.com/my-org",
+			"https://github.com/<org>"},
+		{"too deep GitHub URL", "github.targets.0.configUrl", "https://github.com/a/b/c", "https://github.com/<org>"},
+		{"GitHub URL without owner", "github.targets.0.configUrl", "https://github.com/", "https://github.com/<org>"},
+		{"target without URL", "github.targets.0.configUrl", nil, "github.targets[0].configUrl: is required"},
+		{"negative installation ID", "github.targets.0.installationId", -1,
+			"github.targets[0].installationId: must not be negative"},
+		{"target of an unknown App", "github.targets.0.clientId", "Iv23liOTHER", `"Iv23liOTHER" isn't one of github.apps`},
+		{"the same target twice", "github.targets", []any{
+			map[string]any{"configUrl": "https://github.com/my-org"},
+			map[string]any{"configUrl": "https://github.com/My-Org/"}}, "is already github.targets[0]"},
+		{"the same App twice", "github.apps", []any{
+			map[string]any{"clientId": "Iv23liA", "privateKeyFile": "/a.pem"},
+			map[string]any{"clientId": "Iv23liA", "privateKeyFile": "/b.pem"}}, "already used by github.apps[0]"},
+		{"relative private key", "github.apps.0.privateKeyFile", "key.pem", "must be an absolute path"},
+		{"App without key", "github.apps.0.privateKeyFile", nil, "github.apps[0].privateKeyFile: is required"},
+		{"both formats", "github.configUrl", "https://github.com/my-org", "use apps and targets instead, not both"},
 
 		{"controller memory in GiB by mistake", "worker.memoryMiB", 8, "worker.memoryMiB"},
 		{"negative cores", "worker.cores", -1, "worker.cores"},
@@ -351,36 +369,26 @@ func TestEffectiveMaxWorkers(t *testing.T) {
 	}
 }
 
-func TestRequireGitHubApp(t *testing.T) {
+func TestRequireGitHub(t *testing.T) {
 	c, err := parseDoc(t, validDoc())
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
 	}
-	if err := c.RequireGitHubApp(); err != nil {
-		t.Errorf("RequireGitHubApp with an App = %v", err)
+	if err := c.RequireGitHub(); err != nil {
+		t.Errorf("RequireGitHub with an App = %v", err)
 	}
 
-	// Before the installer creates the App, the config has no App at all.
+	// Before the installer creates the App, the target has none.
 	doc := validDoc()
-	set(t, doc, "github.app", nil)
+	set(t, doc, "github.apps", nil)
+	set(t, doc, "github.targets.0", map[string]any{"configUrl": "https://github.com/my-org"})
 	c, err = parseDoc(t, doc)
 	if err != nil {
 		t.Fatalf("Parse without an App: %v", err)
 	}
-	want := "the GitHub App isn't set up yet: missing github.app.clientId, github.app.installationId, " +
-		"github.app.privateKeyFile"
-	if err := c.RequireGitHubApp(); err == nil || err.Error() != want {
-		t.Errorf("RequireGitHubApp without an App = %v, want %q", err, want)
-	}
-
-	doc = validDoc()
-	set(t, doc, "github.app.installationId", nil)
-	c, err = parseDoc(t, doc)
-	if err != nil {
-		t.Fatalf("Parse without an installation: %v", err)
-	}
-	if err := c.RequireGitHubApp(); err == nil || !strings.HasSuffix(err.Error(), "missing github.app.installationId") {
-		t.Errorf("RequireGitHubApp without an installation = %v", err)
+	want := "the GitHub App isn't set up yet: missing github.targets[0].clientId, github.targets[0].installationId"
+	if err := c.RequireGitHub(); err == nil || err.Error() != want {
+		t.Errorf("RequireGitHub without an App = %v, want %q", err, want)
 	}
 
 	// The installer learns the organization or repository from the App's installation, so at first the config has
@@ -391,29 +399,57 @@ func TestRequireGitHubApp(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Parse without a GitHub section: %v", err)
 	}
-	want = "the GitHub App isn't set up yet: missing github.configUrl, github.app.clientId, " +
-		"github.app.installationId, github.app.privateKeyFile"
-	if err := c.RequireGitHubApp(); err == nil || err.Error() != want {
-		t.Errorf("RequireGitHubApp without a GitHub section = %v, want %q", err, want)
+	if err := c.RequireGitHub(); err == nil || !strings.Contains(err.Error(), "github.targets is empty") {
+		t.Errorf("RequireGitHub without a GitHub section = %v", err)
 	}
 }
 
-func TestParseRepositoryRunnerGroup(t *testing.T) {
+// A config an older release rendered has one target and its App, and still parses, as one App and one target.
+func TestParseLegacyGitHub(t *testing.T) {
 	doc := validDoc()
-	set(t, doc, "github.configUrl", "https://github.com/my-org/my-repo")
+	set(t, doc, "github", map[string]any{
+		"configUrl": "https://github.com/my-org/",
+		"app": map[string]any{"clientId": "Iv23liEXAMPLE", "installationId": 7,
+			"privateKeyFile": "/etc/proxmox-actions-runners/github-app.pem"},
+	})
 	c, err := parseDoc(t, doc)
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
 	}
-	if !c.GitHub.IsRepository() {
-		t.Error("a repository URL isn't reported as a repository")
+	want := GitHub{
+		Apps:    []GitHubApp{{ClientID: "Iv23liEXAMPLE", PrivateKeyFile: "/etc/proxmox-actions-runners/github-app.pem"}},
+		Targets: []Target{{ConfigURL: "https://github.com/my-org", ClientID: "Iv23liEXAMPLE", InstallationID: 7}},
+	}
+	if !reflect.DeepEqual(c.GitHub, want) {
+		t.Errorf("github = %+v, want %+v", c.GitHub, want)
+	}
+	if err := c.RequireGitHub(); err != nil {
+		t.Errorf("RequireGitHub = %v", err)
+	}
+	data, err := Marshal(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "app:") || !strings.Contains(string(data), "targets:") {
+		t.Errorf("Marshal wrote the old format:\n%s", data)
 	}
 
-	set(t, doc, "scaleSets.0.runnerGroup", "builds")
-	_, err = parseDoc(t, doc)
-	want := `scaleSets[0].runnerGroup: repository scale sets must use the "default" runner group`
-	if err == nil || !strings.Contains(err.Error(), want) {
-		t.Fatalf("Parse error = %v, want it to mention %q", err, want)
+	// Before its App, an older release's config names only the target.
+	set(t, doc, "github", map[string]any{"configUrl": "https://github.com/my-org"})
+	if c, err = parseDoc(t, doc); err != nil || len(c.GitHub.Apps) != 0 ||
+		!reflect.DeepEqual(c.GitHub.Targets, []Target{{ConfigURL: "https://github.com/my-org"}}) {
+		t.Errorf("Parse of a target without an App = %+v, %v", c.GitHub, err)
+	}
+}
+
+func TestRunnerGroupFor(t *testing.T) {
+	s := ScaleSet{RunnerGroup: "builds"}
+	if g := s.RunnerGroupFor(Target{ConfigURL: "https://github.com/my-org"}); g != "builds" {
+		t.Errorf("organization: runner group %q, want builds", g)
+	}
+	// GitHub has runner groups only for organizations.
+	if g := s.RunnerGroupFor(Target{ConfigURL: "https://github.com/octocat/hello"}); g != DefaultRunnerGroup {
+		t.Errorf("repository: runner group %q, want %q", g, DefaultRunnerGroup)
 	}
 }
 

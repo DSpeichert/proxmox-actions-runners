@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"net/url"
 	"path/filepath"
@@ -112,40 +113,63 @@ func (p Proxmox) validate(v *validator) {
 }
 
 func (g GitHub) validate(v *validator) {
-	// The target and the App are optional here: the installer checks Proxmox before the user creates the App, and it
-	// learns the organization or repository from where the App is installed. RequireGitHubApp checks that they are
-	// complete.
-	if g.ConfigURL != "" {
-		if _, _, err := ParseGitHubURL(g.ConfigURL); err != nil {
-			v.addf("github.configUrl", "%v", err)
+	// Targets and Apps are optional here, and a target may lack its App: the installer checks Proxmox before the user
+	// creates an App, and it learns the organization or repository from where the App is installed. RequireGitHub
+	// checks that they are complete.
+	if g.legacy() {
+		v.addf("github", "configUrl and app are the format before several targets; use apps and targets instead, "+
+			"not both")
+	}
+	apps := map[string]int{}
+	for i, a := range g.Apps {
+		prefix := fmt.Sprintf("github.apps[%d]", i)
+		if v.required(prefix+".clientId", a.ClientID) {
+			if j, ok := apps[a.ClientID]; ok {
+				v.addf(prefix+".clientId", "%q is already used by github.apps[%d]", a.ClientID, j)
+			}
+			apps[a.ClientID] = i
+		}
+		if v.required(prefix+".privateKeyFile", a.PrivateKeyFile) {
+			v.absPath(prefix+".privateKeyFile", a.PrivateKeyFile)
 		}
 	}
-	if g.App.InstallationID < 0 {
-		v.addf("github.app.installationId", "must not be negative")
-	}
-	if g.App.PrivateKeyFile != "" {
-		v.absPath("github.app.privateKeyFile", g.App.PrivateKeyFile)
+	targets := map[string]int{}
+	for i, t := range g.Targets {
+		prefix := fmt.Sprintf("github.targets[%d]", i)
+		if v.required(prefix+".configUrl", t.ConfigURL) {
+			if _, _, err := ParseGitHubURL(t.ConfigURL); err != nil {
+				v.addf(prefix+".configUrl", "%v", err)
+			} else if j, ok := targets[t.Key()]; ok {
+				v.addf(prefix+".configUrl", "%s is already github.targets[%d]", t.ConfigURL, j)
+			} else {
+				targets[t.Key()] = i
+			}
+		}
+		if _, ok := apps[t.ClientID]; t.ClientID != "" && !ok {
+			v.addf(prefix+".clientId", "%q isn't one of github.apps", t.ClientID)
+		}
+		if t.InstallationID < 0 {
+			v.addf(prefix+".installationId", "must not be negative")
+		}
 	}
 }
 
-// RequireGitHubApp returns an error unless the config names the GitHub target and App: the organization or repository
-// URL, and the App's Client ID, installation ID, and private key file. Parse accepts a config without them, because
-// the installer writes the config and checks Proxmox before the App exists; only the commands that talk to GitHub as
-// the App need them.
-func (c *Config) RequireGitHubApp() error {
-	a := c.GitHub.App
+// RequireGitHub returns an error unless the config names at least one GitHub target, and every target its App and
+// installation and the App its private key file. Parse accepts a config without them, because the installer writes
+// the config and checks Proxmox before an App exists; only the commands that talk to GitHub as an App need them.
+func (c *Config) RequireGitHub() error {
+	if len(c.GitHub.Targets) == 0 {
+		return errors.New("no GitHub target is set up yet: github.targets is empty")
+	}
 	var missing []string
-	if c.GitHub.ConfigURL == "" {
-		missing = append(missing, "github.configUrl")
-	}
-	if a.ClientID == "" {
-		missing = append(missing, "github.app.clientId")
-	}
-	if a.InstallationID == 0 {
-		missing = append(missing, "github.app.installationId")
-	}
-	if a.PrivateKeyFile == "" {
-		missing = append(missing, "github.app.privateKeyFile")
+	for i, t := range c.GitHub.Targets {
+		prefix := fmt.Sprintf("github.targets[%d]", i)
+		if t.ClientID == "" {
+			missing = append(missing, prefix+".clientId")
+		}
+		if t.InstallationID == 0 {
+			missing = append(missing, prefix+".installationId")
+		}
 	}
 	if len(missing) > 0 {
 		return fmt.Errorf("the GitHub App isn't set up yet: missing %s", strings.Join(missing, ", "))
@@ -190,10 +214,6 @@ func (c *Config) validateScaleSets(v *validator) {
 			} else {
 				labels[key] = prefix
 			}
-		}
-
-		if c.GitHub.IsRepository() && s.RunnerGroup != DefaultRunnerGroup {
-			v.addf(prefix+".runnerGroup", "repository scale sets must use the %q runner group", DefaultRunnerGroup)
 		}
 
 		if s.MinRunners < 0 {

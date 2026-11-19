@@ -39,7 +39,6 @@ func ControllerConfig(s *Settings, env Env) (*config.Config, []byte, error) {
 			VMIDRange:       s.Proxmox.VMIDRange,
 			LinkedClone:     &linked,
 		},
-		GitHub: config.GitHub{ConfigURL: s.GitHub.ConfigURL},
 		Worker: s.Worker,
 		// runners.max is the node's limit, whatever the scale sets each ask GitHub for.
 		MaxWorkers: s.ScaleSet.MaxRunners,
@@ -63,11 +62,11 @@ func ControllerConfig(s *Settings, env Env) (*config.Config, []byte, error) {
 	}
 	// The App comes once its key is in the controller, which is when the installer learns its Client ID.
 	if s.GitHub.App.ClientID != "" {
-		c.GitHub.App = config.GitHubApp{
-			ClientID:       s.GitHub.App.ClientID,
-			InstallationID: s.GitHub.App.InstallationID,
-			PrivateKeyFile: config.AppKeyFile,
-		}
+		c.GitHub.Apps = []config.GitHubApp{{ClientID: s.GitHub.App.ClientID, PrivateKeyFile: config.AppKeyFile}}
+	}
+	if s.GitHub.ConfigURL != "" {
+		c.GitHub.Targets = []config.Target{{ConfigURL: s.GitHub.ConfigURL, ClientID: s.GitHub.App.ClientID,
+			InstallationID: s.GitHub.App.InstallationID}}
 	}
 
 	body, err := config.Marshal(c)

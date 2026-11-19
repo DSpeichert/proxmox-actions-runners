@@ -104,6 +104,10 @@ func (c *Config) applyDefaults() {
 		c.Proxmox.LinkedClone = &linked
 	}
 	c.GitHub.ConfigURL = strings.TrimSuffix(c.GitHub.ConfigURL, "/")
+	c.GitHub.normalize()
+	for i := range c.GitHub.Targets {
+		c.GitHub.Targets[i].ConfigURL = strings.TrimSuffix(c.GitHub.Targets[i].ConfigURL, "/")
+	}
 
 	c.Worker = c.Worker.withDefaults(DefaultWorker())
 	for i := range c.ScaleSets {

@@ -775,7 +775,7 @@ func TestMaxWorkersGivesTheNextWorkerToTheLongestWaiting(t *testing.T) {
 
 func TestWorkersCarryTheirTarget(t *testing.T) {
 	cfg := testConfig()
-	cfg.GitHub.ConfigURL = "https://github.com/My-Org"
+	cfg.GitHub.Targets = []config.Target{{ConfigURL: "https://github.com/My-Org"}}
 	h := newHarness(t, cfg)
 	h.pve.addTemplate(testTemplateID, 1)
 	// A worker from before several targets has no target tag and belongs to the first target: it counts toward the
@@ -804,5 +804,82 @@ func TestWorkersCarryTheirTarget(t *testing.T) {
 	}
 	if d := vm.config["description"]; !strings.Contains(d, "of https://github.com/My-Org") {
 		t.Errorf("description = %q, want the target", d)
+	}
+}
+
+// twoTargets returns a harness whose config has an organization and a repository, each served by its own fake.
+func twoTargets(t *testing.T) (*harness, *fakeGitHub, *fakeGitHub) {
+	cfg := testConfig()
+	cfg.GitHub.Targets = []config.Target{{ConfigURL: "https://github.com/my-org"},
+		{ConfigURL: "https://github.com/octocat/hello"}}
+	org, repo := newFakeGitHub(), newFakeGitHub()
+	h := &harness{t: t, pve: newFakeProxmox(), gh: org, clock: &clock{now: testStart}, cfg: cfg}
+	c, err := New(Options{Config: cfg, Proxmox: h.pve, Releases: org, Owner: "test", Now: h.clock.Now,
+		GitHub: map[string]GitHub{"my-org": org, "octocat.hello": repo}, RetryBackoff: time.Minute})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	c.agentPoll = time.Millisecond
+	for _, s := range c.scaleSets {
+		s.setScaleSetID(testScaleSetID)
+	}
+	h.c = c
+	return h, org, repo
+}
+
+func TestEachTargetIsServedByItsOwnClient(t *testing.T) {
+	h, org, repo := twoTargets(t)
+	h.pve.addTemplate(testTemplateID, 1)
+	orgKey := ssKey{target: "my-org", name: testScaleSet}
+	repoKey := ssKey{target: "octocat.hello", name: testScaleSet}
+	if len(h.c.scaleSets) != 2 {
+		t.Fatalf("scale sets = %v, want one per target", h.c.scaleSets)
+	}
+	if _, err := h.c.scaleSets[orgKey].DesiredRunners(context.Background(), 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.c.scaleSets[repoKey].DesiredRunners(context.Background(), 2); err != nil {
+		t.Fatal(err)
+	}
+	h.pass()
+	if len(org.runners) != 1 || len(repo.runners) != 2 {
+		t.Fatalf("runners = %d with the organization's App and %d with the repository's, want 1 and 2",
+			len(org.runners), len(repo.runners))
+	}
+	got := h.workersOf()
+	if got[testScaleSet] != 3 {
+		t.Errorf("workers = %v", got)
+	}
+
+	// Scaling the repository down unregisters its runners with its own App, never the organization's.
+	if _, err := h.c.scaleSets[repoKey].DesiredRunners(context.Background(), 0); err != nil {
+		t.Fatal(err)
+	}
+	h.pass()
+	if len(repo.removed) != 2 || len(org.removed) != 0 {
+		t.Errorf("removed = %v with the repository's App and %v with the organization's", repo.removed, org.removed)
+	}
+}
+
+func TestWorkerOfARemovedTarget(t *testing.T) {
+	h := newHarness(t, testConfig())
+	h.pve.add(proxmox.VM{VMID: 10000, Pool: testPool, Status: "running",
+		Tags: workerTags(ssKey{target: "gone-org", name: testScaleSet}, testStart, testTemplateID, true)})
+	h.pve.add(proxmox.VM{VMID: 10001, Pool: testPool, Status: "running",
+		Tags: workerTags(ssKey{target: "gone-org", name: testScaleSet}, testStart, testTemplateID, false)})
+
+	// The controller can't act as the target's App, so it can't ask about the runners. A half-created worker goes at
+	// once; a ready one is given until the runner check would start, since removing a target unregisters its runners.
+	h.pass()
+	if got := h.pve.ids(); !slices.Equal(got, []int{10000}) {
+		t.Errorf("VMs left = %v, want the ready worker kept for now", got)
+	}
+	h.clock.Advance(10 * time.Minute)
+	h.pass()
+	if got := h.pve.ids(); len(got) != 0 {
+		t.Errorf("VMs left = %v, want the worker of the removed target destroyed", got)
+	}
+	if len(h.gh.removed) != 0 {
+		t.Errorf("asked GitHub to remove %v with another target's App", h.gh.removed)
 	}
 }

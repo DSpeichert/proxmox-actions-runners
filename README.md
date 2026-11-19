@@ -168,11 +168,13 @@ proxmox:
   linkedClone: true                # the template is found by its tags, not a fixed VMID
 
 github:
-  configUrl: https://github.com/my-org
-  app:                             # left out until the installer has created the App
-    clientId: Iv23liEXAMPLE0000000
-    installationId: 7890123
-    privateKeyFile: /etc/proxmox-actions-runners/github-app.pem
+  apps:                            # one per organization or account; left out until the installer has created them
+    - clientId: Iv23liEXAMPLE0000000
+      privateKeyFile: /etc/proxmox-actions-runners/github-app.pem
+  targets:                         # every scale set is registered with every target
+    - configUrl: https://github.com/my-org
+      clientId: Iv23liEXAMPLE0000000
+      installationId: 7890123
 
 worker:            # controller-wide; omit to use the GitHub-matching defaults (2 cores, 8 GiB, 14 GiB free)
   cores: 2

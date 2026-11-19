@@ -257,7 +257,8 @@ func (h *live) envInt(name string) int {
 
 func (h *live) controller() *Controller {
 	h.t.Helper()
-	c, err := New(Options{Config: h.cfg, Proxmox: h.pve, GitHub: h.gh, Owner: "integration-test"})
+	c, err := New(Options{Config: h.cfg, Proxmox: h.pve, GitHub: clientsFor(h.cfg, h.gh), Releases: h.gh,
+		Owner: "integration-test"})
 	if err != nil {
 		h.t.Fatalf("New: %v", err)
 	}

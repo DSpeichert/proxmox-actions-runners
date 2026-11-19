@@ -230,10 +230,12 @@ The controller image, `parcon` on the host, and the controller agree on this lay
   the API serves the node's own certificate, `pve-ca.pem`.
 - **Commands:** `parcon` on the host runs every `parcon` command in the VM as `parcon`, with
   `runuser -u parcon -- parcon …` through `qm guest exec`, so files that `parcon` writes get the right owner.
-- **Before the App exists:** `github.app` (`clientId`, `installationId`, `privateKeyFile`) may be left out of
+- **Before the App exists:** `github.apps`, and a target's `clientId` and `installationId`, may be left out of
   `config.yaml`, because step 11 checks Proxmox before step 12 creates the App. `parcon check config`,
-  `parcon check proxmox`, and `parcon check template` work without it. `parcon run` and `parcon check github` fail
-  with "the GitHub App isn't set up yet" until all three fields are set.
+  `parcon check proxmox`, and `parcon check template` work without them. `parcon run` and `parcon check github` fail
+  with "the GitHub App isn't set up yet" until every target has its App and installation. The controller still
+  reads the format before several targets (`github.configUrl` and `github.app`), as one App and one target, so a
+  new `parcon` works with the config an older release rendered.
 - **Who writes the config:** only `parcon` on the host, which renders it from the host settings (see *Host
   settings*) and rewrites it whenever they change. It writes `config.yaml.new`, has the VM's own
   `parcon check config -config config.yaml.new` accept it, and only then moves it into place, so a config that
@@ -619,8 +621,9 @@ one with an unfinished install (the `par-system` pool exists), it continues it.
     release tags can't show, such as a template imported by a run that was killed partway. The safety checks stay: the release's signature, the plan and its question, the lock, and the
     controller's check of its new config. The controller VM itself must be running, since an update never replaces
     it; a broken one needs `parcon uninstall` and `parcon install`.
-- **Uninstall** (`parcon uninstall`) first stops the controller and deletes the scale set in GitHub
-  (`parcon github scaleset delete` in the controller VM, which also unregisters its runners). It then destroys every
+- **Uninstall** (`parcon uninstall`) first stops the controller and deletes the scale sets in GitHub, for every
+  target (`parcon github scaleset delete` in the controller VM, which also unregisters their runners; with
+  `-target URL` it deletes one target's, and a target GitHub refuses doesn't stop the others). It then destroys every
   VM tagged `par-managed` in the two pools (an older release's gateway VM too), clones before templates, removes the
   ACLs, token, user, role, and pools, the host rule, security group, and IP set, and the subnet, `parnet` VNet, and
   `parzone` zone, and applies the SDN config. The datacenter firewall stays on, and `dnsmasq` stays installed: both

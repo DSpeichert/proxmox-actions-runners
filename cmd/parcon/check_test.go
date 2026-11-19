@@ -260,8 +260,9 @@ func TestWithoutGitHubApp(t *testing.T) {
 			t.Errorf("%v without an App: %v\n%s", args, err, stdout.String())
 		}
 	}
-	// run fails with the reason; check github reports it as a failed check.
-	const want = "the GitHub App isn't set up yet: missing github.app.clientId"
+	// The config is in the format before several targets, which still parses. run fails with the reason; check github
+	// reports it as a failed check.
+	const want = "the GitHub App isn't set up yet: missing github.targets[0].clientId"
 	for _, args := range [][]string{{"run"}, {"check", "github"}} {
 		var stdout, stderr bytes.Buffer
 		err := run(append(args, "-config", path), &stdout, &stderr)

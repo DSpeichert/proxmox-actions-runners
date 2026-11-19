@@ -484,7 +484,8 @@ func testScaleSetConfig() config.ScaleSet {
 func newHarness(t *testing.T, cfg *config.Config) *harness {
 	t.Helper()
 	h := &harness{t: t, pve: newFakeProxmox(), gh: newFakeGitHub(), clock: &clock{now: testStart}, cfg: cfg}
-	c, err := New(Options{Config: cfg, Proxmox: h.pve, GitHub: h.gh, Owner: "test", Now: h.clock.Now,
+	c, err := New(Options{Config: cfg, Proxmox: h.pve, GitHub: clientsFor(cfg, h.gh), Releases: h.gh, Owner: "test",
+		Now:              h.clock.Now,
 		RunnerCheckAfter: 10 * time.Minute, RunnerCheckEvery: 5 * time.Minute, RetryBackoff: time.Minute})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -554,3 +555,12 @@ func (f *fakeGitHub) LatestRunnerRelease(context.Context) (github.RunnerRelease,
 
 // key returns the key of a scale set of the test config, which has no GitHub target.
 func key(name string) ssKey { return ssKey{name: name} }
+
+// clientsFor serves every target of cfg, or the one unnamed target of a config without targets, with gh.
+func clientsFor(cfg *config.Config, gh GitHub) map[string]GitHub {
+	clients := map[string]GitHub{"": gh}
+	for _, t := range cfg.GitHub.Targets {
+		clients[t.Key()] = gh
+	}
+	return clients
+}

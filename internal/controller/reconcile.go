@@ -100,7 +100,7 @@ func (c *Controller) reconcile(ctx context.Context) error {
 				continue
 			}
 			if reason, force := c.retireReason(checkCtx, s, w, now, &checks); reason != "" {
-				c.startRetire(ctx, c.ghFor(s), s, w.vm, w.name, force, reason)
+				c.startRetire(ctx, c.ghFor(s, w), s, w.vm, w.name, force, reason)
 			}
 		}
 	}
@@ -115,12 +115,12 @@ func (c *Controller) reconcile(ctx context.Context) error {
 }
 
 // ghFor returns the GitHub client a worker's runner is registered with: its scale set's, or for a scale set no longer
-// configured, the controller's.
-func (c *Controller) ghFor(s *scaleSetState) GitHub {
+// configured, its target's. It is nil for a target no longer configured, whose App the controller can't act as.
+func (c *Controller) ghFor(s *scaleSetState, w worker) GitHub {
 	if s != nil {
 		return s.gh
 	}
-	return c.gh
+	return c.clients[w.target]
 }
 
 // retireReason says whether a worker should be retired, why, and whether to do it even if its runner is in the
@@ -133,6 +133,15 @@ func (c *Controller) retireReason(ctx context.Context, s *scaleSetState, w worke
 		maxLifetime = s.cfg.MaxLifetime
 	}
 	age := now.Sub(w.created)
+	if s == nil && c.clients[w.target] == nil {
+		// Its target was removed from the config, so the controller can't ask GitHub about its runner. Removing a
+		// target deletes its scale sets first, which unregisters their runners, so a running worker is given until
+		// the runner check would start before it goes.
+		if w.ready && w.vm.Status == "running" && age < c.runnerCheckAfter {
+			return "", false
+		}
+		return "target removed from config", true
+	}
 	switch {
 	case age > maxLifetime:
 		return fmt.Sprintf("older than maxLifetime %s", maxLifetime), true

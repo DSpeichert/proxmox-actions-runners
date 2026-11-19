@@ -236,10 +236,12 @@ expects, and the suite has already caught a missing privilege (`Pool.Audit`) tha
 - Authenticate to GitHub only as a GitHub App (Client ID, installation ID, private key). Don't add PAT support.
 - Never log the manifest-flow code. It can be exchanged for the App's private key until it is used or expires.
   `parcon github app` commands read the code and keys from stdin, never from arguments.
-- `github.app` is optional when the config is parsed, because `parcon install` checks Proxmox before it creates the
-  App. A command that talks to GitHub as the App (`parcon run`, `parcon check github`) calls
-  `(*config.Config).RequireGitHubApp` first; one that needs only public GitHub data, like `parcon check template`,
-  doesn't.
+- `github.apps` and a target's App are optional when the config is parsed, because `parcon install` checks Proxmox
+  before it creates the App. A command that talks to GitHub as an App (`parcon run`, `parcon check github`,
+  `parcon github scaleset delete`) calls `(*config.Config).RequireGitHub` first; one that needs only public GitHub
+  data, like `parcon check template`, doesn't.
+- Every scale set is registered with every target. Build a scale set's spec for a target with
+  `(config.ScaleSet).RunnerGroupFor`, since a repository has no runner groups.
 
 ## Host command guidelines (`internal/installer`, `install/install.sh`)
 

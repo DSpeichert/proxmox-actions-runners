@@ -234,7 +234,7 @@ func TestInstall(t *testing.T) {
 	if err != nil {
 		t.Fatalf("controller config: %v\n%s", err, c.files[config.DefaultPath])
 	}
-	if err := cfg.RequireGitHubApp(); err != nil || cfg.Proxmox.URL != "https://192.0.2.5:8006/api2/json" {
+	if err := cfg.RequireGitHub(); err != nil || cfg.Proxmox.URL != "https://192.0.2.5:8006/api2/json" {
 		t.Errorf("controller config: %v, %+v", err, cfg.Proxmox)
 	}
 	if c.files[config.TokenSecretFile] != tokenSecret+"\n" || c.files[config.CACertFile] == "" {

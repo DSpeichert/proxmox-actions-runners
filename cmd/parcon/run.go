@@ -13,6 +13,7 @@ import (
 
 	"github.com/klponce/proxmox-actions-runners/internal/config"
 	"github.com/klponce/proxmox-actions-runners/internal/controller"
+	"github.com/klponce/proxmox-actions-runners/internal/github"
 )
 
 // runController handles "parcon run": it runs the controller until SIGINT or SIGTERM.
@@ -65,9 +66,13 @@ var statusPath = controller.StatusPath
 
 // newController builds the controller and its clients from the config and the secret files it names.
 func newController(cfg *config.Config, logger *slog.Logger) (*controller.Controller, error) {
-	gh, err := newGitHubClient(cfg, logger.With(slog.String("component", "github")))
+	clients, err := newGitHubClients(cfg, logger.With(slog.String("component", "github")))
 	if err != nil {
 		return nil, err
+	}
+	gh := map[string]controller.GitHub{}
+	for key, c := range clients {
+		gh[key] = c
 	}
 	pve, err := newProxmoxClient(cfg)
 	if err != nil {
@@ -82,9 +87,17 @@ func newController(cfg *config.Config, logger *slog.Logger) (*controller.Control
 		Config:     cfg,
 		Proxmox:    pve,
 		GitHub:     gh,
+		Releases:   releases{},
 		Owner:      owner,
 		Logger:     logger.With(slog.String("component", "controller")),
 		StatusPath: statusPath,
 		Version:    buildVersion(),
 	})
+}
+
+// releases looks up actions/runner releases, which needs no GitHub App.
+type releases struct{}
+
+func (releases) LatestRunnerRelease(ctx context.Context) (github.RunnerRelease, error) {
+	return github.LatestRunnerRelease(ctx)
 }

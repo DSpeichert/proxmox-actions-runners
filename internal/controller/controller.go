@@ -8,6 +8,7 @@ package controller
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"sync"
 	"time"
@@ -65,12 +66,14 @@ const (
 	rootDisk = "scsi0"
 )
 
-// Options configures a Controller. Only Config, Proxmox, and GitHub are required.
+// Options configures a Controller. Only Config, Proxmox, GitHub, and Releases are required.
 type Options struct {
 	Config  *config.Config
 	Proxmox Proxmox
-	GitHub  GitHub
-	// Releases looks up actions/runner releases. Nil means GitHub, if it implements Releases.
+	// GitHub holds a client for each of the config's targets, by the target's key (config.TargetKey). A config
+	// without targets is served as one target with the empty key.
+	GitHub map[string]GitHub
+	// Releases looks up actions/runner releases.
 	Releases Releases
 	// Owner names this controller in GitHub's session list, such as the controller VM's hostname.
 	Owner  string
@@ -100,9 +103,10 @@ type Options struct {
 
 // Controller runs the reconcile loop for every configured scale set.
 type Controller struct {
-	cfg      *config.Config
-	pve      Proxmox
-	gh       GitHub
+	cfg *config.Config
+	pve Proxmox
+	// clients holds a GitHub client for each configured target, by its key.
+	clients  map[string]GitHub
 	releases Releases
 	owner    string
 	logger   *slog.Logger
@@ -148,21 +152,14 @@ type Controller struct {
 
 // New returns a Controller. It doesn't contact Proxmox or GitHub.
 func New(opts Options) (*Controller, error) {
-	if opts.Config == nil || opts.Proxmox == nil || opts.GitHub == nil {
-		return nil, errors.New("controller: config, Proxmox client, and GitHub client are required")
-	}
-	releases := opts.Releases
-	if releases == nil {
-		var ok bool
-		if releases, ok = opts.GitHub.(Releases); !ok {
-			return nil, errors.New("controller: a client for actions/runner releases is required")
-		}
+	if opts.Config == nil || opts.Proxmox == nil || opts.GitHub == nil || opts.Releases == nil {
+		return nil, errors.New("controller: config, Proxmox client, GitHub clients, and release client are required")
 	}
 	c := &Controller{
 		cfg:               opts.Config,
 		pve:               opts.Proxmox,
-		gh:                opts.GitHub,
-		releases:          releases,
+		clients:           opts.GitHub,
+		releases:          opts.Releases,
 		owner:             opts.Owner,
 		logger:            opts.Logger,
 		now:               opts.Now,
@@ -193,11 +190,21 @@ func New(opts Options) (*Controller, error) {
 		parallelism = defaultParallelism
 	}
 	c.slots = make(chan struct{}, parallelism)
-	target := config.TargetKey(c.cfg.GitHub.ConfigURL)
-	c.defaultTarget = target
-	for _, s := range c.cfg.ScaleSets {
-		key := ssKey{target: target, name: s.Name}
-		c.scaleSets[key] = newScaleSetState(key, c.cfg.GitHub.ConfigURL, s, c.gh, c.trigger, c.now)
+	targets := c.cfg.GitHub.Targets
+	if len(targets) == 0 {
+		targets = []config.Target{{}}
+	}
+	c.defaultTarget = targets[0].Key()
+	for _, t := range targets {
+		gh := opts.GitHub[t.Key()]
+		if gh == nil {
+			return nil, fmt.Errorf("controller: no GitHub client for %s", t.ConfigURL)
+		}
+		for _, s := range c.cfg.ScaleSets {
+			s.RunnerGroup = s.RunnerGroupFor(t)
+			key := ssKey{target: t.Key(), name: s.Name}
+			c.scaleSets[key] = newScaleSetState(key, t.ConfigURL, s, gh, c.trigger, c.now)
+		}
 	}
 	return c, nil
 }

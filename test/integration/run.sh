@@ -282,7 +282,8 @@ proxmox:
   firewallGroup: $GROUP
   vmidRange: { start: $((TEST_VMID + 1)), end: $((TEST_VMID + 10)) }
 github:
-  configUrl: https://github.com/my-org/my-repo
+  targets:
+    - { configUrl: https://github.com/my-org/my-repo }
 worker:
   memoryMiB: 2048
 scaleSets:

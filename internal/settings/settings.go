@@ -288,7 +288,7 @@ func (s *Settings) Validate() error {
 	}
 	if !runnerGroupPattern.MatchString(ss.RunnerGroup) {
 		add("scaleSet.runnerGroup", "%q has characters a runner group can't have", ss.RunnerGroup)
-	} else if g.ConfigURL != "" && (config.GitHub{ConfigURL: g.ConfigURL}).IsRepository() &&
+	} else if g.ConfigURL != "" && (config.Target{ConfigURL: g.ConfigURL}).IsRepository() &&
 		ss.RunnerGroup != config.DefaultRunnerGroup {
 		add("scaleSet.runnerGroup", "repository runners must use the runner group %q", config.DefaultRunnerGroup)
 	}

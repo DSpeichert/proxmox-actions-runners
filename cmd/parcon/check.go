@@ -181,55 +181,78 @@ func newProxmoxClient(cfg *config.Config) (*proxmox.Client, error) {
 	})
 }
 
-// newGitHubClient builds the client that talks to GitHub as the App. It fails if the config doesn't name the App
-// yet: only run and check github need it, and the installer runs the other checks before it creates the App.
-// logger may be nil.
-func newGitHubClient(cfg *config.Config, logger *slog.Logger) (*github.Client, error) {
-	if err := cfg.RequireGitHubApp(); err != nil {
+// newGitHubClients builds a client that talks to GitHub as each target's App, by the target's key. It fails if the
+// config doesn't name a complete target yet: only run, check github, and scaleset delete need them, and the installer
+// runs the other checks before it creates an App. Each App's key is read once. logger may be nil.
+func newGitHubClients(cfg *config.Config, logger *slog.Logger) (map[string]*github.Client, error) {
+	if err := cfg.RequireGitHub(); err != nil {
 		return nil, err
 	}
-	key, err := config.ReadSecretFile(cfg.GitHub.App.PrivateKeyFile)
-	if err != nil {
-		return nil, fmt.Errorf("GitHub App key: %w", err)
+	keys := map[string]string{}
+	clients := map[string]*github.Client{}
+	for _, t := range cfg.GitHub.Targets {
+		app, _ := cfg.GitHub.AppFor(t.ClientID)
+		key, ok := keys[app.ClientID]
+		if !ok {
+			var err error
+			if key, err = config.ReadSecretFile(app.PrivateKeyFile); err != nil {
+				return nil, fmt.Errorf("GitHub App %s key: %w", app.ClientID, err)
+			}
+			keys[app.ClientID] = key
+		}
+		var l *slog.Logger
+		if logger != nil {
+			l = logger.With(slog.String("target", t.ConfigURL))
+		}
+		client, err := github.New(github.Options{
+			ConfigURL:      t.ConfigURL,
+			ClientID:       t.ClientID,
+			InstallationID: t.InstallationID,
+			PrivateKeyPEM:  key,
+			Version:        buildVersion(),
+			Logger:         l,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", t.ConfigURL, err)
+		}
+		clients[t.Key()] = client
 	}
-	return github.New(github.Options{
-		ConfigURL:      cfg.GitHub.ConfigURL,
-		ClientID:       cfg.GitHub.App.ClientID,
-		InstallationID: cfg.GitHub.App.InstallationID,
-		PrivateKeyPEM:  key,
-		Version:        buildVersion(),
-		Logger:         logger,
-	})
+	return clients, nil
 }
 
-// checkGitHub confirms that the GitHub App credentials work and shows which scale sets are already registered.
-// It only reads: the scale sets are created when the controller starts.
+// checkGitHub confirms that each target's App credentials work and shows which scale sets are already registered.
+// It only reads: the scale sets are created when the controller starts. A failing target doesn't hide the others.
 func checkGitHub(ctx context.Context, cfg *config.Config, _ string, out io.Writer) error {
 	c := &checker{out: out}
-	client, err := newGitHubClient(cfg, nil)
+	clients, err := newGitHubClients(cfg, nil)
 	if err != nil {
 		c.fail("GitHub App: %v", err)
 		return c.err()
 	}
 
-	// Each lookup authenticates, so bad App credentials fail every line.
-	for _, s := range cfg.ScaleSets {
-		found, err := client.FindScaleSet(ctx, github.ScaleSetSpec{Name: s.Name, Labels: s.Labels,
-			RunnerGroup: s.RunnerGroup})
-		switch {
-		case err != nil:
-			c.fail("scale set %s in runner group %s: %v", s.Name, s.RunnerGroup, err)
-		case found == nil:
-			c.ok("scale set %s in runner group %s: not registered yet; the controller creates it on start", s.Name,
-				s.RunnerGroup)
-		default:
-			c.ok("scale set %s in runner group %s: registered with ID %d, labels %s", s.Name, s.RunnerGroup, found.ID,
-				strings.Join(found.Labels, ", "))
+	for _, t := range cfg.GitHub.Targets {
+		client := clients[t.Key()]
+		failed := c.failed
+		// Each lookup authenticates, so bad App credentials fail every line.
+		for _, s := range cfg.ScaleSets {
+			group := s.RunnerGroupFor(t)
+			found, err := client.FindScaleSet(ctx, github.ScaleSetSpec{Name: s.Name, Labels: s.Labels,
+				RunnerGroup: group})
+			switch {
+			case err != nil:
+				c.fail("%s: scale set %s in runner group %s: %v", t.ConfigURL, s.Name, group, err)
+			case found == nil:
+				c.ok("%s: scale set %s in runner group %s: not registered yet; the controller creates it on start",
+					t.ConfigURL, s.Name, group)
+			default:
+				c.ok("%s: scale set %s in runner group %s: registered with ID %d, labels %s", t.ConfigURL, s.Name,
+					group, found.ID, strings.Join(found.Labels, ", "))
+			}
 		}
-	}
-	if c.failed == 0 {
-		c.ok("GitHub App %s (installation %d) can manage runners on %s", cfg.GitHub.App.ClientID,
-			cfg.GitHub.App.InstallationID, cfg.GitHub.ConfigURL)
+		if c.failed == failed {
+			c.ok("GitHub App %s (installation %d) can manage runners on %s", t.ClientID, t.InstallationID,
+				t.ConfigURL)
+		}
 	}
 	return c.err()
 }

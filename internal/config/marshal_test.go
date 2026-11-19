@@ -16,9 +16,12 @@ func TestMarshalRoundTrips(t *testing.T) {
 			TLSServerName: "pve1.example.com", Node: "pve1", Pool: DefaultPool, Storage: DefaultStorage,
 			VNet: DefaultVNet, VMIDRange: VMIDRange{Start: 10000, End: 10099}, LinkedClone: &linked,
 		},
-		GitHub: GitHub{ConfigURL: "https://github.com/my-org", App: GitHubApp{
-			ClientID: "Iv23liEXAMPLE", InstallationID: 42, PrivateKeyFile: "/etc/proxmox-actions-runners/github-app.pem",
-		}},
+		GitHub: GitHub{
+			Apps: []GitHubApp{{ClientID: "Iv23liEXAMPLE",
+				PrivateKeyFile: "/etc/proxmox-actions-runners/github-app-Iv23liEXAMPLE.pem"}},
+			Targets: []Target{{ConfigURL: "https://github.com/my-org", ClientID: "Iv23liEXAMPLE", InstallationID: 42},
+				{ConfigURL: "https://github.com/octocat/hello"}},
+		},
 		Worker: Worker{Cores: 4, MemoryMiB: 16384},
 		ScaleSets: []ScaleSet{{
 			Name: "ubuntu", Labels: []string{"null", "true", "1.5", "ubuntu"}, MaxRunners: 3, MinRunners: 1,

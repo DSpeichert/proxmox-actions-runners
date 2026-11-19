@@ -2,6 +2,7 @@ package settings
 
 import (
 	"net/netip"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -33,8 +34,8 @@ func TestControllerConfigBeforeTheApp(t *testing.T) {
 	if strings.Contains(string(data), "github") {
 		t.Errorf("config has a github section before the App exists:\n%s", data)
 	}
-	if err := c.RequireGitHubApp(); err == nil {
-		t.Error("RequireGitHubApp passes without an App")
+	if err := c.RequireGitHub(); err == nil {
+		t.Error("RequireGitHub passes without an App")
 	}
 	ss := c.ScaleSets[0]
 	if ss.Name != config.DefaultScaleSetName || ss.MaxRunners != 1 || ss.Worker != config.DefaultWorker() {
@@ -58,11 +59,18 @@ func TestControllerConfigWithTheApp(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := c.RequireGitHubApp(); err != nil {
+	if err := c.RequireGitHub(); err != nil {
 		t.Error(err)
 	}
-	if c.GitHub.App.PrivateKeyFile != config.AppKeyFile || c.GitHub.App.InstallationID != 7 {
-		t.Errorf("app = %+v", c.GitHub.App)
+	wantGitHub := config.GitHub{
+		Apps:    []config.GitHubApp{{ClientID: "Iv23liEXAMPLE", PrivateKeyFile: config.AppKeyFile}},
+		Targets: []config.Target{{ConfigURL: "https://github.com/my-org", ClientID: "Iv23liEXAMPLE", InstallationID: 7}},
+	}
+	if !reflect.DeepEqual(c.GitHub, wantGitHub) {
+		t.Errorf("github = %+v, want %+v", c.GitHub, wantGitHub)
+	}
+	if c.MaxWorkers != 4 {
+		t.Errorf("maxWorkers = %d, want runners.max", c.MaxWorkers)
 	}
 	if c.Proxmox.TLSFingerprint != "AA:BB" || c.Proxmox.CACertFile != "" || c.Proxmox.UseLinkedClone() {
 		t.Errorf("proxmox = %+v", c.Proxmox)
