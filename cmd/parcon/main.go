@@ -46,6 +46,11 @@ const hostUsage = `usage on the Proxmox host, as root:
   parcon config set <key> <value>       change a setting; the controller restarts with it
   parcon config describe [<key>]        which values a setting takes, and when a change applies
   parcon config apply                   push the settings to the controller again
+  parcon target list [-json]            list the organizations and repositories the runners serve
+  parcon target add -github-url URL [-app manifest|manual] [-client-id ID] [-yes] [-dry-run]
+                                        serve another organization or repository too
+  parcon target remove URL [-yes] [-dry-run]
+                                        stop serving one; its scale sets are deleted in GitHub
   parcon update [-pre] [-yes] [-dry-run]
                                         update to the newest release (-pre: or pre-release), once its signature
                                         checks out; running it again continues an update that stopped
@@ -129,7 +134,7 @@ func run(args []string, stdout, stderr io.Writer) error {
 		return runCheck(args[1:], stdout, stderr)
 	case "github":
 		return runGitHub(args[1:], stdout, stderr)
-	case "install", "uninstall", "status", "update", "config":
+	case "install", "uninstall", "status", "update", "config", "target":
 		return fmt.Errorf("parcon %s runs on the Proxmox host, not in the controller VM", args[0])
 	default:
 		fmt.Fprintf(stderr, "unknown command %q\n%s", args[0], vmUsage)
@@ -153,6 +158,8 @@ func runHost(args []string, stdout, stderr io.Writer) error {
 		err = runConfig(args[1:], stdout, stderr)
 	case "update":
 		err = runUpdate(args[1:], stdout, stderr)
+	case "target":
+		err = runTarget(args[1:], stdout, stderr)
 	case "run", "github":
 		return fmt.Errorf("parcon %s runs in the controller VM; parcon install sets it up", args[0])
 	default:

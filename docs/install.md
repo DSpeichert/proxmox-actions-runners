@@ -93,11 +93,14 @@ After the install, `parcon` in `/usr/local/bin` does the rest:
 | `parcon config set <key> <value>` | Change a setting and apply it: the controller restarts with it |
 | `parcon config describe [<key>]` | Which values a setting takes, and when a change applies |
 | `parcon config apply` | Push the settings to the controller again, for example after the API's pinned certificate was renewed |
+| `parcon target list [--json]` | The organizations and repositories the runners serve, each with its App, installation, and session |
+| `parcon target add --github-url URL [--app manual --client-id ID] [--yes] [--dry-run]` | Serve another organization or repository too (see *Several GitHub targets*) |
+| `parcon target remove URL [--yes] [--dry-run]` | Stop serving one: delete its scale set in GitHub, then push the config without it, which destroys its workers |
 | `parcon update [--pre] [--force] [--yes] [--dry-run]` | Update to the newest release, or pre-release with `--pre`. `--force` runs every step, even those already done for the release |
 | `parcon check` | Every check below, and after an install, the controller's own checks |
 | `parcon check network` | The worker network check from step 13, on demand |
 | `parcon check config\|proxmox\|github\|template` | One of the controller's checks, run in the controller VM |
-| `parcon uninstall [--yes] [--dry-run]` | Remove everything, `parcon` included |
+| `parcon uninstall [--yes] [--dry-run]` | Remove everything, `parcon` included; the GitHub Apps stay in GitHub |
 
 ## Architecture
 
@@ -467,6 +470,34 @@ About the helper page:
 Typing a code from `parcon` into the page (the device-flow style) isn't possible: the page is static, so it has no
 way to send the result back to `parcon`. That would need a hosted relay service, which would also see
 the code that unlocks the private key.
+
+### Several GitHub targets
+
+`parcon install` sets up one target, an organization or a personal account's repository. `parcon target add
+--github-url URL` adds more to a finished install, in steps that each check what already exists, so a re-run
+continues:
+
+1. **Plan.** It shows the target, the App it will use, and that `runners.max` is shared by every target, and asks.
+   It needs the install finished and the controller running the host's `parcon` version, since it pushes a config.
+2. **App.** A private App can be installed only on its owner, so there is one App per organization or personal
+   account. An account that already has one reuses it: its own App, or the App of another of its targets. Otherwise
+   the user creates one with the helper page, as at install, or `--app manual --client-id ID` imports an existing
+   App's key. The key goes into the controller VM as `github-app-<Client ID>.pem`. If the user picks another account
+   on the helper page, the new App is kept for that account when it has none yet, or its key is removed when it
+   has one, and `parcon` says what to do.
+3. **Installation.** `wait-installation -account <owner>`, with `-repository <repo>` for a repository, waits until
+   the App is installed there and reaches the repository. On a personal account whose App is installed already, the
+   user only adds the repository to that installation. The target is saved as soon as it is added, and its App and
+   installation once they are known; the controller serves it only from then on.
+4. **Controller.** `parcon check github` checks every target, and the controller restarts with the new config. `parcon`
+   waits until the controller's log shows a session for every target.
+
+`parcon target remove URL` refuses the last target, which only `parcon uninstall` removes. It deletes the target's
+scale sets first with `parcon github scaleset delete -target URL`, using the config that still names the target, so
+if GitHub refuses, nothing else has changed. It then pushes the config without the target and restarts the
+controller. The controller destroys a worker whose target is no longer configured without asking GitHub, once the
+worker isn't ready or has run as long as the runner check waits. The App's key goes when no other target uses the
+App; the App itself stays in GitHub.
 
 ## Metrics endpoint
 

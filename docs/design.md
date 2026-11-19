@@ -283,6 +283,31 @@ Don't bake reusable credentials (VPN keys, registry passwords, cloud keys) into 
 access should get short-lived credentials at run time, for example through GitHub OIDC. See
 [install.md](install.md#networking) for the network details.
 
+## Several organizations and repositories
+
+One install can serve several targets: organizations, and personal accounts' repositories, which GitHub allows only
+one repository at a time. Every configured scale set is registered with every target, each through a client for
+that target's App installation, so one `runs-on` value works everywhere.
+
+- **One App per account.** A private App can be installed only on the account that owns it, so each organization
+  or personal account has its own, created with the same manifest flow. A personal account's repositories share
+  its App and its one installation. One public App for every target was considered and dropped: anyone could install
+  it, so the controller would have to tell its own installations from strangers', and taking the wrong one would hand
+  the node to a stranger's workflows. With private Apps that can't happen, and `wait-installation` still binds each
+  target to its account's installation rather than to whichever GitHub lists first.
+- **Shared capacity.** Every scale set asks GitHub for up to `runners.max`, but the controller runs at most
+  `runners.max` workers of all targets together (`maxWorkers`), taking turns among scale sets that want more, oldest
+  demand first. Per-target limits were considered and dropped: their sum would overcommit the node, or each target
+  would get a small share of it even while the others are idle.
+- **Target keys.** Every target has a scale set of the same name, so a worker's `par-ss-` tag doesn't say which one
+  it belongs to. A `par-tg-` tag carries the target's key: the owner, or `owner.repo`, in lowercase, cut short with a
+  hash if long. Keys compare the way GitHub compares names. A worker from before the tag belongs to the first target.
+- **Removing a target.** Its scale sets are deleted in GitHub first, which unregisters their runners. The controller
+  can't act as an App it no longer has, so it destroys the removed target's workers without asking GitHub, giving a
+  ready worker as long as the runner check would.
+- **One pool and network.** All targets share them, like scale sets do. Workers of different targets are as isolated
+  from each other as workers of one target, and no more: see *Trust levels and scale sets*.
+
 ## Trust levels and scale sets
 
 Use separate scale sets for jobs with different trust levels. For example, keep jobs that build untrusted code apart

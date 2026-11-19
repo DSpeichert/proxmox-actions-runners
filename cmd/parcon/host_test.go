@@ -76,7 +76,7 @@ func TestCommandsRunWhereTheyBelong(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 
 	hostMode = func() bool { return false }
-	for _, cmd := range []string{"install", "status", "update", "config", "uninstall"} {
+	for _, cmd := range []string{"install", "status", "update", "config", "uninstall", "target"} {
 		if err := run([]string{cmd}, &stdout, &stderr); err == nil || !strings.Contains(err.Error(), "runs on the Proxmox host") {
 			t.Errorf("%s in the VM: %v", cmd, err)
 		}

@@ -742,6 +742,9 @@ func (n *fakeNode) exec(vm *fakeVM, argv []string, stdin []byte) (int, string, s
 			account = strings.ToLower(argv[i+1])
 		}
 		inst, ok := n.installations[account]
+		if i := slices.Index(argv, "-repository"); ok && i >= 0 && !slices.Contains(inst.Repositories, argv[i+1]) {
+			ok = false
+		}
 		if !ok {
 			return 1, "", "the GitHub App isn't installed after 15m"
 		}

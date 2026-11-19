@@ -71,11 +71,34 @@ reaches into them through the guest agent for what it does.
 | `parcon config get --all` | Every setting you can change, with its value and default |
 | `parcon config set worker.memory 16GiB` | Change a setting. The controller restarts with it; running jobs keep going |
 | `parcon config describe worker.memory` | Which values a setting takes, and when a change applies |
+| `parcon target add --github-url URL` | Serve another organization or repository too (see *Several organizations and repositories*). `parcon target list` lists them, and `parcon target remove URL` stops serving one |
 | `parcon update` | Update to the newest release, once its signature checks out. `--pre` includes pre-releases, and `--force` runs every step again to repair an install |
 | `parcon check` | Check the node and the controller. `parcon check network` checks the worker network from a throwaway worker |
-| `parcon uninstall` | Remove everything, `parcon` included. The GitHub App stays |
+| `parcon uninstall` | Remove everything, `parcon` included. The GitHub Apps stay |
 
 The settings you can change so far are `runners.max`, `worker.cores`, `worker.memory`, and `worker.maxLifetime`.
+
+### Several organizations and repositories
+
+One install can serve several organizations and personal repositories. `parcon install` sets up the first; add
+more with:
+
+```bash
+parcon target add --github-url https://github.com/another-org
+parcon target add --github-url https://github.com/octocat/hello
+```
+
+Every target gets the same scale set, so `runs-on: proxmox-ubuntu-26.04` works in all of them, and they share the
+node: `runners.max` is the most workers of all targets together. When they want more, they take turns, so a busy one
+can't starve the others.
+
+GitHub lets a private App be installed only on the account that owns it, so each organization or personal account
+gets its own App, created in a browser the same way as at install. A personal account's runners serve one repository
+each, as GitHub requires, but they share the account's App: adding another of its repositories only asks you to add
+the repository to the App's installation. `--app manual --client-id ID` uses an existing App instead.
+
+`parcon target remove URL` deletes the target's scale set in GitHub, which unregisters its runners, and destroys
+its workers. The App stays in GitHub.
 
 ## How it works
 
@@ -275,8 +298,9 @@ turned off. See [docs/install.md](docs/install.md#networking) for the details.
   its rules before you turn it on. `parcon` doesn't turn it on for you.
 - **An IPv4 DNS server** in the node's DNS settings (System > DNS) that isn't the node itself. Workers use it.
 - **A GitHub organization or personal account** where you can create and install a GitHub App: an organization's
-  runners serve all its repositories, and a personal account's serve one repository, which GitHub requires. The App
-  is created in your account with only the permission it needs:
+  runners serve all its repositories, and a personal account's serve one repository, which GitHub requires. More can
+  be added later with `parcon target add`, each account with its own App. The App is created in your account with
+  only the permission it needs:
   - organization runners need **Self-hosted runners: write** (write includes read)
   - repository runners need **Administration: write**
 - **A browser on any device** for the one-time App creation step.
@@ -321,8 +345,9 @@ These are deliberate. The project supports exactly the setup `parcon install` cr
   and `parcon install` refuses to run on a cluster member. The maintainer has no hardware to test clusters.
 - **One installation layout.** No container image, Kubernetes deployment, other hypervisors, or controller running
   outside its VM. The repository is public, so you are welcome to fork it for other setups.
-- **One worker network.** Every scale set shares the same worker network and runner pool. Keep jobs with different
-  trust levels apart with separate scale sets and GitHub runner groups.
+- **One worker network.** Every scale set and every organization or repository shares the same worker network and
+  runner pool. Keep jobs with different trust levels apart with separate scale sets and GitHub runner groups, or on
+  separate nodes: a hostile job from one target runs next to the others' workers.
 - **Workers share a network segment.** The firewall stops workers from connecting to each other, but workers running
   at the same time share one layer-2 segment, so a hostile job could still answer ARP for another worker's address.
   Run jobs that must be protected from untrusted code on a separate node.

@@ -152,14 +152,6 @@ func (in *Installer) install(ctx context.Context, s *settings.Settings, opts Ins
 		return err
 	}
 	in.Out.Step("Done")
-	labels := s.ScaleSet.Labels
-	if len(labels) == 0 {
-		labels = []string{s.ScaleSet.Name}
-	}
-	runsOn := labels[0]
-	if len(labels) > 1 {
-		runsOn = "[" + strings.Join(labels, ", ") + "]"
-	}
 	in.Out.Say(`Use the runners in a workflow in %s:
 
   runs-on: %s
@@ -169,7 +161,7 @@ Status:    parcon status
 Settings:  parcon config get --all
 Update:    parcon update
 Targets:   parcon target add|remove|list
-Uninstall: parcon uninstall`, strings.Join(targetURLs(s), " and "), runsOn, controller, addr)
+Uninstall: parcon uninstall`, strings.Join(targetURLs(s), " and "), runsOn(s), controller, addr)
 	in.rebootNote(ctx)
 	return nil
 }

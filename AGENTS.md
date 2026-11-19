@@ -24,6 +24,11 @@ behind the invariants and the alternatives that were rejected.
 
 - **Runner scale set**: a GitHub-side group of runners that workflows target by name. The controller receives job
   assignments through its message queue API, the same one ARC uses.
+- **Target**: an organization or a personal account's repository the runners serve. `parcon install` sets up the
+  first and `parcon target add` more. Every scale set is registered with every target, and `runners.max` caps the
+  workers of all of them together. Each organization or account has its own private GitHub App, shared by its
+  targets; its key is `github-app-<Client ID>.pem` in the controller VM. Workers carry their target's key in a
+  `par-tg-` tag.
 - **JIT config**: a single-use, just-in-time runner registration config from GitHub. It registers one ephemeral
   runner. Treat it as a credential until it is used.
 - **`actions/scaleset`**: GitHub's Go client for the scale set APIs (the non-Kubernetes counterpart to ARC). The
@@ -40,10 +45,10 @@ behind the invariants and the alternatives that were rejected.
   drops SDN's IP set of the worker subnet (`+sdn/parnet-all`) and the IP set `par-blocked` (private, CGNAT, and
   link-local ranges, the LAN, the host, the controller). Rules use scoped references (`+sdn/`, `+dc/`), which a
   worker's own IP sets can't shadow. It applies only while the datacenter firewall is on, which the user turns on.
-- **Host commands**: `parcon install`, `status`, `config`, `update`, `check`, and `uninstall`, run as root on the
-  Proxmox VE 9 node (`internal/installer`). They are the user's interface: the controller VM needs no login, and
-  `parcon` reaches into it through the guest agent. `install/install.sh` is the bootstrap that
-  downloads and verifies the release's `parcon` and runs `parcon install`. See [docs/install.md](docs/install.md).
+- **Host commands**: `parcon install`, `status`, `config`, `target`, `update`, `check`, and `uninstall`, run as root
+  on the Proxmox VE 9 node (`internal/installer`). They are the user's interface: the controller VM needs no login,
+  and `parcon` reaches into it through the guest agent. `install/install.sh` is the bootstrap that downloads and
+  verifies the release's `parcon` and runs `parcon install`. See [docs/install.md](docs/install.md).
 - **Host settings**: `/etc/proxmox-actions-runners/settings.yaml` on the host (`internal/settings`), the source of
   truth for the install. `parcon` renders the controller VM's `config.yaml` from it. It holds nothing secret.
 - **Worker**: a VM cloned from the template to run one job.
@@ -118,7 +123,8 @@ Keep these true. If a change needs to break one, discuss it first.
 ## Repository layout (planned)
 
 ```
-cmd/parcon/            `parcon` binary. On the host: `install`, `status`, `config`, `update`, `check`, `uninstall`.
+cmd/parcon/            `parcon` binary. On the host: `install`, `status`, `config`, `target`, `update`, `check`,
+                       `uninstall`.
                        In the controller VM: `run`, `check`, `github app create|import|wait-installation`,
                        `github scaleset delete`. Flags, wiring, signals
 internal/config/       the controller's config schema, every default (install defaults included), validation
