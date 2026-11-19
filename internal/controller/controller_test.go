@@ -494,7 +494,7 @@ func TestDestroyingAVMThatIsGoneSucceeds(t *testing.T) {
 	if err := h.c.destroy(context.Background(), 10003); err != nil {
 		t.Errorf("destroy of a VM that doesn't exist: %v", err)
 	}
-	if err := h.c.retire(context.Background(), 10003, true, "", true); err != nil {
+	if err := h.c.retire(context.Background(), h.gh, 10003, true, "", true); err != nil {
 		t.Errorf("retire of a VM that doesn't exist: %v", err)
 	}
 }

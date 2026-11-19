@@ -13,7 +13,9 @@ import (
 // into it, and the reconcile loop reads it. Handler methods only record and wake the loop, because the listener
 // doesn't fetch the next message until they return.
 type scaleSetState struct {
-	cfg  config.ScaleSet
+	cfg config.ScaleSet
+	// gh serves the scale set: the client for the App installation it is registered with.
+	gh   GitHub
 	wake func()
 
 	mu sync.Mutex
@@ -37,8 +39,8 @@ type scaleSetState struct {
 	now          func() time.Time
 }
 
-func newScaleSetState(cfg config.ScaleSet, wake func(), now func() time.Time) *scaleSetState {
-	return &scaleSetState{cfg: cfg, wake: wake, busy: map[string]bool{}, now: now}
+func newScaleSetState(cfg config.ScaleSet, gh GitHub, wake func(), now func() time.Time) *scaleSetState {
+	return &scaleSetState{cfg: cfg, gh: gh, wake: wake, busy: map[string]bool{}, now: now}
 }
 
 // SessionOpened implements github.SessionObserver.

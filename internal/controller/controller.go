@@ -31,19 +31,25 @@ type Proxmox interface {
 	Firewall(ctx context.Context, vmid int) (proxmox.Firewall, error)
 }
 
-// GitHub is what the controller needs from GitHub. *github.Client implements it.
+// GitHub is what the controller needs from GitHub to serve a scale set, on behalf of one App installation.
+// *github.Client implements it.
 type GitHub interface {
 	EnsureScaleSet(ctx context.Context, spec github.ScaleSetSpec) (github.ScaleSet, error)
 	GenerateJITConfig(ctx context.Context, scaleSetID int, runnerName string) (github.JITConfig, error)
 	RunnerByName(ctx context.Context, name string) (*github.Runner, error)
 	RemoveRunner(ctx context.Context, id int64) error
 	Listen(ctx context.Context, opts github.ListenOptions, h github.Handler)
+}
+
+// Releases looks up actions/runner releases, which needs no credentials. *github.Client implements it.
+type Releases interface {
 	LatestRunnerRelease(ctx context.Context) (github.RunnerRelease, error)
 }
 
 var (
-	_ Proxmox = (*proxmox.Client)(nil)
-	_ GitHub  = (*github.Client)(nil)
+	_ Proxmox  = (*proxmox.Client)(nil)
+	_ GitHub   = (*github.Client)(nil)
+	_ Releases = (*github.Client)(nil)
 )
 
 // Defaults for Options.
@@ -64,6 +70,8 @@ type Options struct {
 	Config  *config.Config
 	Proxmox Proxmox
 	GitHub  GitHub
+	// Releases looks up actions/runner releases. Nil means GitHub, if it implements Releases.
+	Releases Releases
 	// Owner names this controller in GitHub's session list, such as the controller VM's hostname.
 	Owner  string
 	Logger *slog.Logger
@@ -92,12 +100,13 @@ type Options struct {
 
 // Controller runs the reconcile loop for every configured scale set.
 type Controller struct {
-	cfg    *config.Config
-	pve    Proxmox
-	gh     GitHub
-	owner  string
-	logger *slog.Logger
-	now    func() time.Time
+	cfg      *config.Config
+	pve      Proxmox
+	gh       GitHub
+	releases Releases
+	owner    string
+	logger   *slog.Logger
+	now      func() time.Time
 
 	resync           time.Duration
 	bootTimeout      time.Duration
@@ -138,10 +147,18 @@ func New(opts Options) (*Controller, error) {
 	if opts.Config == nil || opts.Proxmox == nil || opts.GitHub == nil {
 		return nil, errors.New("controller: config, Proxmox client, and GitHub client are required")
 	}
+	releases := opts.Releases
+	if releases == nil {
+		var ok bool
+		if releases, ok = opts.GitHub.(Releases); !ok {
+			return nil, errors.New("controller: a client for actions/runner releases is required")
+		}
+	}
 	c := &Controller{
 		cfg:               opts.Config,
 		pve:               opts.Proxmox,
 		gh:                opts.GitHub,
+		releases:          releases,
 		owner:             opts.Owner,
 		logger:            opts.Logger,
 		now:               opts.Now,
@@ -173,7 +190,7 @@ func New(opts Options) (*Controller, error) {
 	}
 	c.slots = make(chan struct{}, parallelism)
 	for _, s := range c.cfg.ScaleSets {
-		c.scaleSets[s.Name] = newScaleSetState(s, c.trigger, c.now)
+		c.scaleSets[s.Name] = newScaleSetState(s, c.gh, c.trigger, c.now)
 	}
 	return c, nil
 }
@@ -236,7 +253,7 @@ func (c *Controller) serve(ctx context.Context, s *scaleSetState) {
 		return
 	}
 	c.trigger()
-	c.gh.Listen(ctx, github.ListenOptions{ScaleSetID: s.scaleSetID(), MaxRunners: s.cfg.MaxRunners, Owner: c.owner}, s)
+	s.gh.Listen(ctx, github.ListenOptions{ScaleSetID: s.scaleSetID(), MaxRunners: s.cfg.MaxRunners, Owner: c.owner}, s)
 }
 
 // register makes sure a scale set exists in GitHub and learns its ID, retrying until ctx ends, because GitHub may be
@@ -244,7 +261,7 @@ func (c *Controller) serve(ctx context.Context, s *scaleSetState) {
 func (c *Controller) register(ctx context.Context, s *scaleSetState) bool {
 	backoff := time.Second
 	for {
-		ss, err := c.gh.EnsureScaleSet(ctx, github.ScaleSetSpec{Name: s.cfg.Name, Labels: s.cfg.Labels,
+		ss, err := s.gh.EnsureScaleSet(ctx, github.ScaleSetSpec{Name: s.cfg.Name, Labels: s.cfg.Labels,
 			RunnerGroup: s.cfg.RunnerGroup})
 		if err == nil {
 			s.setScaleSetID(ss.ID)

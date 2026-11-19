@@ -51,7 +51,7 @@ func (c *Controller) checkRunnerFreshness(ctx context.Context, template *proxmox
 func (c *Controller) compareRunner(ctx context.Context, template proxmox.VM, now time.Time) time.Time {
 	ctx, cancel := context.WithTimeout(ctx, runnerCheckTimeout)
 	defer cancel()
-	latest, err := c.gh.LatestRunnerRelease(ctx)
+	latest, err := c.releases.LatestRunnerRelease(ctx)
 	if err != nil {
 		c.logger.WarnContext(ctx, "checking for a newer actions/runner release failed", slog.String("error", err.Error()))
 		return now.Add(runnerCheckRetry)

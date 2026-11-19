@@ -83,7 +83,7 @@ func (c *Controller) reconcile(ctx context.Context) error {
 	c.checkRunnerFreshness(ctx, v.template)
 
 	for _, vm := range v.strays {
-		c.startRetire(ctx, nil, vm, "", true, "left half-created")
+		c.startRetire(ctx, nil, nil, vm, "", true, "left half-created")
 	}
 
 	checks := 0
@@ -96,7 +96,7 @@ func (c *Controller) reconcile(ctx context.Context) error {
 				continue
 			}
 			if reason, force := c.retireReason(checkCtx, s, w, now, &checks); reason != "" {
-				c.startRetire(ctx, s, w.vm, w.name, force, reason)
+				c.startRetire(ctx, c.ghFor(s), s, w.vm, w.name, force, reason)
 			}
 		}
 	}
@@ -106,6 +106,15 @@ func (c *Controller) reconcile(ctx context.Context) error {
 	}
 	c.countWorkers(v)
 	return nil
+}
+
+// ghFor returns the GitHub client a worker's runner is registered with: its scale set's, or for a scale set no longer
+// configured, the controller's.
+func (c *Controller) ghFor(s *scaleSetState) GitHub {
+	if s != nil {
+		return s.gh
+	}
+	return c.gh
 }
 
 // retireReason says whether a worker should be retired, why, and whether to do it even if its runner is in the
@@ -150,7 +159,7 @@ func (c *Controller) retireReason(ctx context.Context, s *scaleSetState, w worke
 		return "", false
 	}
 	*checks++
-	runner, err := c.gh.RunnerByName(ctx, w.name)
+	runner, err := s.gh.RunnerByName(ctx, w.name)
 	if err != nil {
 		c.logger.WarnContext(ctx, "looking up a worker's runner failed", slog.Int("vmid", w.vm.VMID),
 			slog.String("runnerName", w.name), slog.String("error", err.Error()))
@@ -218,7 +227,7 @@ func (c *Controller) scale(ctx context.Context, s *scaleSetState, v view, now ti
 		// picked up a job in the meantime refuses to go (RemoveRunner fails), stays, and counts as busy from then on.
 		sort.Slice(idle, func(i, j int) bool { return idle[i].created.Before(idle[j].created) })
 		for _, w := range idle[:min(active-target, len(idle))] {
-			c.startRetire(ctx, s, w.vm, w.name, false, "more workers than GitHub wants")
+			c.startRetire(ctx, s.gh, s, w.vm, w.name, false, "more workers than GitHub wants")
 		}
 	}
 }
