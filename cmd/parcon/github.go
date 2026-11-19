@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -127,17 +128,25 @@ func appImport(args []string, _, stderr io.Writer) error {
 
 // appWaitInstallation waits until the App is installed and prints where, as JSON: the installation's ID, the
 // account, its type, and, on a personal account, the repositories it can reach. The installer picks the runners'
-// organization or repository from it, so the user chooses the target only once, on GitHub.
+// organization or repository from it, so the user chooses the target only once, on GitHub. -account binds the wait
+// to one account, and -repository also waits until that installation reaches the repository, so the user can add
+// it on GitHub while parcon waits.
 func appWaitInstallation(args []string, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("github app wait-installation", flag.ContinueOnError)
 	clientID := fs.String("client-id", "", "the App's client ID (required)")
 	keyFile := fs.String("key-file", defaultKeyFile, "the App's private key")
 	timeout := fs.Duration("timeout", 15*time.Minute, "how long to wait for the installation")
+	account := fs.String("account", "", "the organization or personal account the App must be installed on")
+	repository := fs.String("repository", "", "a repository the installation must reach (needs -account)")
 	if err := parseFlags(fs, args, stderr); err != nil {
 		return err
 	}
 	if *clientID == "" {
 		fmt.Fprintln(stderr, "-client-id is required")
+		return errUsage
+	}
+	if *repository != "" && *account == "" {
+		fmt.Fprintln(stderr, "-repository needs -account")
 		return errUsage
 	}
 	key, err := config.ReadSecretFile(*keyFile)
@@ -150,8 +159,22 @@ func appWaitInstallation(args []string, stdout, stderr io.Writer) error {
 	// Errors don't end the wait: a network blip, a GitHub 5xx, or a new App GitHub doesn't know yet all pass. Each
 	// new error is shown right away, and the last one is repeated if the wait times out.
 	var lastErr error
+	reported := false
 	for {
-		in, err := findInstallation(ctx, *clientID, key)
+		in, err := findInstallation(ctx, *clientID, key, *account)
+		if errors.Is(err, github.ErrSeveralInstallations) {
+			return fmt.Errorf("%w: pass -account", err)
+		}
+		if in.ID != 0 && *repository != "" && !slices.ContainsFunc(in.Repositories, func(r string) bool {
+			return strings.EqualFold(r, *repository)
+		}) {
+			if !reported {
+				fmt.Fprintf(stderr, "the App is installed on %s, but not for the repository %s yet; still waiting\n",
+					in.Account, *repository)
+				reported = true
+			}
+			in = github.Installation{}
+		}
 		if in.ID != 0 {
 			return json.NewEncoder(stdout).Encode(struct {
 				InstallationID int64    `json:"installationId"`

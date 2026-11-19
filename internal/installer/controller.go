@@ -155,6 +155,13 @@ const (
 // re-run after a failure continues with the same App instead of creating another.
 func (in *Installer) setupApp(ctx context.Context, vmid int, s *settings.Settings, mode AppMode, clientID string) error {
 	in.Out.Step("GitHub App")
+	// account is who the App must be installed on, when it is known: the --github-url's owner, or the owner of the
+	// App the manifest flow just created. Without it, wait-installation refuses an App installed on several accounts
+	// rather than taking whichever GitHub lists first.
+	var account string
+	if s.GitHub.ConfigURL != "" {
+		account, _, _ = config.ParseGitHubURL(s.GitHub.ConfigURL)
+	}
 	if s.GitHub.App.ClientID == "" {
 		if mode == AppManual {
 			if err := in.importAppKey(ctx, vmid); err != nil {
@@ -162,8 +169,12 @@ func (in *Installer) setupApp(ctx context.Context, vmid int, s *settings.Setting
 			}
 		} else {
 			var err error
-			if clientID, s.GitHub.App.Slug, err = in.createApp(ctx, vmid); err != nil {
+			var owner string
+			if clientID, s.GitHub.App.Slug, owner, err = in.createApp(ctx, vmid); err != nil {
 				return err
+			}
+			if account == "" {
+				account = owner
 			}
 		}
 		s.GitHub.App.ClientID = clientID
@@ -173,8 +184,11 @@ func (in *Installer) setupApp(ctx context.Context, vmid int, s *settings.Setting
 	}
 	if s.GitHub.App.InstallationID == 0 {
 		in.askToInstall(s.GitHub.App)
-		out, err := in.asParcon(ctx, vmid, 16*time.Minute, nil, "parcon", "github", "app", "wait-installation",
-			"-client-id", s.GitHub.App.ClientID)
+		args := []string{"parcon", "github", "app", "wait-installation", "-client-id", s.GitHub.App.ClientID}
+		if account != "" {
+			args = append(args, "-account", account)
+		}
+		out, err := in.asParcon(ctx, vmid, 16*time.Minute, nil, args...)
 		if err != nil {
 			return fmt.Errorf("the App wasn't installed; run parcon install again to keep waiting: %w", err)
 		}
@@ -282,9 +296,9 @@ func (in *Installer) askToInstall(app settings.App) {
       https://github.com/apps/%s/installations/new`, app.Slug)
 }
 
-// createApp runs the manifest flow and returns the new App's Client ID and slug. The code the user pastes goes only
-// into the controller VM, on stdin.
-func (in *Installer) createApp(ctx context.Context, vmid int) (clientID, slug string, err error) {
+// createApp runs the manifest flow and returns the new App's Client ID, slug, and owner. The code the user pastes
+// goes only into the controller VM, on stdin.
+func (in *Installer) createApp(ctx context.Context, vmid int) (clientID, slug, owner string, err error) {
 	state := newState()
 	in.Out.Say(`
     Create your GitHub App in a browser on any device:
@@ -296,19 +310,19 @@ func (in *Installer) createApp(ctx context.Context, vmid int) (clientID, slug st
 `, HelperURL, state)
 	line, err := in.Term.Line("    Line from the page: ")
 	if errors.Is(err, term.ErrNoTerminal) {
-		return "", "", errors.New("creating the GitHub App needs a terminal; run parcon install in one, or use an " +
+		return "", "", "", errors.New("creating the GitHub App needs a terminal; run parcon install in one, or use an " +
 			"existing App with --app manual --client-id")
 	}
 	if err != nil {
-		return "", "", err
+		return "", "", "", err
 	}
 	got, code, ok := strings.Cut(strings.TrimSpace(line), ".")
 	if !ok || got != state || code == "" {
-		return "", "", errors.New("that line isn't from this install's link; run parcon install again")
+		return "", "", "", errors.New("that line isn't from this install's link; run parcon install again")
 	}
 	out, err := in.asParcon(ctx, vmid, time.Minute, []byte(code+"\n"), "parcon", "github", "app", "create")
 	if err != nil {
-		return "", "", fmt.Errorf("creating the GitHub App failed: %w", err)
+		return "", "", "", fmt.Errorf("creating the GitHub App failed: %w", err)
 	}
 	var app struct {
 		ClientID string `json:"clientId"`
@@ -316,10 +330,10 @@ func (in *Installer) createApp(ctx context.Context, vmid int) (clientID, slug st
 		Owner    string `json:"owner"`
 	}
 	if err := json.Unmarshal(out, &app); err != nil || app.ClientID == "" {
-		return "", "", fmt.Errorf("parcon github app create printed %q", out)
+		return "", "", "", fmt.Errorf("parcon github app create printed %q", out)
 	}
 	in.Out.Say("\n    Created GitHub App %s, owned by %s.", app.Slug, app.Owner)
-	return app.ClientID, app.Slug, nil
+	return app.ClientID, app.Slug, app.Owner, nil
 }
 
 // importAppKey reads an existing App's private key from the terminal and pipes it into the controller VM.

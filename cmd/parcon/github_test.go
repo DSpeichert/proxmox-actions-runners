@@ -10,6 +10,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -200,6 +201,7 @@ func TestGitHubAppWaitInstallation(t *testing.T) {
 		found    github.Installation
 		pollsTo  int   // the poll that finds the installation; 0 means never
 		findErr  error // returned by every poll before it
+		repoFrom int   // the poll from which the installation reaches its repositories; 0 means from the start
 		want     outcome
 		wantOut  string
 		wantMsgs string
@@ -222,17 +224,37 @@ func TestGitHubAppWaitInstallation(t *testing.T) {
 			wantMsgs: "must not be accessible to group or others"},
 		{name: "no client ID", args: []string{"-client-id", ""}, want: usageError,
 			wantMsgs: "-client-id is required"},
+		{name: "installed on the named account", args: []string{"-account", "my-org"}, found: org, pollsTo: 1,
+			want: succeeded, wantOut: orgOut},
+		{name: "several installations and no account", args: []string{"-timeout", "1s"},
+			findErr: github.ErrSeveralInstallations, want: failed, wantMsgs: "pass -account"},
+		{name: "the repository is added after a few polls", args: []string{"-account", "octocat", "-repository",
+			"World"}, found: user, pollsTo: 1, repoFrom: 3, want: succeeded,
+			wantOut: `{"installationId":7890123,"account":"octocat","accountType":"User",` +
+				`"repositories":["hello","world"]}` + "\n",
+			wantMsgs: "not for the repository World yet; still waiting"},
+		{name: "repository without account", args: []string{"-repository", "hello"}, want: usageError,
+			wantMsgs: "-repository needs -account"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			polls := 0
-			findInstallation = func(_ context.Context, clientID, keyPEM string) (github.Installation, error) {
+			wantAccount := ""
+			if i := slices.Index(tt.args, "-account"); i >= 0 {
+				wantAccount = tt.args[i+1]
+			}
+			findInstallation = func(_ context.Context, clientID, keyPEM, account string) (github.Installation,
+				error) {
 				polls++
-				if clientID != testClientID || keyPEM != strings.TrimSpace(testKeyPEM) {
-					t.Errorf("findInstallation(%q, <key>) got the wrong arguments", clientID)
+				if clientID != testClientID || keyPEM != strings.TrimSpace(testKeyPEM) || account != wantAccount {
+					t.Errorf("findInstallation(%q, <key>, %q) got the wrong arguments", clientID, account)
 				}
 				if tt.pollsTo != 0 && polls >= tt.pollsTo {
-					return tt.found, nil
+					found := tt.found
+					if polls < tt.repoFrom {
+						found.Repositories = []string{"hello"}
+					}
+					return found, nil
 				}
 				return github.Installation{}, tt.findErr
 			}
@@ -243,11 +265,12 @@ func TestGitHubAppWaitInstallation(t *testing.T) {
 				t.Errorf("outcome %s, stdout %q, want %s and %q mentioning %q:\n%s", got, stdout, tt.want, tt.wantOut,
 					tt.wantMsgs, all)
 			}
-			if tt.pollsTo != 0 && polls != tt.pollsTo {
-				t.Errorf("polled %d times, want %d", polls, tt.pollsTo)
+			if want := max(tt.pollsTo, tt.repoFrom); tt.pollsTo != 0 && polls != want {
+				t.Errorf("polled %d times, want %d", polls, want)
 			}
 			// The same error is shown once, not on every poll.
-			if tt.findErr != nil && strings.Count(all, "still waiting") != 1 {
+			waited := (tt.findErr != nil || tt.repoFrom != 0) && !errors.Is(tt.findErr, github.ErrSeveralInstallations)
+			if waited && strings.Count(all, "still waiting") != 1 {
 				t.Errorf("the repeated error was shown %d times, want once:\n%s", strings.Count(all, "still waiting"),
 					all)
 			}

@@ -84,6 +84,11 @@ type fakeGitHub struct {
 	// installedOn is the type of account the App is installed on: "Organization" (my-org), "User" (octocat, on the
 	// repositories hello and world), or "" for not installed.
 	installedOn string
+	// otherInstallations are organizations the App is also installed on, listed before installedOn's account, as
+	// a public App can be installed by anyone.
+	otherInstallations []string
+	// repositories is how many repositories the personal-account installation reaches; 0 means hello and world.
+	repositories int
 }
 
 func newFakeGitHub(t *testing.T) *fakeGitHub {
@@ -132,6 +137,20 @@ func (f *fakeGitHub) certPool() *x509.CertPool {
 	return pool
 }
 
+// page returns the page of items that the request's page and per_page parameters select, as GitHub does.
+func page(r *http.Request, items []map[string]any) []map[string]any {
+	perPage, err := strconv.Atoi(r.URL.Query().Get("per_page"))
+	if err != nil || perPage <= 0 {
+		perPage = 30
+	}
+	n, err := strconv.Atoi(r.URL.Query().Get("page"))
+	if err != nil || n <= 0 {
+		n = 1
+	}
+	start := min((n-1)*perPage, len(items))
+	return append([]map[string]any{}, items[start:min(start+perPage, len(items))]...)
+}
+
 func (f *fakeGitHub) called() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -172,13 +191,17 @@ func (f *fakeGitHub) serve(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusUnauthorized, map[string]any{"message": "A JSON web token could not be decoded"})
 			return
 		}
-		login := map[string]string{"Organization": "my-org", "User": "octocat"}[f.installedOn]
 		installations := []map[string]any{}
+		for i, login := range f.otherInstallations {
+			installations = append(installations, map[string]any{"id": 1000 + i,
+				"account": map[string]any{"login": login, "type": "Organization"}})
+		}
 		if f.installedOn != "" {
+			login := map[string]string{"Organization": "my-org", "User": "octocat"}[f.installedOn]
 			installations = append(installations, map[string]any{"id": testInstallationID,
 				"account": map[string]any{"login": login, "type": f.installedOn}})
 		}
-		writeJSON(w, http.StatusOK, installations)
+		writeJSON(w, http.StatusOK, page(r, installations))
 	case route == fmt.Sprintf("POST /app/installations/%d/access_tokens", testInstallationID):
 		if !f.validAppJWT(strings.TrimPrefix(auth, "Bearer ")) {
 			writeJSON(w, http.StatusUnauthorized, map[string]any{"message": "A JSON web token could not be decoded"})
@@ -190,8 +213,14 @@ func (f *fakeGitHub) serve(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusUnauthorized, map[string]any{"message": "Bad credentials"})
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"total_count": 2,
-			"repositories": []map[string]any{{"name": "hello"}, {"name": "world"}}})
+		repos := []map[string]any{{"name": "hello"}, {"name": "world"}}
+		if f.repositories > 0 {
+			repos = nil
+			for i := range f.repositories {
+				repos = append(repos, map[string]any{"name": fmt.Sprintf("repo%d", i)})
+			}
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"total_count": len(repos), "repositories": page(r, repos)})
 	case route == "POST /api/v3/orgs/my-org/actions/runners/registration-token":
 		if auth != "Bearer "+testInstallToken {
 			writeJSON(w, http.StatusUnauthorized, map[string]any{"message": "Bad credentials"})

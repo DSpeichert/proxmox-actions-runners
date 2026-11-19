@@ -158,6 +158,12 @@ func TestInstall(t *testing.T) {
 		s.GitHub.App.InstallationID != 7 {
 		t.Errorf("settings github = %+v", s.GitHub)
 	}
+	// The installation is looked up on the account that owns the new App, never taken on trust.
+	if !slices.ContainsFunc(ti.node.lines(), func(l string) bool {
+		return strings.Contains(l, "wait-installation -client-id Iv23liEXAMPLE -account my-org")
+	}) {
+		t.Errorf("wait-installation wasn't bound to the App's owner:\n%s", strings.Join(ti.node.lines(), "\n"))
+	}
 
 	// Proxmox objects.
 	n := ti.node
@@ -359,6 +365,13 @@ func TestInstallWithAnExistingApp(t *testing.T) {
 	}
 	if s, _ := settings.Load(ti.SettingsPath); s.GitHub.App.ClientID != "Iv23liEXISTING" {
 		t.Errorf("client ID = %q", s.GitHub.App.ClientID)
+	}
+	// Without --github-url, the owner of an existing App is unknown, so wait-installation is left to refuse an App
+	// installed on several accounts.
+	if !slices.ContainsFunc(ti.node.lines(), func(l string) bool {
+		return strings.HasSuffix(l, "wait-installation -client-id Iv23liEXISTING")
+	}) {
+		t.Errorf("wait-installation was bound to an account:\n%s", strings.Join(ti.node.lines(), "\n"))
 	}
 }
 

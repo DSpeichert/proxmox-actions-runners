@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/golang-jwt/jwt/v4"
@@ -73,30 +74,55 @@ type Installation struct {
 	Repositories []string
 }
 
-// FindInstallation returns the App's installation, or a zero Installation if the App isn't installed yet. A private
-// App can only be installed on the account that owns it, so it has at most one. It authenticates as the App with a
-// JWT signed by keyPEM.
-func FindInstallation(ctx context.Context, clientID, keyPEM string) (Installation, error) {
-	return findInstallation(ctx, &http.Client{Timeout: restTimeout}, defaultAPIBase, clientID, keyPEM)
+// ErrSeveralInstallations is returned when no account is named and the App is installed on more than one account,
+// so the installation to use is ambiguous.
+var ErrSeveralInstallations = errors.New("github: the App is installed on several accounts; name the one to use")
+
+// pageSize is how many items a list request asks GitHub for per page, the most it allows.
+const pageSize = 100
+
+// FindInstallation returns the App's installation on account, or a zero Installation if the App isn't installed
+// there yet. Accounts are compared without regard to case, as GitHub does. With an empty account it returns the
+// App's only installation, or ErrSeveralInstallations if there is more than one: a private App can only be installed
+// on the account that owns it, but an existing App passed in by hand may be public and installed by anyone, so the
+// first one GitHub lists is never taken on trust. It authenticates as the App with a JWT signed by keyPEM.
+func FindInstallation(ctx context.Context, clientID, keyPEM, account string) (Installation, error) {
+	return findInstallation(ctx, &http.Client{Timeout: restTimeout}, defaultAPIBase, clientID, keyPEM, account)
 }
 
-func findInstallation(ctx context.Context, client *http.Client, apiBase, clientID, keyPEM string) (Installation,
-	error) {
+func findInstallation(ctx context.Context, client *http.Client, apiBase, clientID, keyPEM, wanted string) (
+	Installation, error) {
 	jwt, err := appJWT(clientID, keyPEM, time.Now())
 	if err != nil {
 		return Installation{}, err
 	}
-	var installations []struct {
+	type installation struct {
 		ID      int64   `json:"id"`
 		Account account `json:"account"`
 	}
-	if err := restGet(ctx, client, apiBase, "/app/installations", jwt, &installations); err != nil {
-		return Installation{}, fmt.Errorf("github: find the App's installation: %w", err)
+	var matches []installation
+	for page := 1; ; page++ {
+		var installations []installation
+		path := fmt.Sprintf("/app/installations?per_page=%d&page=%d", pageSize, page)
+		if err := restGet(ctx, client, apiBase, path, jwt, &installations); err != nil {
+			return Installation{}, fmt.Errorf("github: find the App's installation: %w", err)
+		}
+		for _, in := range installations {
+			if wanted == "" || strings.EqualFold(in.Account.Login, wanted) {
+				matches = append(matches, in)
+			}
+		}
+		if len(installations) < pageSize {
+			break
+		}
 	}
-	if len(installations) == 0 {
+	switch {
+	case len(matches) == 0:
 		return Installation{}, nil
+	case len(matches) > 1:
+		return Installation{}, ErrSeveralInstallations
 	}
-	in := installations[0]
+	in := matches[0]
 	found := Installation{ID: in.ID, Account: in.Account.Login, AccountType: in.Account.Type}
 	if found.AccountType != "User" {
 		return found, nil
@@ -114,17 +140,22 @@ func findInstallation(ctx context.Context, client *http.Client, apiBase, clientI
 		return Installation{}, fmt.Errorf("github: list the installation's repositories: POST %s: %d %s", path, status,
 			http.StatusText(status))
 	}
-	var repos struct {
-		Repositories []struct {
-			Name string `json:"name"`
-		} `json:"repositories"`
-	}
-	if err := restGet(ctx, client, apiBase, "/installation/repositories?per_page=100", token.Token,
-		&repos); err != nil {
-		return Installation{}, fmt.Errorf("github: list the installation's repositories: %w", err)
-	}
-	for _, r := range repos.Repositories {
-		found.Repositories = append(found.Repositories, r.Name)
+	for page := 1; ; page++ {
+		var repos struct {
+			Repositories []struct {
+				Name string `json:"name"`
+			} `json:"repositories"`
+		}
+		path := fmt.Sprintf("/installation/repositories?per_page=%d&page=%d", pageSize, page)
+		if err := restGet(ctx, client, apiBase, path, token.Token, &repos); err != nil {
+			return Installation{}, fmt.Errorf("github: list the installation's repositories: %w", err)
+		}
+		for _, r := range repos.Repositories {
+			found.Repositories = append(found.Repositories, r.Name)
+		}
+		if len(repos.Repositories) < pageSize {
+			break
+		}
 	}
 	return found, nil
 }

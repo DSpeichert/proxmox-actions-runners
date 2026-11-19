@@ -72,35 +72,68 @@ func TestFindInstallation(t *testing.T) {
 		Bytes: x509.MarshalPKCS1PrivateKey(otherKey)}))
 	tokenRoute := fmt.Sprintf("POST /app/installations/%d/access_tokens", testInstallationID)
 
+	list := "GET /app/installations"
+	repos := "GET /installation/repositories"
+	many := make([]string, 150)
+	for i := range many {
+		many[i] = fmt.Sprintf("repo%d", i)
+	}
+	strangers := make([]string, 100)
+	for i := range strangers {
+		strangers[i] = fmt.Sprintf("stranger%d", i)
+	}
+
 	tests := []struct {
-		name       string
-		on         string
-		key        string
-		want       Installation
-		wantErr    string
-		wantRoutes []string
+		name         string
+		on           string
+		others       []string
+		repositories int
+		account      string
+		key          string
+		want         Installation
+		wantErr      string
+		wantRoutes   []string
 	}{
 		{name: "organization", on: "Organization",
 			want:       Installation{ID: testInstallationID, Account: "my-org", AccountType: "Organization"},
-			wantRoutes: []string{"GET /app/installations"}},
+			wantRoutes: []string{list}},
 		{name: "personal account, with its repositories", on: "User",
 			want: Installation{ID: testInstallationID, Account: "octocat", AccountType: "User",
 				Repositories: []string{"hello", "world"}},
-			wantRoutes: []string{"GET /app/installations", tokenRoute, "GET /installation/repositories"}},
-		{name: "not installed yet", wantRoutes: []string{"GET /app/installations"}},
-		{name: "wrong key", on: "Organization", key: otherPEM, wantErr: "401",
-			wantRoutes: []string{"GET /app/installations"}},
+			wantRoutes: []string{list, tokenRoute, repos}},
+		{name: "every page of repositories", on: "User", repositories: 150,
+			want:       Installation{ID: testInstallationID, Account: "octocat", AccountType: "User", Repositories: many},
+			wantRoutes: []string{list, tokenRoute, repos, repos}},
+		{name: "not installed yet", wantRoutes: []string{list}},
+		{name: "the named account, not the first one listed", on: "Organization", others: []string{"stranger"},
+			account:    "my-org",
+			want:       Installation{ID: testInstallationID, Account: "my-org", AccountType: "Organization"},
+			wantRoutes: []string{list}},
+		{name: "the named account, in any case", on: "Organization", account: "My-Org",
+			want:       Installation{ID: testInstallationID, Account: "my-org", AccountType: "Organization"},
+			wantRoutes: []string{list}},
+		{name: "the named account, on a later page", on: "Organization", others: strangers, account: "my-org",
+			want:       Installation{ID: testInstallationID, Account: "my-org", AccountType: "Organization"},
+			wantRoutes: []string{list, list}},
+		{name: "not installed on the named account", on: "Organization", others: []string{"stranger"},
+			account: "elsewhere", wantRoutes: []string{list}},
+		{name: "several installations and no account named", on: "Organization", others: []string{"stranger"},
+			wantErr: "several accounts", wantRoutes: []string{list}},
+		{name: "wrong key", on: "Organization", key: otherPEM, wantErr: "401", wantRoutes: []string{list}},
 		{name: "key not PEM", key: "not a key", wantErr: "not a valid RSA key"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			f := newFakeGitHub(t)
 			f.installedOn = tt.on
+			f.otherInstallations = tt.others
+			f.repositories = tt.repositories
 			key := tt.key
 			if key == "" {
 				key = testKeyPEM()
 			}
-			got, err := findInstallation(context.Background(), f.httpClient(), f.srv.URL, testClientID, key)
+			got, err := findInstallation(context.Background(), f.httpClient(), f.srv.URL, testClientID, key,
+				tt.account)
 			if tt.wantErr != "" {
 				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
 					t.Fatalf("FindInstallation error = %v, want it to mention %q", err, tt.wantErr)

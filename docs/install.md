@@ -422,7 +422,7 @@ never logged or printed:
 | ------- | ----- | ------ |
 | `parcon github app create [-key-file PATH]` | the manifest code | `{"clientId":"…","appId":…,"slug":"…","owner":"…","ownerType":"Organization"}` |
 | `parcon github app import [-key-file PATH]` | an existing App's PEM private key | nothing |
-| `parcon github app wait-installation -client-id ID [-key-file PATH] [-timeout 15m]` | nothing | `{"installationId":…,"account":"…","accountType":"User","repositories":["…"]}` |
+| `parcon github app wait-installation -client-id ID [-account LOGIN [-repository NAME]] [-key-file PATH] [-timeout 15m]` | nothing | `{"installationId":…,"account":"…","accountType":"User","repositories":["…"]}` |
 
 - `-key-file` defaults to `/etc/proxmox-actions-runners/github-app.pem`. `create` and `import` write it with mode
   `0600` through a temporary file in the same directory and a rename, so a reader never sees half a key. `create`
@@ -433,12 +433,16 @@ never logged or printed:
   expired code fails with a message that says so.
 - `import` is the `--app manual --client-id ID` path for an App that already exists: `parcon install` reads its
   private key from the terminal and pipes the key to `import`. `import` checks that it is a PEM-encoded RSA private key.
-- `wait-installation` authenticates as the App with a JWT and polls `GET /app/installations` every 5 seconds until
-  the App is installed. On a personal account it also lists the repositories the installation can reach
-  (`GET /installation/repositories` with an installation token), since the runners need one of them; an
-  organization's runners serve the whole organization. Errors don't end the wait, because a network blip, a GitHub
-  error, or a newly created App that GitHub doesn't know yet all pass. It prints each new error as it happens and
-  fails after `-timeout` with the last one.
+- `wait-installation` authenticates as the App with a JWT and polls `GET /app/installations`, every page of it,
+  every 5 seconds until the App is installed. With `-account` it waits for the installation on that account, compared
+  without regard to case; without it, it takes the App's only installation and fails if there are several, because
+  an existing App may be public and installed by anyone. `parcon install` passes `-account` whenever it knows the
+  owner: from `--github-url`, or from the App the manifest flow just created. On a personal account it also lists
+  every repository the installation can reach (`GET /installation/repositories` with an installation token), since
+  the runners need one of them; an organization's runners serve the whole organization. `-repository` keeps waiting
+  until the installation reaches that repository, so it can be added on GitHub while parcon waits. Errors don't end
+  the wait, because a network blip, a GitHub error, or a newly created App that GitHub doesn't know yet all pass. It
+  prints each new error as it happens and fails after `-timeout` with the last one.
 
 About the helper page:
 
