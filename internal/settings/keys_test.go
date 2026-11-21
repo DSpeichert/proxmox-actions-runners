@@ -47,7 +47,13 @@ func TestSetKey(t *testing.T) {
 		{key: "worker.maxLifetime", value: "6d", wantErr: "must be 10m to 5d"},
 		{key: "worker.maxLifetime", value: "5m", wantErr: "must be 10m to 5d"},
 		{key: "worker.maxLifetime", value: "12", wantErr: "needs a number and a unit"},
-		{key: "worker.disk", value: "20GiB", wantErr: "unknown key"},
+		{key: "worker.disk", value: "50GiB", want: "50GiB"},
+		{key: "worker.disk", value: "1024MiB", want: "1GiB"},
+		{key: "worker.disk", value: "1536MiB", wantErr: "whole number of GiB"},
+		{key: "worker.disk", value: "50GB", wantErr: "use GiB or MiB"},
+		{key: "worker.disk", value: "50", wantErr: "needs a number and a unit"},
+		{key: "worker.disk", value: "5000GiB", wantErr: "must be 1GiB to 4096GiB"},
+		{key: "worker.gpu", value: "1", wantErr: "unknown key"},
 	}
 	for _, tt := range tests {
 		s := Default()
@@ -90,7 +96,7 @@ func TestSetKeyChecksTheWholeSettings(t *testing.T) {
 func TestGetShowsDefaults(t *testing.T) {
 	s := Default()
 	for name, want := range map[string]string{"runners.max": "1", "worker.cores": "2", "worker.memory": "8GiB",
-		"worker.maxLifetime": "6h"} {
+		"worker.maxLifetime": "6h", "worker.disk": "14GiB"} {
 		k, err := Lookup(name)
 		if err != nil {
 			t.Fatal(err)

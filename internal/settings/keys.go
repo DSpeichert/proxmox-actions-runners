@@ -38,7 +38,7 @@ type Key struct {
 var ErrUnknownKey = errors.New("unknown key")
 
 // Keys are the settings users can change, sorted by name.
-var Keys = []Key{runnersMax, workerCores, workerMaxLifetime, workerMemory}
+var Keys = []Key{runnersMax, workerCores, workerDisk, workerMaxLifetime, workerMemory}
 
 // Lookup finds a key by name.
 func Lookup(name string) (Key, error) {
@@ -178,6 +178,41 @@ var workerMemory = Key{
 			return fmt.Errorf("this node has only %s", config.FormatMiB(l.HostMemMiB))
 		}
 		s.Worker.MemoryMiB = mib
+		return nil
+	},
+	Applies: appliesToNewWorkers,
+}
+
+// maxFreeDiskGiB bounds worker.disk, to catch a typo before Proxmox fails every clone on a full storage.
+const maxFreeDiskGiB = 4096
+
+var workerDisk = Key{
+	Name:    "worker.disk",
+	Summary: "free disk space per worker VM, on top of the runner template's disk",
+	Allowed: func(*Settings, Limits) string {
+		return fmt.Sprintf("a whole number of GiB from %dGiB to %dGiB, such as 50GiB; each worker's disk is the "+
+			"template's size plus this, and it comes out of the VM storage while the worker lives (a linked clone "+
+			"takes only what the job writes)", config.MinFreeDiskGiB, maxFreeDiskGiB)
+	},
+	Default: fmt.Sprintf("%dGiB, like the free space on GitHub's ubuntu-latest for private repositories",
+		config.DefaultFreeDiskGiB),
+	Get: func(s *Settings) (string, bool) {
+		n := s.EffectiveWorker().FreeDiskGiB
+		return strconv.Itoa(n) + "GiB", n == config.DefaultFreeDiskGiB
+	},
+	Set: func(s *Settings, value string, _ Limits) error {
+		mib, err := config.ParseSize(value)
+		if err != nil {
+			return err
+		}
+		if mib%1024 != 0 {
+			return errors.New("must be a whole number of GiB, since Proxmox grows disks in GiB")
+		}
+		gib := mib / 1024
+		if gib < config.MinFreeDiskGiB || gib > maxFreeDiskGiB {
+			return fmt.Errorf("must be %dGiB to %dGiB", config.MinFreeDiskGiB, maxFreeDiskGiB)
+		}
+		s.Worker.FreeDiskGiB = gib
 		return nil
 	},
 	Applies: appliesToNewWorkers,

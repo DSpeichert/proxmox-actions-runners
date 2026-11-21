@@ -67,8 +67,9 @@ func TestConfigGet(t *testing.T) {
 			t.Errorf("get --all lacks %q:\n%s", want, out)
 		}
 	}
-	if _, errOut, err := onHost(t, &s, "config", "get", "worker.disk"); outcomeOf(err) != usageError ||
-		!strings.Contains(errOut, "the keys are runners.max, worker.cores, worker.maxLifetime, worker.memory") {
+	if _, errOut, err := onHost(t, &s, "config", "get", "worker.gpu"); outcomeOf(err) != usageError ||
+		!strings.Contains(errOut, "the keys are runners.max, worker.cores, worker.disk, worker.maxLifetime, "+
+			"worker.memory") {
 		t.Errorf("unknown key: %v, %s", err, errOut)
 	}
 	if _, _, err := onHost(t, nil, "config", "get", "worker.cores"); err == nil ||

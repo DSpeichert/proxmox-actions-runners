@@ -257,7 +257,7 @@ saved settings, skips the free space an install needs, and also runs the control
 | `proxmox` | the storage and the VMID range | install flags |
 | `github` | `apps`: each App's Client ID, slug (for its install link), and owner; `targets`: each organization or repository, and the App and installation that reach it | the install and `parcon target add`, as they learn them |
 | `scaleSet` | the name, labels, runner group, the most and fewest workers, and how long a worker may live | install flags, `runners.max`, `worker.maxLifetime` |
-| `worker` | worker hardware; a field left out uses the GitHub-matching default | `worker.cores`, `worker.memory` |
+| `worker` | worker hardware; a field left out uses the GitHub-matching default | `worker.cores`, `worker.memory`, `worker.disk` |
 
 Version 2 of the file, from releases before several targets, had one `github.configUrl` and one `github.app`. `parcon`
 reads it as one App and one target, and `parcon update` saves it as version 3. A target that is waiting for its App or
@@ -275,6 +275,7 @@ node (for example, no more vCPUs than the node has), a default, and says when a 
 | --- | ------ | ------- |
 | `runners.max` | 1 to the number of worker IDs in the VMID range, and at least `minRunners` | 1 |
 | `worker.cores` | 1 to the node's CPU threads | 2 |
+| `worker.disk` | 1GiB to 4096GiB in whole GiB, such as `50GiB`: free space on top of the template's disk | 14GiB |
 | `worker.maxLifetime` | 10m to 5d (GitHub's job limit for self-hosted runners), such as `12h`, `1h30m`, or `2d` | 6h |
 | `worker.memory` | 1GiB to the node's memory, in GiB or MiB, such as `8GiB` or `12288MiB` | 8GiB |
 

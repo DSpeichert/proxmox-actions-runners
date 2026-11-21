@@ -87,7 +87,8 @@ Proxmox firewall at each worker's NIC, so it doesn't depend on how your LAN or V
 | `parcon check` | Check the node and the controller. `parcon check network` checks the worker network from a throwaway worker |
 | `parcon uninstall` | Remove everything, `parcon` included. The GitHub Apps stay |
 
-The settings you can change so far are `runners.max`, `worker.cores`, `worker.memory`, and `worker.maxLifetime`.
+The settings you can change so far are `runners.max`, `worker.cores`, `worker.memory`, `worker.disk`, and
+`worker.maxLifetime`.
 
 ### Several organizations and repositories
 
@@ -162,9 +163,10 @@ The default spec matches the standard GitHub-hosted `ubuntu-latest` runner for p
 | Disk     | 14 GiB free |
 
 GitHub's 14 GB is the free space a job gets, not the size of the disk. Each worker's disk is the template's disk
-size plus `freeDiskGiB` (14 by default), because a clone's disk can grow but can't be smaller than its template's.
+size plus `worker.disk` (14GiB by default), because a clone's disk can grow but can't be smaller than its template's.
 
-Change them with `parcon config set worker.cores 4` and `parcon config set worker.memory 16GiB` on the Proxmox host.
+Change them with `parcon config set worker.cores 4`, `parcon config set worker.memory 16GiB`, and
+`parcon config set worker.disk 50GiB` on the Proxmox host.
 New workers get the new hardware; running ones finish their jobs as they are.
 
 A worker is destroyed after 6 hours, job or not, which matches GitHub-hosted runners. For longer jobs, raise it with

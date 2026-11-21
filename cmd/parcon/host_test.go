@@ -61,7 +61,8 @@ func TestSettingsFlagsRefuse(t *testing.T) {
 		{[]string{"--vmid-range", "10000"}, "FIRST-LAST"},
 		{[]string{"--set", "runners.max"}, "KEY=VALUE"},
 		{[]string{"--set", "worker.memory=16GB"}, "use GiB or MiB"},
-		{[]string{"--set", "worker.disk=1"}, "unknown key"},
+		{[]string{"--set", "worker.gpu=1"}, "unknown key"},
+		{[]string{"--set", "worker.disk=1"}, "needs a number and a unit"},
 		{[]string{"--app", "browser"}, "--app must be manifest or manual"},
 		{[]string{"--pve-address", "pve1"}, "network.pveAddress"},
 	} {

@@ -60,7 +60,7 @@ func TestSetConfig(t *testing.T) {
 	if err := ti.SetConfig(ctx, "worker.memory", "16GB"); !errors.As(err, &verr) {
 		t.Errorf("16GB: %v", err)
 	}
-	if err := ti.SetConfig(ctx, "worker.disk", "1"); !errors.Is(err, settings.ErrUnknownKey) {
+	if err := ti.SetConfig(ctx, "worker.gpu", "1"); !errors.Is(err, settings.ErrUnknownKey) {
 		t.Errorf("unknown key: %v", err)
 	}
 
@@ -201,6 +201,18 @@ func TestSetConfigMaxLifetime(t *testing.T) {
 	}
 	if out := ti.stdout.String(); !strings.Contains(out, "worker.maxLifetime: 6h -> 36h, which applies to every "+
 		"worker, running ones included") {
+		t.Errorf("output:\n%s", out)
+	}
+}
+
+func TestSetConfigDisk(t *testing.T) {
+	ti := installed(t)
+	must(t, ti.SetConfig(context.Background(), "worker.disk", "50GiB"))
+	if cfg := ti.controllerConfig(t); cfg.ScaleSets[0].Worker.FreeDiskGiB != 50 {
+		t.Errorf("controller config worker = %+v", cfg.ScaleSets[0].Worker)
+	}
+	if out := ti.stdout.String(); !strings.Contains(out, "worker.disk: 14GiB -> 50GiB") ||
+		!strings.Contains(out, "listening for jobs") {
 		t.Errorf("output:\n%s", out)
 	}
 }

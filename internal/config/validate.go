@@ -14,10 +14,11 @@ import (
 const (
 	minVMID = 100
 
-	// MinCores and MinMemoryMiB are the smallest worker a config accepts. parcon's config keys offer the same range.
+	// MinCores, MinMemoryMiB, and MinFreeDiskGiB are the smallest worker a config accepts. parcon's config keys offer
+	// the same range.
 	MinCores       = 1
 	MinMemoryMiB   = 1024
-	minFreeDiskGiB = 1
+	MinFreeDiskGiB = 1
 
 	// MinMaxLifetime and MaxMaxLifetime bound a worker's lifetime. MaxMaxLifetime is GitHub's job execution limit for
 	// self-hosted runners.
@@ -176,7 +177,7 @@ func (c *Config) RequireGitHub() error {
 func (w Worker) validate(v *validator, prefix string) {
 	v.atLeast(prefix+".cores", w.Cores, MinCores)
 	v.atLeast(prefix+".memoryMiB", w.MemoryMiB, MinMemoryMiB)
-	v.atLeast(prefix+".freeDiskGiB", w.FreeDiskGiB, minFreeDiskGiB)
+	v.atLeast(prefix+".freeDiskGiB", w.FreeDiskGiB, MinFreeDiskGiB)
 }
 
 func (c *Config) validateScaleSets(v *validator) {
