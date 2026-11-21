@@ -45,7 +45,7 @@ func runTarget(args []string, stdout, stderr io.Writer) error {
 func targetAdd(args []string, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("target add", flag.ContinueOnError)
 	var h hostFlags
-	h.register(fs, false)
+	h.register(fs)
 	url := fs.String("github-url", "", "the organization or repository, as https://github.com/<org> or "+
 		"https://github.com/<owner>/<repo>")
 	app := fs.String("app", string(installer.AppManifest), "for an account without an App yet: manifest (create "+
@@ -80,7 +80,7 @@ func targetRemove(args []string, stdout, stderr io.Writer) error {
 	url, args := args[0], args[1:]
 	fs := flag.NewFlagSet("target remove", flag.ContinueOnError)
 	var h hostFlags
-	h.register(fs, false)
+	h.register(fs)
 	if err := parseHostFlags(fs, args, stderr); err != nil {
 		return usageOrNil(err)
 	}

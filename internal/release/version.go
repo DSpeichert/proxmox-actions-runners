@@ -1,8 +1,5 @@
-// Package release finds, downloads, and verifies this project's releases, which `parcon update` installs.
-//
-// A release's SHA256SUMS lists every asset's checksum, and SHA256SUMS.sig is an Ed25519 signature of it made by the
-// release workflow. parcon carries the public keys it trusts (keys/*.pem) and refuses a release whose signature none
-// of them verifies, then checks every asset it downloads against SHA256SUMS.
+// Package release is parcon's own release version, which an install records, and installing the parcon binary.
+// parcon downloads nothing: the user brings the binary and the runner image.
 package release
 
 import (
@@ -11,9 +8,6 @@ import (
 	"strconv"
 	"strings"
 )
-
-// Repo is the project's GitHub repository.
-const Repo = "klponce/proxmox-actions-runners"
 
 // Version is a release version: major.minor.patch with an optional pre-release suffix, such as 0.2.0-rc.1.
 type Version struct {

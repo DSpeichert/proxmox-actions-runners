@@ -16,7 +16,6 @@ import (
 	"github.com/klponce/proxmox-actions-runners/internal/github"
 	"github.com/klponce/proxmox-actions-runners/internal/proxmox"
 	"github.com/klponce/proxmox-actions-runners/internal/pvecli"
-	"github.com/klponce/proxmox-actions-runners/internal/release"
 	"github.com/klponce/proxmox-actions-runners/internal/settings"
 	"github.com/klponce/proxmox-actions-runners/internal/vmtags"
 )
@@ -49,9 +48,6 @@ type Report struct {
 	PVEVersion string `json:"pveVersion"`
 	// Installed is the release of the finished install; empty if the node has none.
 	Installed string `json:"installed,omitempty"`
-	// Latest is the newest release, or LatestError why it isn't known.
-	Latest      string `json:"latest,omitempty"`
-	LatestError string `json:"latestError,omitempty"`
 
 	Host       []Finding                   `json:"host"`
 	Controller *ControllerStatus           `json:"controller,omitempty"`
@@ -168,17 +164,6 @@ func (in *Installer) Status(ctx context.Context) (*Report, error) {
 	part("the controller's service", func() StatusLevel {
 		r.Controller, snapshot = in.controllerStatus(ctx, s)
 		return worst(r.Controller.Findings)
-	})
-	part("the latest release on GitHub", func() StatusLevel {
-		ctx, cancel := context.WithTimeout(ctx, githubTimeout)
-		defer cancel()
-		latest, err := release.Latest(ctx, in.Source, in.Version.IsPre())
-		if err != nil {
-			r.LatestError = err.Error()
-			return WARN
-		}
-		r.Latest = latest.Version.String()
-		return OK
 	})
 	var runner Finding
 	part("the runner template against actions/runner's latest release", func() StatusLevel {
@@ -491,14 +476,6 @@ func (r *Report) Render(w io.Writer, now time.Time) {
 		installed = "not finished"
 	}
 	p("proxmox-actions-runners %s on %s (%s)", installed, r.Node, r.PVEVersion)
-	switch {
-	case r.LatestError != "":
-		p("  latest release unknown: %s", r.LatestError)
-	case r.Latest != "" && r.Installed != "" && compareVersions(r.Latest, r.Installed) > 0:
-		p("  release %s is out: run parcon update", r.Latest)
-	case r.Latest != "":
-		p("  up to date with the latest release, %s", r.Latest)
-	}
 	p("\nHost")
 	for _, f := range r.Host {
 		line(f)
@@ -541,13 +518,4 @@ func (r *Report) Render(w io.Writer, now time.Time) {
 	for _, w := range r.SettingsWarnings {
 		p("  WARN  %s", w)
 	}
-}
-
-func compareVersions(a, b string) int {
-	va, err1 := release.ParseVersion(a)
-	vb, err2 := release.ParseVersion(b)
-	if err1 != nil || err2 != nil {
-		return 0
-	}
-	return va.Compare(vb)
 }

@@ -24,15 +24,24 @@ control.
 
 ## Install
 
-*Planned.* On a standalone Proxmox VE 9 node, as root:
+*Planned.* You need two things on a standalone Proxmox VE 9 node: `parcon`, built with its version stamped in, and
+the runner image, `par-runner-<version>.qcow2`, with its Packer manifest `par-runner-<version>.json` next to it. Take
+them from a release, or build them in the dev container:
 
 ```bash
-curl -fsSLO https://github.com/klponce/proxmox-actions-runners/releases/latest/download/install.sh
-bash install.sh
+.github/scripts/build-image.sh runner 0.3.0     # output-runner/par-runner-0.3.0.qcow2 and .json
+CGO_ENABLED=0 go build -trimpath -ldflags "-X main.version=0.3.0" -o parcon ./cmd/parcon
 ```
 
-`install.sh` only downloads the release's `parcon`, checks it against the checksum written into the script, and runs
-`parcon install`. `parcon` first runs preflight checks: it must be root on a PVE 9.x node with KVM, a synchronized
+Copy them to the node, then, as root:
+
+```bash
+./parcon install --image /var/tmp/par-runner-0.3.0.qcow2
+```
+
+`parcon` downloads nothing: it imports the image you name. A release's `install.sh` still works as a bootstrap that
+fetches `parcon` and passes its arguments on, so `bash install.sh --image PATH` does the same. `parcon` first runs
+preflight checks: it must be root on a PVE 9.x node with KVM, a synchronized
 clock, enough storage, outbound HTTPS, `dnsmasq` installed for SDN DHCP, and the datacenter firewall on, among other
 checks (see *Requirements*). It then shows the full plan and asks for
 confirmation, and changes nothing before that (`--dry-run` stops at the plan). After that it:
@@ -48,7 +57,7 @@ confirmation, and changes nothing before that (`--dry-run` stops at the plan). A
   organization or personal account and create the App on GitHub. You paste one line back, install the App with
   GitHub's own install page, and the installer learns the organization or repository from it. The host itself needs
   no browser
-- imports the **runner template** from the runner image published with the release
+- imports the **runner template** from the runner image you name with `--image`
 - registers the scale set with GitHub
 
 `parcon install -h` lists the settings you can choose, such as the bridge, the worker subnet, or
@@ -74,7 +83,7 @@ Proxmox firewall at each worker's NIC, so it doesn't depend on how your LAN or V
 | `parcon config set worker.memory 16GiB` | Change a setting. The controller restarts with it; running jobs keep going |
 | `parcon config describe worker.memory` | Which values a setting takes, and when a change applies |
 | `parcon target add --github-url URL` | Serve another organization or repository too (see *Several organizations and repositories*). `parcon target list` lists them, and `parcon target remove URL` stops serving one |
-| `parcon update` | Update to the newest release, once its signature checks out. `--pre` includes pre-releases, and `--force` runs every step again to repair an install |
+| `parcon update [--image PATH]` | Run it with a new `parcon` to bring the install to it, and with `--image` to import a new runner image. `--force` runs every step again to repair an install |
 | `parcon check` | Check the node and the controller. `parcon check network` checks the worker network from a throwaway worker |
 | `parcon uninstall` | Remove everything, `parcon` included. The GitHub Apps stay |
 
@@ -252,7 +261,7 @@ and environment variables follow GitHub's [`actions/runner-images`](https://gith
 those actions work, but its preinstalled toolset is not included.
 
 The template contains no credentials. Each clone receives its JIT runner config through the guest agent after boot.
-Templates are immutable: `parcon update` imports a newer release's runner image as a new template, the controller
+Templates are immutable: `parcon update --image PATH` imports a new runner image as a new template, the controller
 clones the newest one, and it deletes an old template once no worker uses it.
 
 GitHub stops accepting a self-hosted runner that doesn't update itself 30 days after a newer runner release, so
@@ -378,7 +387,7 @@ internal/settings/     the host's settings, the config keys, and the controller 
 internal/installer/    install, check, status, config, update, and uninstall on the host
 internal/pvecli/       Proxmox through pvesh, pveum, and qm on the host
 internal/hostsys/      host facts: addresses, NICs, memory, the API's certificate
-internal/release/      release lookup and signature verification
+internal/release/      the release version, and installing the parcon binary
 internal/term/         questions on the terminal
 internal/github/       scale set listener, JIT configs, GitHub App auth
 internal/proxmox/      Proxmox API client (clone, configure, start, destroy, list)
@@ -408,9 +417,8 @@ docs/                  design notes
   and they never reach a command line, the output, or the disk unencrypted. The host's settings hold nothing secret.
 - The controller runs as a transient user in a systemd sandbox, with no capabilities and no access to Proxmox's own
   secrets in `/etc/pve`. `systemd-analyze security parcon.service` shows its exposure.
-- Releases are signed. `install.sh` checks `parcon` against the checksum written into it, and `parcon` accepts a
-  release only if its `SHA256SUMS` carries a signature from a key built into it, then checks every file it downloads
-  against those checksums.
+- `parcon` downloads nothing: you bring `parcon` and the runner image, so check them yourself, for example against a
+  release's signed `SHA256SUMS`. `install.sh` checks the `parcon` it fetches against the checksum written into it.
 - Metrics, once added (deferred past v0.1), will be served on the host without authentication. Don't expose them
   beyond your LAN.
 - The GitHub App private key and the Proxmox token are read from files and never logged. JIT configs are

@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"os"
 	"strings"
-	"syscall"
 
 	"github.com/klponce/proxmox-actions-runners/internal/release"
 	"github.com/klponce/proxmox-actions-runners/internal/settings"
@@ -15,24 +14,14 @@ import (
 
 // UpdateOptions are the choices for an update.
 type UpdateOptions struct {
-	// Pre includes pre-releases when looking for the newest release.
-	Pre bool
-	// Continue means this parcon was just installed by an update, which the user confirmed: it brings the node to
-	// its own release without looking for a newer one.
-	Continue bool
-	// Force redoes every piece of the update, even those already at the release, to repair an install that a
-	// stopped update or anything else left broken.
+	// Force redoes every piece of the update, even those already done, to repair an install that a stopped update
+	// or anything else left broken.
 	Force bool
 }
 
-// execBinary replaces this process with another program. Tests replace it.
-var execBinary = func(path string, args []string) error {
-	return syscall.Exec(path, args, os.Environ()) //nolint:gosec // G204: the verified parcon just installed.
-}
-
-// Update updates the install to the newest release. A newer release than this parcon is verified and installed
-// first, then run to do the rest, so each release's own code updates the node to it. Running it again continues an
-// update that stopped partway.
+// Update brings the install to this parcon: the user runs the new parcon, with --image for a new runner image, and
+// it installs itself, imports the image, and does the rest. parcon looks up and downloads nothing. Running it again
+// continues an update that stopped partway.
 func (in *Installer) Update(ctx context.Context, opts UpdateOptions) error {
 	installed, ok, err := in.InstalledRelease(ctx)
 	if err != nil {
@@ -41,68 +30,12 @@ func (in *Installer) Update(ctx context.Context, opts UpdateOptions) error {
 	if !ok {
 		return errors.New("there is no finished install on this node; run parcon install")
 	}
-	if !opts.Continue && in.Assets == "" {
-		in.Out.Step("Releases")
-		latest, err := release.Latest(ctx, in.Source, opts.Pre)
-		if err != nil {
-			return fmt.Errorf("find the newest release: %w", err)
-		}
-		if latest.Version.Compare(in.Version) > 0 {
-			return in.updateSelf(ctx, installed, latest.Version, opts)
-		}
-		in.Out.Say("The newest release is %s, and this parcon is %s.", latest.Version, in.Version)
-	}
-	return in.Upgrade(ctx, installed, opts.Continue, opts.Force)
-}
-
-// updateSelf installs the verified parcon of release v and runs it to update the node.
-func (in *Installer) updateSelf(ctx context.Context, installed, v release.Version, opts UpdateOptions) error {
-	in.Out.Step("Plan")
-	in.Out.Say("Update proxmox-actions-runners %s to %s:", installed, v)
-	in.Out.Say("  replace %s with parcon %s, from the release, once its signature checks out", in.BinaryPath, v)
-	in.Out.Say("  then, run by parcon %s: its runner template, worker network and firewall, and controller, as it "+
-		"plans them", v)
-	if opts.Force {
-		in.Out.Say("  (--force: all of them, even those already at %s)", v)
-	}
-	if in.Change.DryRun {
-		return nil
-	}
-	if err := in.confirm(fmt.Sprintf("Update to %s?", v)); err != nil {
-		return err
-	}
-	unlock, err := in.Lock()
-	if err != nil {
-		return err
-	}
-	in.Out.Step("parcon %s", v)
-	dir, err := os.MkdirTemp(DownloadDir, "par-update.")
-	if err != nil {
-		unlock()
-		return fmt.Errorf("make a download directory: %w", err)
-	}
-	defer func() { _ = os.RemoveAll(dir) }()
-	assets, err := release.Fetch(ctx, in.Source, v, dir, in.Keys)
-	if err == nil {
-		var bin string
-		if bin, err = in.get(ctx, assets, BinaryAsset(v)); err == nil {
-			in.Change.Log("install " + BinaryAsset(v) + " " + in.BinaryPath)
-			err = release.ReplaceBinary(bin, in.BinaryPath)
+	if in.Image != "" {
+		if _, err := in.image(); err != nil {
+			return err
 		}
 	}
-	// The new parcon takes the lock itself.
-	unlock()
-	if err != nil {
-		return err
-	}
-	args := []string{in.BinaryPath, "update", "--continue", "--yes"}
-	if opts.Pre {
-		args = append(args, "--pre")
-	}
-	if opts.Force {
-		args = append(args, "--force")
-	}
-	return execBinary(in.BinaryPath, args)
+	return in.Upgrade(ctx, installed, false, opts.Force)
 }
 
 // upgradeStep is one thing an upgrade does.
@@ -111,13 +44,13 @@ type upgradeStep struct {
 	do   func(ctx context.Context) error
 }
 
-// Upgrade brings the node from release installed to this parcon's release: the runner template, the worker network
-// and firewall, the controller's config and service, and the host's NIC offloads and KVM async page faults. Each piece already at
-// this release is left alone, unless force redoes it.
+// Upgrade brings the node from release installed to this parcon's release: parcon itself, the runner template when
+// Image names a new one, the worker network and firewall, the controller's config and service, and the host's NIC
+// offloads and KVM async page faults. Each piece already at this release is left alone, unless force redoes it.
 func (in *Installer) Upgrade(ctx context.Context, installed release.Version, confirmed, force bool) error {
 	if installed.Compare(in.Version) > 0 {
-		return fmt.Errorf("the node runs release %s, newer than this parcon %s; run parcon update", installed,
-			in.Version)
+		return fmt.Errorf("the node runs release %s, newer than this parcon %s; run parcon update with the newer "+
+			"parcon", installed, in.Version)
 	}
 	if err := in.refuseOlderLayout(ctx); err != nil {
 		return err
@@ -137,12 +70,16 @@ func (in *Installer) Upgrade(ctx context.Context, installed release.Version, con
 	}
 	in.Out.Step("Plan")
 	if len(steps) == 0 {
-		in.Out.Say("proxmox-actions-runners is at %s, and nothing needs updating.", in.Version)
+		in.Out.Say("proxmox-actions-runners is at %s, and nothing needs updating. To import a new runner image, "+
+			"run parcon update --image PATH.", in.Version)
 		return nil
 	}
 	in.Out.Say("Update proxmox-actions-runners %s to %s:", installed, in.Version)
 	for _, st := range steps {
 		in.Out.Say("  %s", st.plan)
+	}
+	if in.Image == "" {
+		in.Out.Say("  (the runner template stays; --image PATH imports a new one)")
 	}
 	if in.Change.DryRun {
 		return nil
@@ -168,19 +105,11 @@ func (in *Installer) Upgrade(ctx context.Context, installed release.Version, con
 	return nil
 }
 
-// upgradeSteps works out what an upgrade to this release has to do. None means the node is at this release. With
-// force, every step runs, even one already done for this release: it imports the runner template again, sets up the
-// worker network and firewall again, rewrites the controller's config and unit and restarts it, and runs the host
-// tuning. The safety checks stay: the release's signature, the plan and its question, and the lock.
+// upgradeSteps works out what an upgrade to this release has to do. None means the node is at this release. A new
+// runner image is imported whenever Image names one. With force, every other step runs, even one already done for
+// this release: it sets up the worker network and firewall again, rewrites the controller's config and unit and
+// restarts it, and runs the host tuning. The safety checks stay: the plan and its question, and the lock.
 func (in *Installer) upgradeSteps(ctx context.Context, s *settings.Settings, force bool) ([]upgradeStep, error) {
-	vms, err := in.vms(ctx)
-	if err != nil {
-		return nil, err
-	}
-	hasTemplate := false
-	for _, vm := range tagged(vms, RunnerPool, in.releaseTag()) {
-		hasTemplate = hasTemplate || vm.Template
-	}
 	want, _, err := in.RenderConfig(ctx, s)
 	if err != nil {
 		return nil, err
@@ -195,41 +124,16 @@ func (in *Installer) upgradeSteps(ctx context.Context, s *settings.Settings, for
 	offloads := in.offloadPlan(ctx, s)
 	asyncPF := in.asyncPFPlan(ctx)
 
-	// The release's assets are fetched once, by the first step that needs them, and removed by the last step.
-	var assets *release.Assets
-	cleanup := func() {}
-	fetch := func(ctx context.Context) (*release.Assets, error) {
-		if assets == nil {
-			in.Out.Step("Release %s", in.Version)
-			a, c, err := in.assets(ctx)
-			if err != nil {
-				return nil, err
-			}
-			assets, cleanup = a, c
-		}
-		return assets, nil
-	}
-
 	var steps []upgradeStep
 	if newBinary {
 		steps = append(steps, upgradeStep{plan: fmt.Sprintf("install parcon %s as %s", in.Version, in.BinaryPath),
 			do: func(context.Context) error { return in.installBinary() }})
 	}
-	if !hasTemplate || force {
-		again := ""
-		if hasTemplate {
-			again = " again"
-		}
+	if in.Image != "" {
 		steps = append(steps, upgradeStep{
-			plan: fmt.Sprintf("import the %s runner template%s; the controller removes old ones once unused",
-				in.Version, again),
-			do: func(ctx context.Context) error {
-				a, err := fetch(ctx)
-				if err != nil {
-					return err
-				}
-				return in.importTemplate(ctx, s, a, force)
-			},
+			plan: fmt.Sprintf("import %s as a new runner template; the controller removes old ones once unused",
+				in.Image),
+			do: func(ctx context.Context) error { return in.importTemplate(ctx, s, true) },
 		})
 	}
 	if len(network) > 0 || force {
@@ -276,10 +180,7 @@ func (in *Installer) upgradeSteps(ctx context.Context, s *settings.Settings, for
 	// The settings record the release last: it marks a finished update.
 	return append(steps, upgradeStep{
 		plan: fmt.Sprintf("record release %s in %s", in.Version, in.SettingsPath),
-		do: func(context.Context) error {
-			defer cleanup()
-			return in.markInstalled(s)
-		},
+		do:   func(context.Context) error { return in.markInstalled(s) },
 	}), nil
 }
 

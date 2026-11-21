@@ -372,12 +372,12 @@ cmd_test() {
 	log "all integration tests passed"
 }
 
-# Where cmd_installer puts parcon and the release assets on the node.
+# Where cmd_installer puts parcon and the runner image on the node.
 readonly INSTALLER_DIR=/var/tmp/par-it-installer
 
 # cmd_installer runs parcon's host commands on the node without GitHub: the dry run, the install up to the GitHub App
 # (--stop-after configure), the controller's check in its sandbox and the sandbox's exposure, the worker network
-# check, and the uninstall. It installs from the local runner image (--assets), with the install's real names
+# check, and the uninstall. It installs from the local runner image (--image), with the install's real names
 # (par-runners, parzone), so it needs a node with no install on it, and it uninstalls even when a step fails.
 cmd_installer() {
 	require_throwaway
@@ -404,14 +404,13 @@ cmd_installer() {
 	log "build parcon and copy it and the runner image to $INSTALLER_DIR on the node"
 	(cd "$ROOT" && CGO_ENABLED=0 go build -trimpath -ldflags "-X main.version=$release" -o "$STATE/parcon-host" \
 		./cmd/parcon)
-	node "rm -rf $INSTALLER_DIR && mkdir -p $INSTALLER_DIR/assets"
+	node "rm -rf $INSTALLER_DIR && mkdir -p $INSTALLER_DIR"
 	scp -q "${SSH_OPTS[@]}" "$STATE/parcon-host" "$PAR_IT_SSH:$INSTALLER_DIR/parcon"
-	scp -q "${SSH_OPTS[@]}" "$RUNNER_IMAGE" "$PAR_IT_SSH:$INSTALLER_DIR/assets/par-runner-$release.qcow2"
-	scp -q "${SSH_OPTS[@]}" "$IMAGE_MANIFEST" "$PAR_IT_SSH:$INSTALLER_DIR/assets/par-runner-$release.json"
-	node "cd $INSTALLER_DIR/assets && sha256sum -- * >SHA256SUMS"
+	scp -q "${SSH_OPTS[@]}" "$RUNNER_IMAGE" "$PAR_IT_SSH:$INSTALLER_DIR/par-runner-$release.qcow2"
+	scp -q "${SSH_OPTS[@]}" "$IMAGE_MANIFEST" "$PAR_IT_SSH:$INSTALLER_DIR/par-runner-$release.json"
 
 	# The GitHub settings are placeholders: nothing here contacts the App or the organization.
-	local install=("$INSTALLER_DIR/parcon" install --assets "$INSTALLER_DIR/assets" --assets-version "$release"
+	local install=("$INSTALLER_DIR/parcon" install --image "$INSTALLER_DIR/par-runner-$release.qcow2"
 		--storage "$STORAGE" --bridge "$BUILD_BRIDGE" --github-url https://github.com/my-org --app manual
 		--client-id Iv23liEXAMPLE0000000)
 

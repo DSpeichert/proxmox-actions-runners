@@ -26,25 +26,16 @@ var newInstaller = func(stdout, stderr io.Writer, dryRun bool) (*installer.Insta
 	if err != nil {
 		return nil, fmt.Errorf("find parcon's own path: %w", err)
 	}
-	// A development build has no release version; only install and update need one.
+	// A build without -X main.version has no release version; only install and update need one.
 	v, _ := release.ParseVersion(version)
 	return installer.New(&term.Out{W: stdout, Err: stderr}, self, v, dryRun)
 }
 
-// needRelease makes sure the Installer has a release version to install. A development build has none, and can
-// install only from local assets, whose version it is given.
-func needRelease(in *installer.Installer, assetsVersion string) error {
-	if assetsVersion != "" {
-		v, err := release.ParseVersion(assetsVersion)
-		if err != nil {
-			return err
-		}
-		in.Version = v
-		return nil
-	}
+// needRelease makes sure the Installer has a release version to install, which the build stamps into parcon.
+func needRelease(in *installer.Installer) error {
 	if in.Version == (release.Version{}) {
-		return errors.New("this parcon is a development build without a release version; install from a " +
-			"release (see the README)")
+		return errors.New("this parcon has no release version: build it with " +
+			"-ldflags '-X main.version=X.Y.Z', such as 0.3.0 or 0.3.0-dev.1")
 	}
 	return nil
 }
@@ -149,43 +140,51 @@ func (f *settingsFlags) settings(fs *flag.FlagSet, limits settings.Limits) (*set
 
 // hostFlags are the flags every host command that changes the node shares.
 type hostFlags struct {
-	yes, dryRun   bool
-	assets        string
-	assetsVersion string
+	yes, dryRun bool
 }
 
-func (h *hostFlags) register(fs *flag.FlagSet, withAssets bool) {
+func (h *hostFlags) register(fs *flag.FlagSet) {
 	fs.BoolVar(&h.yes, "yes", false, "answer yes to every confirmation")
 	fs.BoolVar(&h.dryRun, "dry-run", false, "run the checks, print the plan, and change nothing")
-	if withAssets {
-		// For the integration tests and development builds: use a directory of release assets instead of
-		// downloading a release. Not in the usage text.
-		fs.StringVar(&h.assets, "assets", "", "")
-		fs.StringVar(&h.assetsVersion, "assets-version", "", "")
-	}
+}
+
+// imageFlags name the runner image install and update import.
+type imageFlags struct {
+	image, runnerVersion string
+}
+
+func (f *imageFlags) register(fs *flag.FlagSet, what string) {
+	fs.StringVar(&f.image, "image", "", "the runner image to import as "+what+": par-runner-<version>.qcow2, built "+
+		"from images/runner, with its Packer manifest (.json) next to it")
+	fs.StringVar(&f.runnerVersion, "runner-version", "", "the image's actions/runner version, such as 2.330.0 "+
+		"(default: from the image's manifest)")
+}
+
+func (f *imageFlags) apply(in *installer.Installer) {
+	in.Image, in.RunnerVersion = f.image, f.runnerVersion
 }
 
 func runInstall(args []string, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("install", flag.ContinueOnError)
 	var h hostFlags
-	h.register(fs, true)
+	h.register(fs)
+	var img imageFlags
+	img.register(fs, "the runner template (required, unless an earlier run imported it)")
 	var sf settingsFlags
 	sf.register(fs)
 	stopAfter := fs.String("stop-after", "", "")
 	if err := parseHostFlags(fs, args, stderr); err != nil {
 		return usageOrNil(err)
 	}
-	if h.assets == "" && h.assetsVersion != "" {
-		return fmt.Errorf("--assets-version needs --assets")
-	}
 	in, err := newInstaller(stdout, stderr, h.dryRun)
 	if err != nil {
 		return err
 	}
-	if err := needRelease(in, h.assetsVersion); err != nil {
+	if err := needRelease(in); err != nil {
 		return err
 	}
-	in.Yes, in.Assets, in.StopAfter = h.yes, h.assets, *stopAfter
+	img.apply(in)
+	in.Yes, in.StopAfter = h.yes, *stopAfter
 	s, err := sf.settings(fs, in.Limits())
 	if err != nil {
 		return err
@@ -206,7 +205,7 @@ func usageOrNil(err error) error {
 func runUninstall(args []string, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("uninstall", flag.ContinueOnError)
 	var h hostFlags
-	h.register(fs, false)
+	h.register(fs)
 	if err := parseHostFlags(fs, args, stderr); err != nil {
 		return usageOrNil(err)
 	}
@@ -283,16 +282,14 @@ func runStatus(args []string, stdout, stderr io.Writer) error {
 	return nil
 }
 
-// runUpdate handles "parcon update": update the install to the newest release, verified by its signature.
+// runUpdate handles "parcon update": bring the install to this parcon, and with --image, import a new runner image.
 func runUpdate(args []string, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("update", flag.ContinueOnError)
 	var h hostFlags
-	h.register(fs, true)
-	pre := fs.Bool("pre", false, "consider pre-releases too, such as 0.2.0-rc.1")
-	force := fs.Bool("force", false, "run every step, even those already done for the release, to repair "+
-		"an install")
-	// Set by an older parcon that installed this one to finish the update it started. Not in the usage text.
-	cont := fs.Bool("continue", false, "")
+	h.register(fs)
+	var img imageFlags
+	img.register(fs, "a new runner template")
+	force := fs.Bool("force", false, "run every step, even those already done, to repair an install")
 	if err := parseHostFlags(fs, args, stderr); err != nil {
 		return usageOrNil(err)
 	}
@@ -300,11 +297,12 @@ func runUpdate(args []string, stdout, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
-	if err := needRelease(in, h.assetsVersion); err != nil {
+	if err := needRelease(in); err != nil {
 		return err
 	}
-	in.Yes, in.Assets = h.yes || *cont, h.assets
+	img.apply(in)
+	in.Yes = h.yes
 	ctx, cancel := hostContext()
 	defer cancel()
-	return in.Update(ctx, installer.UpdateOptions{Pre: *pre, Continue: *cont, Force: *force})
+	return in.Update(ctx, installer.UpdateOptions{Force: *force})
 }

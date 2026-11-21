@@ -5,14 +5,11 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
-	"crypto/sha256"
 	"crypto/x509"
-	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"fmt"
-	"io"
 	"maps"
 	"net/netip"
 	"os"
@@ -863,15 +860,6 @@ func (n *fakeNode) vmsTagged(tag string) []int {
 	return ids
 }
 
-// fakeSource is a release source with fixed releases and no assets.
-type fakeSource struct{ releases []release.Info }
-
-func (f *fakeSource) Releases(context.Context) ([]release.Info, error) { return f.releases, nil }
-
-func (f *fakeSource) Open(_ context.Context, _ release.Version, asset string) (io.ReadCloser, error) {
-	return nil, fmt.Errorf("download %s: 404 Not Found", asset)
-}
-
 // fakeClock is a clock that Sleep moves forward.
 type fakeClock struct{ now time.Time }
 
@@ -927,8 +915,7 @@ func newTestInstaller(t *testing.T) *testInstaller {
 	scripted := &term.Scripted{}
 	clock := &fakeClock{now: time.Date(2026, 9, 26, 12, 0, 0, 0, time.UTC)}
 	v, _ := release.ParseVersion("0.2.0")
-	assets := filepath.Join(dir, "assets")
-	writeAssets(t, assets, v)
+	image := writeImage(t, filepath.Join(dir, "images"), "0.2.0", "2.338.0")
 	self := filepath.Join(dir, "self-parcon")
 	must(t, os.WriteFile(self, []byte("parcon 0.2.0"), 0o755))
 
@@ -948,8 +935,7 @@ func newTestInstaller(t *testing.T) *testInstaller {
 		ConvertManifest: node.convertManifest,
 		Self:            self,
 		Version:         v,
-		Assets:          assets,
-		Source:          &fakeSource{releases: []release.Info{{Version: v}}},
+		Image:           image,
 		Reach:           func(context.Context, string) error { return nil },
 		Now:             clock.Now,
 		Sleep:           clock.Sleep,
@@ -965,22 +951,16 @@ func newTestInstaller(t *testing.T) *testInstaller {
 	return &testInstaller{Installer: in, node: node, stdout: stdout, stderr: stderr, term: scripted, dir: dir}
 }
 
-// writeAssets writes a release's assets and their SHA256SUMS.
-func writeAssets(t *testing.T, dir string, v release.Version) {
+// writeImage writes a runner image of a release into dir, with its Packer manifest next to it, as
+// build-image.sh writes them, and returns the image's path.
+func writeImage(t *testing.T, dir, version, runnerVersion string) string {
 	t.Helper()
 	must(t, os.MkdirAll(dir, 0o755))
-	files := map[string]string{
-		runnerImage(v):    "runner image",
-		runnerManifest(v): `{"builds":[{"custom_data":{"runner_version":"2.338.0"}}]}`,
-		BinaryAsset(v):    "parcon " + v.String(),
-	}
-	var sums strings.Builder
-	for name, content := range files {
-		must(t, os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644))
-		sum := sha256.Sum256([]byte(content))
-		fmt.Fprintf(&sums, "%s  %s\n", hex.EncodeToString(sum[:]), name)
-	}
-	must(t, os.WriteFile(filepath.Join(dir, "SHA256SUMS"), []byte(sums.String()), 0o644))
+	image := filepath.Join(dir, "par-runner-"+version+".qcow2")
+	must(t, os.WriteFile(image, []byte("runner image "+version), 0o644))
+	must(t, os.WriteFile(strings.TrimSuffix(image, ".qcow2")+".json",
+		[]byte(`{"builds":[{"custom_data":{"runner_version":"`+runnerVersion+`"}}]}`), 0o644))
+	return image
 }
 
 func must(t *testing.T, err error) {
@@ -991,5 +971,3 @@ func must(t *testing.T, err error) {
 }
 
 func netipMust(s string) netip.Addr { return netip.MustParseAddr(s) }
-
-var defaultExecBinary = execBinary

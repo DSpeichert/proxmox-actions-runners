@@ -96,7 +96,7 @@ func (in *Installer) Preflight(ctx context.Context, s *settings.Settings, mode M
 		{Hard, "storage " + s.Proxmox.Storage, func() result { return in.checkStorage(ctx, s) }},
 		{Warn, "linked clones on " + s.Proxmox.Storage, func() result { return in.checkLinkedClones(ctx, s) }},
 		{Hard, "free space on " + s.Proxmox.Storage, func() result { return in.checkFreeSpace(ctx, s) }},
-		{Hard, "free space for downloads in " + DownloadDir, func() result { return in.checkDownloadSpace() }},
+		{Hard, "runner image", in.checkImage},
 		{Warn, "memory", func() result { return in.checkMemory(ctx, s) }},
 		{Hard, "LAN bridge " + s.Network.Bridge, func() result { return in.checkBridge(ctx, s) }},
 		{Warn, "LAN NIC offloads", func() result { return in.checkOffloads(ctx, s, mode) }},
@@ -208,9 +208,8 @@ func (in *Installer) checkClock(ctx context.Context) result {
 	return pass("")
 }
 
-// httpsHosts are what the installer and the controller reach: GitHub, its API, and the release asset hosts.
-var httpsHosts = []string{"github.com", "api.github.com", "objects.githubusercontent.com",
-	"release-assets.githubusercontent.com"}
+// httpsHosts are what the installer and the controller reach: GitHub and its API.
+var httpsHosts = []string{"github.com", "api.github.com"}
 
 func reachHTTPS(ctx context.Context, host string) error {
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
@@ -291,12 +290,16 @@ func (in *Installer) checkFreeSpace(ctx context.Context, s *settings.Settings) r
 	return result{avail >= FreeGiB, fmt.Sprintf("%d GiB free, %d GiB needed", avail, FreeGiB)}
 }
 
-func (in *Installer) checkDownloadSpace() result {
-	avail, err := in.Sys.FreeGiB(DownloadDir)
+// checkImage checks the runner image --image names, and its actions/runner version.
+func (in *Installer) checkImage() result {
+	if in.Image == "" {
+		return pass("none given; an install needs --image unless an earlier run imported its template")
+	}
+	img, err := in.image()
 	if err != nil {
 		return fail("%v", err)
 	}
-	return result{avail >= DownloadGiB, fmt.Sprintf("%d GiB free, %d GiB needed", avail, DownloadGiB)}
+	return pass("%s, actions/runner %s", img.path, img.runnerVersion)
 }
 
 // controllerMiB is the most memory the controller's service may use (MemoryMax in sandboxProperties).

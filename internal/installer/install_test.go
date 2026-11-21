@@ -553,3 +553,42 @@ func TestInstallWithAnExistingAppSaysWhereToInstallIt(t *testing.T) {
 		t.Errorf("last line while waiting = %q", shown)
 	}
 }
+
+// An install needs the runner image, unless an earlier run imported its template; the plan names where it comes
+// from.
+func TestInstallNeedsTheRunnerImage(t *testing.T) {
+	ti := newTestInstaller(t)
+	ti.answerManifest()
+	image := ti.Image
+	ti.Image = ""
+	if err := ti.Install(context.Background(), defaultOptions()); !errors.Is(err, errNoImage) {
+		t.Fatalf("Install without an image = %v", err)
+	}
+	if ti.node.ran("pveum") {
+		t.Error("an install without an image changed the node")
+	}
+	ti.Image = filepath.Join(ti.dir, "missing.qcow2")
+	if err := ti.Install(context.Background(), defaultOptions()); err == nil || !strings.Contains(err.Error(), "missing.qcow2") {
+		t.Fatalf("Install with a missing image = %v", err)
+	}
+
+	// The first run stops after the template; the second continues without the image.
+	ti.Image = image
+	ti.node.controller = func(argv []string) (int, string, string, bool) {
+		if slices.Contains(argv, "wait-installation") {
+			return 1, "", "timed out", true
+		}
+		return 0, "", "", false
+	}
+	if err := ti.Install(context.Background(), defaultOptions()); err == nil {
+		t.Fatal("the first run didn't stop")
+	}
+	if !strings.Contains(ti.stdout.String(), "imported from "+image+" (actions/runner 2.338.0)") {
+		t.Errorf("plan:\n%s", ti.stdout)
+	}
+	ti.node.controller, ti.Image = nil, ""
+	must(t, ti.Install(context.Background(), defaultOptions()))
+	if !strings.Contains(ti.stdout.String(), "the one an earlier run imported") {
+		t.Errorf("plan:\n%s", ti.stdout)
+	}
+}

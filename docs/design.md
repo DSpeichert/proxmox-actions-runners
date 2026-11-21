@@ -372,20 +372,16 @@ Alternatives that were rejected:
 
 ### Release trust
 
-`parcon update` replaces itself, which is the controller too, and imports the runner image, from a release on GitHub. Its
-trust anchor is a release signing key: the release workflow signs `SHA256SUMS` with an Ed25519 key held in a GitHub
-environment that only the release job on `main` can use, and `parcon` carries the public keys and refuses a release none of them verifies.
-It is checked with Go's standard library, so it adds no dependency.
+`parcon` downloads nothing. `parcon install --image PATH` and `parcon update --image PATH` import the runner image the
+user names, and an update installs the `parcon` the user runs. Whoever puts the two files on the node, as root,
+vouches for them. A release still publishes them with a `SHA256SUMS` the release workflow signs with an Ed25519 key
+held in a GitHub environment that only the release job on `main` can use, so users can check them; `install.sh`
+trusts only the checksum of `parcon` written into it.
 
 | Option | Why not |
 | ------ | ------- |
-| HTTPS and `SHA256SUMS` only | Anyone who can change a release's assets can change its checksums too |
+| `parcon` finds, downloads, and verifies releases itself | A release lookup, a downloader, and signature checks in the tool that runs as root, for what `scp` and a checksum do; and every install would need GitHub's release hosts |
 | GitHub artifact attestations (Sigstore) | Strong and keyless, but verifying them needs a large dependency tree in `parcon` |
-| Checksums written into each `parcon` | A release can't know the checksums of the releases after it |
-
-The first install still starts from `install.sh`, which trusts only the checksum of `parcon` written into it, the
-same trust as downloading `parcon` from the release page. A leaked signing key can't be revoked: after a leak,
-the key is rotated and users reinstall from a new release's `install.sh`.
 
 ## Sources
 

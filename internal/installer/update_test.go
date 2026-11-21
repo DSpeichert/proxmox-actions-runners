@@ -1,16 +1,11 @@
 package installer
 
 import (
-	"bytes"
 	"context"
-	"crypto/ed25519"
-	"crypto/rand"
-	"crypto/sha256"
-	"encoding/hex"
-	"fmt"
-	"io"
 	"os"
+	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -19,113 +14,40 @@ import (
 	"github.com/klponce/proxmox-actions-runners/internal/vmtags"
 )
 
-// signedSource serves releases whose SHA256SUMS a test key signs.
-type signedSource struct {
-	releases []release.Info
-	files    map[string][]byte // "version/asset"
-}
-
-func (s *signedSource) Releases(context.Context) ([]release.Info, error) { return s.releases, nil }
-
-func (s *signedSource) Open(_ context.Context, v release.Version, asset string) (io.ReadCloser, error) {
-	data, ok := s.files[v.String()+"/"+asset]
-	if !ok {
-		return nil, fmt.Errorf("download %s: 404 Not Found", asset)
-	}
-	return io.NopCloser(bytes.NewReader(data)), nil
-}
-
-// publish adds a signed release with the usual assets.
-func (s *signedSource) publish(t *testing.T, key ed25519.PrivateKey, version string) release.Version {
+// newRelease makes ti the parcon of another release, run from where the user put it, as an update runs it.
+func newRelease(t *testing.T, ti *testInstaller, version string) release.Version {
 	t.Helper()
 	v, err := release.ParseVersion(version)
 	must(t, err)
-	assets := map[string]string{
-		runnerImage(v):    "runner image " + version,
-		runnerManifest(v): `{"builds":[{"custom_data":{"runner_version":"2.339.0"}}]}`,
-		BinaryAsset(v):    "parcon " + version,
-	}
-	var sums strings.Builder
-	for name, content := range assets {
-		sum := sha256.Sum256([]byte(content))
-		fmt.Fprintf(&sums, "%s  %s\n", hex.EncodeToString(sum[:]), name)
-		s.files[version+"/"+name] = []byte(content)
-	}
-	s.files[version+"/SHA256SUMS"] = []byte(sums.String())
-	s.files[version+"/SHA256SUMS.sig"] = ed25519.Sign(key, []byte(sums.String()))
-	s.releases = append(s.releases, release.Info{Version: v})
+	self := filepath.Join(ti.dir, "parcon-"+version)
+	must(t, os.WriteFile(self, []byte("parcon "+version), 0o755))
+	ti.Self, ti.Version, ti.Image, ti.Yes = self, v, "", true
 	return v
 }
 
-func TestUpdateInstallsTheNewParconAndRunsIt(t *testing.T) {
+// An update runs the new parcon: it installs itself and, given an image, imports it, then restarts the controller.
+func TestUpdateToANewParconAndImage(t *testing.T) {
 	ti := installed(t)
-	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
-	src := &signedSource{files: map[string][]byte{}}
-	src.publish(t, priv, "0.2.0")
-	src.publish(t, priv, "0.3.0-rc.1")
-	ti.Source, ti.Keys, ti.Assets = src, []ed25519.PublicKey{pub}, ""
-	ti.Yes = true
-	var execed []string
-	execBinary = func(path string, args []string) error { execed = append([]string{path}, args...); return nil }
-	t.Cleanup(func() { execBinary = defaultExecBinary })
-
-	// Without --pre, 0.2.0 is the newest, and the node is at it.
+	newRelease(t, ti, "0.3.0")
+	ti.Image = writeImage(t, filepath.Join(ti.dir, "new"), "0.3.0", "2.339.0")
 	must(t, ti.Update(context.Background(), UpdateOptions{}))
-	if execed != nil || !strings.Contains(ti.stdout.String(), "nothing needs updating") {
-		t.Fatalf("update without --pre: exec %v\n%s", execed, ti.stdout)
-	}
-
-	// With --pre, parcon 0.3.0-rc.1 replaces this one and finishes the update.
-	must(t, ti.Update(context.Background(), UpdateOptions{Pre: true}))
-	if data, _ := os.ReadFile(ti.BinaryPath); string(data) != "parcon 0.3.0-rc.1" {
-		t.Errorf("host binary = %q", data)
-	}
-	want := []string{ti.BinaryPath, ti.BinaryPath, "update", "--continue", "--yes", "--pre"}
-	if !slices.Equal(execed, want) {
-		t.Errorf("exec %v, want %v", execed, want)
-	}
-}
-
-func TestUpdateRefusesAnUnsignedRelease(t *testing.T) {
-	ti := installed(t)
-	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
-	_, other, _ := ed25519.GenerateKey(rand.Reader)
-	src := &signedSource{files: map[string][]byte{}}
-	src.publish(t, other, "0.3.0")
-	ti.Source, ti.Keys, ti.Assets, ti.Yes = src, []ed25519.PublicKey{pub}, "", true
-	_ = priv
-	before, _ := os.ReadFile(ti.BinaryPath)
-	err := ti.Update(context.Background(), UpdateOptions{})
-	if err == nil || !strings.Contains(err.Error(), "doesn't verify") {
-		t.Errorf("Update = %v", err)
-	}
-	if after, _ := os.ReadFile(ti.BinaryPath); !bytes.Equal(before, after) {
-		t.Error("the host binary changed")
-	}
-}
-
-func TestUpgradeBringsTheNodeToTheRelease(t *testing.T) {
-	ti := installed(t)
-	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
-	src := &signedSource{files: map[string][]byte{}}
-	v := src.publish(t, priv, "0.3.0")
-	ti.Source, ti.Keys, ti.Assets, ti.Version, ti.Yes = src, []ed25519.PublicKey{pub}, "", v, true
-	// The new parcon, as an update runs it: the old one installed it in place first.
-	must(t, os.WriteFile(ti.BinaryPath, []byte("parcon 0.3.0"), 0o755))
-	ti.Self = ti.BinaryPath
-
-	installedV, _ := release.ParseVersion("0.2.0")
-	must(t, ti.Upgrade(context.Background(), installedV, true, false))
 	out := ti.stdout.String()
-	for _, want := range []string{"import the 0.3.0 runner template", "render the controller's config",
-		"record release 0.3.0"} {
+	for _, want := range []string{"install parcon 0.3.0 as " + ti.BinaryPath, "import " + ti.Image + " as a new " +
+		"runner template", "render the controller's config", "record release 0.3.0"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("plan lacks %q:\n%s", want, out)
 		}
 	}
 	n := ti.node
-	if tmpl := n.vmsTagged("par-release-0.3.0"); len(tmpl) != 1 {
+	if data, _ := os.ReadFile(ti.BinaryPath); string(data) != "parcon 0.3.0" {
+		t.Errorf("host binary = %q", data)
+	}
+	tmpl := n.vmsTagged("par-release-0.3.0")
+	if len(tmpl) != 1 || !slices.Contains(n.vms[tmpl[0]].tags, "par-rv-2.339.0") {
 		t.Errorf("templates of 0.3.0: %v", tmpl)
+	}
+	if !n.ran("qm set " + strconv.Itoa(tmpl[0]) + " --scsi0 local-lvm:0,import-from=" + ti.Image) {
+		t.Errorf("the image wasn't imported from its path:\n%s", strings.Join(n.lines(), "\n"))
 	}
 	if s, _ := settings.Load(ti.SettingsPath); s.Installed != "0.3.0" {
 		t.Errorf("installed = %q", s.Installed)
@@ -134,12 +56,49 @@ func TestUpgradeBringsTheNodeToTheRelease(t *testing.T) {
 		t.Errorf("the controller wasn't restarted: %v", n.lines())
 	}
 
-	// Once there, another upgrade has nothing to do.
+	// Once there, another update has nothing to do, and looks nothing up.
 	n.calls = nil
 	ti.stdout.Reset()
-	must(t, ti.Upgrade(context.Background(), v, true, false))
+	ti.Self, ti.Image = ti.BinaryPath, ""
+	must(t, ti.Update(context.Background(), UpdateOptions{}))
 	if !strings.Contains(ti.stdout.String(), "nothing needs updating") || n.ran("pvesh create") {
-		t.Errorf("second upgrade:\n%s", ti.stdout)
+		t.Errorf("second update:\n%s", ti.stdout)
+	}
+}
+
+// Without an image, an update keeps the runner template, and says how to import a new one.
+func TestUpdateWithoutAnImageKeepsTheTemplate(t *testing.T) {
+	ti := installed(t)
+	newRelease(t, ti, "0.3.0")
+	templates := ti.node.vmsTagged(vmtags.Template)
+	must(t, ti.Update(context.Background(), UpdateOptions{}))
+	if !strings.Contains(ti.stdout.String(), "(the runner template stays; --image PATH imports a new one)") {
+		t.Errorf("plan:\n%s", ti.stdout)
+	}
+	if now := ti.node.vmsTagged(vmtags.Template); !slices.Equal(now, templates) {
+		t.Errorf("templates %v, then %v", templates, now)
+	}
+}
+
+// The image's actions/runner version comes from its manifest, or from --runner-version without one.
+func TestUpdateImageWithoutAManifest(t *testing.T) {
+	ti := installed(t)
+	v := newRelease(t, ti, "0.3.0")
+	ti.Image = filepath.Join(ti.dir, "custom.qcow2")
+	must(t, os.WriteFile(ti.Image, []byte("my image"), 0o644))
+	err := ti.Update(context.Background(), UpdateOptions{})
+	if err == nil || !strings.Contains(err.Error(), "custom.json") || !strings.Contains(err.Error(), "--runner-version") {
+		t.Fatalf("Update = %v", err)
+	}
+	ti.RunnerVersion = "banana"
+	if err := ti.Update(context.Background(), UpdateOptions{}); err == nil || !strings.Contains(err.Error(), "banana") {
+		t.Errorf("Update with a bad runner version = %v", err)
+	}
+	ti.RunnerVersion = "2.340.0"
+	must(t, ti.Update(context.Background(), UpdateOptions{}))
+	tmpl := ti.node.vmsTagged("par-release-" + v.String())
+	if len(tmpl) != 1 || !slices.Contains(ti.node.vms[tmpl[0]].tags, "par-rv-2.340.0") {
+		t.Errorf("templates of %s: %v", v, tmpl)
 	}
 }
 

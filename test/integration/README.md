@@ -78,11 +78,10 @@ devcontainer exec --workspace-folder . ... \
   test/integration/run.sh installer
 ```
 
-It builds `parcon`, stamped with the image's version, and copies it and the image, as release assets with a
-`SHA256SUMS`, to `/var/tmp/par-it-installer` on the node, then:
+It builds `parcon`, stamped with the image's version, and copies it, the image, and the image's manifest to
+`/var/tmp/par-it-installer` on the node, then:
 
-1. runs `parcon install --dry-run` with the local assets (`--assets`, which trusts their `SHA256SUMS` instead of a
-   signed release), and checks that it changed nothing on the node or its files;
+1. runs `parcon install --dry-run --image <the image>`, and checks that it changed nothing on the node or its files;
 2. runs `parcon install --stop-after configure`: parcon and its settings on the host, the Proxmox access objects, the
    worker network and firewall, the runner template, and the controller's config, unit, and encrypted token, which
    ends with `parcon check proxmox` as the controller, in its sandbox;

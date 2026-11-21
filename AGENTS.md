@@ -138,8 +138,8 @@ internal/installer/    the host commands: preflight, plan, install steps, status
                        uninstall; the controller's unit, sandbox, and credentials
 internal/pvecli/       Proxmox through pvesh, pveum, and qm on the host; the Changer that logs every change
 internal/hostsys/      host facts: addresses, routes, NICs, ethtool, memory, the API's certificate
-internal/release/      release lookup, SHA256SUMS signature verification, verified downloads; keys/ holds the
-                       public release signing keys
+internal/release/      the release version and installing the parcon binary; keys/ holds the public release
+                       signing keys, which the release workflow checks its signature against
 internal/term/         questions on /dev/tty and step output for the host commands
 internal/github/       thin wrapper over actions/scaleset: GitHub App auth, scale set, message session, JIT configs
 internal/proxmox/      Proxmox API client wrapper: clone, configure, start, stop, destroy, list by tag, guest-agent writes
@@ -273,9 +273,9 @@ See [docs/install.md](docs/install.md) for the full design.
   `qm guest exec --pass-stdin`. A test runs a whole install with sentinel secrets and checks every command line,
   output, error, and host file for them; keep it passing.
 - Use only tools that ship with Proxmox VE 9, through `pvecli` or `hostsys`. Parse their JSON in Go.
-- Download only release assets listed in a `SHA256SUMS` whose signature a key in `internal/release/keys` verifies,
-  into a temporary directory removed afterward. `--assets` (for the integration suite and development builds) is the
-  one exception: whoever put the files there, as root, vouches for them.
+- `parcon` downloads nothing. It installs the binary the user runs and imports the runner image they name with
+  `--image` (its `actions/runner` version from the Packer manifest next to it, or `--runner-version`); whoever puts
+  them on the node, as root, vouches for them. Don't add release lookups or downloads back.
 - Push the controller's config as `config.yaml.new`, have the controller's own `parcon check config` accept it, and
   only then move it into place. A config the controller's version can't read must never replace a working one.
 - Hold the lock (`Installer.Lock`) in every command that changes the node.
@@ -301,7 +301,7 @@ See [docs/install.md](docs/install.md) for the full design.
   release-asset limit.
 - Pin the `actions/runner` version and its SHA-256 (`runner_version` and `runner_sha256` in `runner.pkr.hcl`) and
   disable runner auto-update. GitHub stops accepting a runner that doesn't update itself 30 days after a newer
-  release, so each runner release needs a new runner image, imported by `parcon update`. The controller logs a
+  release, so each runner release needs a new runner image, imported by `parcon update --image`. The controller logs a
   warning 7 days after a release its template lacks and an error after 21 (`parcon check template` shows the same).
 - Scripts run in order: `images/common/base.sh` (system upgrade, `qemu-guest-agent`, and `net.ifnames=0`, shared
   with the other images), `scripts/base.sh` (the `runner` user, automatic updates off),
@@ -394,26 +394,24 @@ commit messages are the release process. Follow these rules exactly.
   cause and re-run the failed jobs, which the draft waits for.
 - **Pre-releases**, to test a release on a node first: add a `Release-As: 0.2.0-rc.1` footer to a commit (an empty
   `chore` commit is fine). The release pull request then proposes that version, and publish marks any version with
-  a suffix as a pre-release, which `releases/latest` skips and `parcon update --pre` takes.
+  a suffix as a pre-release, which `releases/latest` skips.
 - `install/fill-release.sh` writes the version and `parcon`'s checksum into `install.sh`, which refuses a `parcon`
-  that doesn't match; `parcon` refuses a release whose `SHA256SUMS.sig` no key in `internal/release/keys` verifies,
-  and any asset that doesn't match `SHA256SUMS`.
+  that doesn't match. `parcon` itself checks no signature; users check a release's files against its signed
+  `SHA256SUMS` with a key in `internal/release/keys`.
 - **Running the workflow by hand** checks and builds everything as `0.0.0-dev.<run>` and keeps the files as workflow
   artifacts, unsigned, without releasing.
 - **Release signing**: the `publish` job runs in the `release` environment, whose `RELEASE_SIGNING_KEY` secret holds
   an Ed25519 private key in PEM. It signs `SHA256SUMS` with `openssl pkeyutl -sign -rawin`, then checks the
-  signature against every public key in `internal/release/keys` before it publishes, so a release `parcon` would
-  refuse is never published. Limit the environment to the `main` branch (Settings → Environments → release →
+  signature against every public key in `internal/release/keys` before it publishes, so a release users can't
+  verify is never published. Limit the environment to the `main` branch (Settings → Environments → release →
   deployment branches and tags), since releases run on pushes to `main`.
   - Create a key with `openssl genpkey -algorithm ed25519 -out release-signing.pem`, put the whole file in the
     secret, and commit its public key: `openssl pkey -in release-signing.pem -pubout -out
     internal/release/keys/<year>-<n>.pem`. Keep an offline copy of the private key, and never commit it or put it
     in `.agents/`.
-  - To rotate, commit the new public key next to the old one and release with the old key, so installed `parcon`s
-    trust both; then switch the secret to the new key, and drop the old public key a release later.
-  - There is no revocation: a leaked key can sign releases that installed `parcon`s accept until they update past
-    one that drops it. After a leak, rotate at once and tell users to reinstall with a new release's `install.sh`,
-    which trusts only its written-in checksum.
+  - To rotate, commit the new public key next to the old one and release with the old key; then switch the secret
+    to the new key, and drop the old public key a release later.
+  - There is no revocation: after a leak, rotate at once and tell users which releases to distrust.
 - **actions/runner** (`runner-release.yml`): a daily job opens a pull request, `fix(images): update actions/runner
   to X`, that bumps the runner image's pin when a new release is out (`.github/scripts/bump-runner.sh`). Merge it,
   then the release pull request, within GitHub's 30-day window.

@@ -124,7 +124,7 @@ func TestStatus(t *testing.T) {
 		t.Errorf("progress:\n%s", progress)
 	}
 	for _, want := range []string{"ok    node pve1, its settings, and its VMs (",
-		"ok    the controller's service (", "ok    the latest release on GitHub (",
+		"ok    the controller's service (",
 		"ok    the host's Proxmox objects and tuning (",
 		"ok    the runner template against actions/runner's latest release ("} {
 		if !strings.Contains(progress, want) {
@@ -135,7 +135,6 @@ func TestStatus(t *testing.T) {
 	r.Render(&out, ti.Now())
 	for _, want := range []string{
 		"proxmox-actions-runners 0.2.0 on pve1",
-		"up to date with the latest release, 0.2.0",
 		"ok    pools, role, token, and the worker network parzone/parnet",
 		"ok    worker subnet 10.251.0.0/22 with SNAT and DHCP; firewall group par-worker and IP set par-blocked",
 		"Controller (parcon.service)", "parcon.service is active", "its config matches the settings",

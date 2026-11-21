@@ -7,11 +7,11 @@
 //
 // Usage on the Proxmox host:
 //
-//	parcon install [flags]
+//	parcon install --image PATH [flags]
 //	parcon status [-json]
 //	parcon config get <key> | get --all | set <key> <value> | describe [<key>] | apply
 //	parcon target list [-json] | add -github-url URL | remove URL
-//	parcon update [-pre] [-yes] [-dry-run]
+//	parcon update [-image PATH] [-force] [-yes] [-dry-run]
 //	parcon check [network|config|proxmox|github|template]
 //	parcon uninstall [-yes] [-dry-run]
 //	parcon version
@@ -39,8 +39,8 @@ import (
 var version = ""
 
 const hostUsage = `usage on the Proxmox host, as root:
-  parcon install [flags]                install the runners on this node, or continue an install that stopped;
-                                        parcon install -h lists the flags
+  parcon install -image PATH [flags]    install the runners on this node, or continue an install that stopped;
+                                        PATH is the runner image; parcon install -h lists the flags
   parcon status [-json]                 the state of the whole install
   parcon config get <key>               print a setting
   parcon config get --all               print every setting, with its default and what it is
@@ -52,9 +52,9 @@ const hostUsage = `usage on the Proxmox host, as root:
                                         serve another organization or repository too
   parcon target remove URL [-yes] [-dry-run]
                                         stop serving one; its scale sets are deleted in GitHub
-  parcon update [-pre] [-yes] [-dry-run]
-                                        update to the newest release (-pre: or pre-release), once its signature
-                                        checks out; running it again continues an update that stopped
+  parcon update [-image PATH] [-force] [-yes] [-dry-run]
+                                        bring the install to this parcon (run the new one), and with -image import
+                                        a new runner image; running it again continues an update that stopped
   parcon uninstall [-yes] [-dry-run]    remove everything parcon created, and parcon itself
   parcon check                          check this node, and after an install, the controller too
   parcon check network                  check the worker network from a throwaway worker

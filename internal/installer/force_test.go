@@ -2,9 +2,8 @@ package installer
 
 import (
 	"context"
-	"crypto/ed25519"
-	"crypto/rand"
 	"errors"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -13,16 +12,12 @@ import (
 	"github.com/klponce/proxmox-actions-runners/internal/vmtags"
 )
 
-// sameRelease makes ti an update of its node to the release it is already at, served signed as a real update
-// would be.
+// sameRelease makes ti an update of its node to the release it is already at, run as the installed parcon, with no
+// new image.
 func sameRelease(t *testing.T, ti *testInstaller) release.Version {
 	t.Helper()
-	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
-	src := &signedSource{files: map[string][]byte{}}
-	v := src.publish(t, priv, ti.Version.String())
-	ti.Source, ti.Keys, ti.Assets, ti.Yes = src, []ed25519.PublicKey{pub}, "", true
-	ti.Self = ti.BinaryPath
-	return v
+	ti.Self, ti.Image, ti.Yes = ti.BinaryPath, "", true
+	return ti.Version
 }
 
 func TestUpgradeForceRunsEveryStep(t *testing.T) {
@@ -40,22 +35,30 @@ func TestUpgradeForceRunsEveryStep(t *testing.T) {
 	ti.stdout.Reset()
 	must(t, ti.Upgrade(ctx, v, true, true))
 	out := ti.stdout.String()
-	for _, want := range []string{"import the 0.2.0 runner template again",
-		"check the worker network and firewall, and set them up again",
+	for _, want := range []string{"check the worker network and firewall, and set them up again",
 		"render the controller's config", "check the LAN NIC's offloads", "check KVM async page faults",
-		"record release 0.2.0",
-		"importing a new one anyway"} {
+		"record release 0.2.0"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("forced update lacks %q:\n%s", want, out)
 		}
 	}
 	n := ti.node
-	// The old template stays for the controller to remove once unused; a new one joins it.
-	if now := n.vmsTagged(vmtags.Template); len(now) != len(templates)+1 || !slices.Contains(now, templates[0]) {
+	// Without an image, --force keeps the template.
+	if now := n.vmsTagged(vmtags.Template); !slices.Equal(now, templates) {
 		t.Errorf("templates %v, then %v", templates, now)
 	}
 	if !n.ran("systemctl try-restart parcon.service") {
 		t.Errorf("the controller wasn't restarted: %v", n.lines())
+	}
+
+	// With the same image again, it imports it again; the old template stays for the controller to remove once unused.
+	ti.Image = writeImage(t, filepath.Join(ti.dir, "again"), v.String(), "2.338.0")
+	must(t, ti.Upgrade(ctx, v, true, true))
+	if now := n.vmsTagged(vmtags.Template); len(now) != len(templates)+1 || !slices.Contains(now, templates[0]) {
+		t.Errorf("templates %v, then %v", templates, now)
+	}
+	if !strings.Contains(ti.stdout.String(), "importing a new one anyway") {
+		t.Errorf("output:\n%s", ti.stdout)
 	}
 }
 
@@ -121,21 +124,5 @@ func TestUpgradeRefusesWithoutTheDatacenterFirewall(t *testing.T) {
 	ti.node.clusterFW = false
 	if err := ti.Upgrade(context.Background(), v, true, false); !errors.Is(err, errNoClusterFirewall) {
 		t.Errorf("Upgrade = %v", err)
-	}
-}
-
-func TestUpdateForcePassesItOnToTheNewParcon(t *testing.T) {
-	ti := installed(t)
-	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
-	src := &signedSource{files: map[string][]byte{}}
-	src.publish(t, priv, "0.3.0")
-	ti.Source, ti.Keys, ti.Assets, ti.Yes = src, []ed25519.PublicKey{pub}, "", true
-	var execed []string
-	execBinary = func(path string, args []string) error { execed = append([]string{path}, args...); return nil }
-	t.Cleanup(func() { execBinary = defaultExecBinary })
-
-	must(t, ti.Update(context.Background(), UpdateOptions{Force: true}))
-	if !slices.Equal(execed, []string{ti.BinaryPath, ti.BinaryPath, "update", "--continue", "--yes", "--force"}) {
-		t.Errorf("exec %v", execed)
 	}
 }

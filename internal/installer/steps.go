@@ -3,9 +3,12 @@ package installer
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/netip"
 	"os"
+	"path/filepath"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -14,7 +17,6 @@ import (
 	"github.com/klponce/proxmox-actions-runners/internal/config"
 	"github.com/klponce/proxmox-actions-runners/internal/proxmox"
 	"github.com/klponce/proxmox-actions-runners/internal/pvecli"
-	"github.com/klponce/proxmox-actions-runners/internal/release"
 	"github.com/klponce/proxmox-actions-runners/internal/settings"
 	"github.com/klponce/proxmox-actions-runners/internal/vmtags"
 )
@@ -200,42 +202,64 @@ func (in *Installer) networkDrift(ctx context.Context, s *settings.Settings) []s
 	return nil
 }
 
-// Asset names of a release.
-func runnerImage(v release.Version) string    { return "par-runner-" + v.String() + ".qcow2" }
-func runnerManifest(v release.Version) string { return "par-runner-" + v.String() + ".json" }
-
-// BinaryAsset is the release's parcon binary.
-func BinaryAsset(v release.Version) string { return "parcon-" + v.String() + "-linux-amd64" }
-
-// assets returns this release's assets: the local directory given with Assets, or the signed release, downloaded
-// into a temporary directory under DownloadDir that cleanup removes.
-func (in *Installer) assets(ctx context.Context) (a *release.Assets, cleanup func(), err error) {
-	if in.Assets != "" {
-		a, err := release.Local(in.Assets, in.Version)
-		return a, func() {}, err
-	}
-	dir, err := os.MkdirTemp(DownloadDir, "par-install.")
-	if err != nil {
-		return nil, nil, fmt.Errorf("make a download directory: %w", err)
-	}
-	cleanup = func() { _ = os.RemoveAll(dir) }
-	a, err = release.Fetch(ctx, in.Source, in.Version, dir, in.Keys)
-	if err != nil {
-		cleanup()
-		return nil, nil, err
-	}
-	return a, cleanup, nil
+// runnerImage is a runner image to import, and the actions/runner version it carries.
+type runnerImage struct {
+	path, runnerVersion string
 }
 
-// get returns a verified asset's path, saying so when it downloads one.
-func (in *Installer) get(ctx context.Context, a *release.Assets, name string) (string, error) {
-	in.Out.Say("    %s", name)
-	return a.Get(ctx, name)
+// errNoImage is an install that needs a runner image and wasn't given one.
+var errNoImage = errors.New("--image is required: the runner image, par-runner-<version>.qcow2, built from " +
+	"images/runner (.github/scripts/build-image.sh runner VERSION), with its .json manifest next to it or " +
+	"--runner-version")
+
+// runnerVersionPattern is an actions/runner version, which becomes a tag.
+var runnerVersionPattern = regexp.MustCompile(`^[0-9]+\.[0-9]+\.[0-9]+$`)
+
+// image returns the runner image Image names, with its actions/runner version: RunnerVersion, or the one in the
+// image's Packer manifest next to it (the image's name with .json for .qcow2), as build-image.sh writes them.
+func (in *Installer) image() (runnerImage, error) {
+	if in.Image == "" {
+		return runnerImage{}, errNoImage
+	}
+	path, err := filepath.Abs(in.Image)
+	if err != nil {
+		return runnerImage{}, err
+	}
+	st, err := os.Stat(path)
+	if err != nil {
+		return runnerImage{}, fmt.Errorf("runner image: %w", err)
+	}
+	if !st.Mode().IsRegular() || st.Size() == 0 {
+		return runnerImage{}, fmt.Errorf("runner image %s isn't a disk image", path)
+	}
+	rv := in.RunnerVersion
+	if rv == "" {
+		manifest := strings.TrimSuffix(path, filepath.Ext(path)) + ".json"
+		if rv, err = runnerVersion(manifest); err != nil {
+			return runnerImage{}, fmt.Errorf("runner image %s: %w; put its Packer manifest next to it as %s, or "+
+				"pass --runner-version", path, err, filepath.Base(manifest))
+		}
+	}
+	if !runnerVersionPattern.MatchString(rv) {
+		return runnerImage{}, fmt.Errorf("actions/runner version %q isn't a version such as 2.330.0", rv)
+	}
+	return runnerImage{path: path, runnerVersion: rv}, nil
+}
+
+// hasTemplate reports whether a runner template from this release exists.
+func (in *Installer) hasTemplate(ctx context.Context) (bool, error) {
+	vms, err := in.vms(ctx)
+	if err != nil {
+		return false, err
+	}
+	return slices.ContainsFunc(tagged(vms, RunnerPool, in.releaseTag()), func(vm proxmox.VM) bool {
+		return vm.Template
+	}), nil
 }
 
 // runnerVersion reads the actions/runner version from the runner image's Packer manifest.
 func runnerVersion(path string) (string, error) {
-	data, err := os.ReadFile(path) //nolint:gosec // G304: a verified asset.
+	data, err := os.ReadFile(path) //nolint:gosec // G304: the manifest next to the image the user names.
 	if err != nil {
 		return "", err
 	}
@@ -266,10 +290,10 @@ func freeReservedVMID(vms []proxmox.VM, r config.VMIDRange) (int, error) {
 	return 0, fmt.Errorf("no free VMID in the reserved IDs at the end of %d-%d", r.Start, r.End)
 }
 
-// importTemplate imports the runner image as a new template in the reserved VMIDs, unless one from this release
-// exists and again is false. The template tags come first, so a failed import is found and replaced by the next
-// run; the controller only clones a VM that Proxmox reports as a template, and removes older ones once unused.
-func (in *Installer) importTemplate(ctx context.Context, s *settings.Settings, a *release.Assets, again bool) error {
+// importTemplate imports the runner image (Image) as a new template in the reserved VMIDs, unless one from this
+// release exists and again is false. The template tags come first, so a failed import is found and replaced by the
+// next run; the controller only clones a VM that Proxmox reports as a template, and removes older ones once unused.
+func (in *Installer) importTemplate(ctx context.Context, s *settings.Settings, again bool) error {
 	in.Out.Step("Runner template")
 	vms, err := in.vms(ctx)
 	if err != nil {
@@ -292,18 +316,12 @@ func (in *Installer) importTemplate(ctx context.Context, s *settings.Settings, a
 		}
 		vms = slices.DeleteFunc(vms, func(vm proxmox.VM) bool { return vm.VMID == t.VMID })
 	}
-	image, err := in.get(ctx, a, runnerImage(in.Version))
+	img, err := in.image()
 	if err != nil {
 		return err
 	}
-	manifest, err := in.get(ctx, a, runnerManifest(in.Version))
-	if err != nil {
-		return err
-	}
-	rv, err := runnerVersion(manifest)
-	if err != nil {
-		return err
-	}
+	in.Out.Say("    %s, actions/runner %s", img.path, img.runnerVersion)
+	image, rv := img.path, img.runnerVersion
 	vmid, err := freeReservedVMID(vms, s.Proxmox.VMIDRange)
 	if err != nil {
 		return err

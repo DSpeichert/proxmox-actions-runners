@@ -3,15 +3,15 @@
 `parcon`, run as root on a standalone Proxmox VE 9 node, installs and manages the whole project. `parcon install`
 checks the host, creates the worker network and its firewall, imports the runner template, sets up the controller as
 `parcon.service` on the host, and registers the scale set. After that, `parcon status`, `parcon config`,
-`parcon target`, `parcon update`, and `parcon uninstall` are how the user runs it. [`install/install.sh`](../install/install.sh) is only the bootstrap: it
-downloads the release's `parcon`, checks it against the checksum written into it, and runs `parcon install`.
+`parcon target`, `parcon update`, and `parcon uninstall` are how the user runs it.
 
 `parcon` changes the host only where the project needs it, almost entirely through Proxmox's own tools, and it can
-remove everything it created. It installs only from a signed release.
+remove everything it created. It downloads nothing: the user brings `parcon` and the runner image, and names the image
+with `--image`.
 
 ## Goals
 
-- **One download, one command.** No clone and no build tools. The one package to install first is Proxmox's own
+- **Two files, one command.** `parcon` and the runner image. The one package to install first is Proxmox's own
   prerequisite for SDN DHCP, `dnsmasq`, and the one setting to turn on first is the datacenter firewall: `parcon`
   checks both and says how, but leaves them to the user.
 - **Headless.** `parcon` runs in a root shell with no browser. The only browser step, creating the GitHub App,
@@ -34,28 +34,26 @@ remove everything it created. It installs only from a signed release.
 - **Safe to re-run.** A second `parcon install` continues an install that stopped, and `parcon update` continues an
   update that stopped. `parcon update --force` runs every step of an update again, to repair what a run that was
   killed partway or anything else left broken. `--dry-run` prints the plan and changes nothing.
-- **Signed updates.** `parcon update` installs only a release whose checksums carry a signature from a key built
-  into `parcon`.
+- **Nothing fetched.** `parcon` installs and updates only from the binary the user runs and the image they name. It
+  reaches GitHub only for the GitHub App and the scale sets, and to see whether `actions/runner` has a newer release.
 - **Reversible.** `parcon uninstall` removes every object `parcon` or the controller created, found by tag and name,
   and `parcon` itself.
 
 ## Usage
 
-Download, read, then run the bootstrap:
+Bring `parcon` (built with `-ldflags "-X main.version=<version>"`) and the runner image, `par-runner-<version>.qcow2`
+with its Packer manifest `par-runner-<version>.json` next to it, to the node: from a release, or built in the dev
+container (`.github/scripts/build-image.sh runner <version>`). Then, as root:
 
 ```bash
-curl -fsSLO https://github.com/klponce/proxmox-actions-runners/releases/latest/download/install.sh
-less install.sh
-bash install.sh
+./parcon install --image /var/tmp/par-runner-0.3.0.qcow2
 ```
 
-Or run it in one line:
+Without the manifest, `--runner-version` gives the image's `actions/runner` version. A release's
+[`install.sh`](../install/install.sh) is a bootstrap that fetches the release's `parcon`, checks it against the
+checksum written into it, and passes its arguments on: `bash install.sh --image PATH`.
 
-```bash
-bash -c "$(curl -fsSL https://github.com/klponce/proxmox-actions-runners/releases/latest/download/install.sh)"
-```
-
-`install.sh` passes its arguments to `parcon install`. Every setting has a default, so `parcon` asks only for
+Every setting has a default, so `parcon` asks only for
 confirmation and for the GitHub App step (see *GitHub App setup*), where you choose the organization or repository on
 GitHub. `parcon install -h` lists the settings:
 
@@ -94,7 +92,7 @@ After the install, `parcon` in `/usr/local/bin` does the rest:
 | `parcon target list [--json]` | The organizations and repositories the runners serve, each with its App, installation, and session |
 | `parcon target add --github-url URL [--app manual --client-id ID] [--yes] [--dry-run]` | Serve another organization or repository too (see *Several GitHub targets*) |
 | `parcon target remove URL [--yes] [--dry-run]` | Stop serving one: delete its scale set in GitHub, then push the config without it, which destroys its workers |
-| `parcon update [--pre] [--force] [--yes] [--dry-run]` | Update to the newest release, or pre-release with `--pre`. `--force` runs every step, even those already done for the release |
+| `parcon update [--image PATH [--runner-version V]] [--force] [--yes] [--dry-run]` | Run with a new `parcon`: install it and bring the node to it; with `--image`, import a new runner template. `--force` runs every step, even those already done |
 | `parcon check` | Every check below, and after an install, the controller's own checks |
 | `parcon check network` | The worker network check from step 12, on demand |
 | `parcon check config\|proxmox\|github\|template` | One of the controller's checks, run in its sandbox |
@@ -163,22 +161,10 @@ published, and the release stays a draft until every file is uploaded.
 | `SHA256SUMS` | Checksums of all of the above | Release workflow |
 | `SHA256SUMS.sig` | An Ed25519 signature of `SHA256SUMS` by the release signing key | Release workflow |
 
-The chain of trust:
-
-1. `install.sh` holds the version and `parcon`'s SHA-256 (its `@PAR_VERSION@` and `@PAR_PARCON_SHA256@`
-   placeholders, filled by `install/fill-release.sh`), and runs a downloaded `parcon` only if it matches. A copy from
-   the source tree refuses to run.
-2. `parcon` carries the public release signing keys (`internal/release/keys`). It accepts a release only if one of
-   them verifies its `SHA256SUMS.sig`, then checks every asset it downloads against `SHA256SUMS`. `parcon update`
-   does the same from the running `parcon`, so an update needs neither a new `install.sh` nor trust in anything but
-   the key.
-3. The release workflow signs with a key only its `publish` job can read (the `release` environment admits only
-   `main`), and checks the signature against those public keys before it publishes (see *Release signing* in
-   [AGENTS.md](../AGENTS.md)).
-
-A version with a suffix, such as `0.2.0-rc.1`, is published as a pre-release: its `install.sh` installs it and
-`parcon update --pre` updates to it, but the `releases/latest` links in *Usage* and a plain `parcon update` keep to
-the latest full release.
+`parcon` uses none of them by itself: the user brings `parcon` and the runner image, and checks them, for example
+against the release's `SHA256SUMS` and its signature (`openssl pkeyutl -verify -rawin` with a key from
+`internal/release/keys`). `install.sh` holds the version and `parcon`'s SHA-256 (filled by
+`install/fill-release.sh`) and runs a fetched `parcon` only if it matches.
 
 **Why prebuilt images instead of stock Ubuntu cloud images:** stock images don't include `qemu-guest-agent`, and the
 only way to add it at first boot is custom cloud-init user data. Proxmox stores that as snippet files, which means
@@ -203,11 +189,11 @@ saved settings, skips the free space an install needs, and also runs the control
 | No controller VM from an older release | no VM tagged `par-controller` or `par-gateway` and no pool `par-system`: releases before the controller ran on the host can't be moved over, so the user runs that release's `parcon uninstall` first | hard |
 | systemd credentials | systemd 254 or newer, for `ImportCredential=`. It reports whether `systemd-creds` will use a TPM2 (`systemd-creds has-tpm2`) or the host's key alone. It encrypts nothing: `systemd-creds` makes the host's key when the install first encrypts a secret | hard |
 | Clock synchronized | `timedatectl show -p NTPSynchronized` is `yes` (GitHub App JWTs fail when clocks drift) | hard |
-| Outbound HTTPS | `github.com`, `api.github.com`, and the release asset hosts (`objects.githubusercontent.com`, `release-assets.githubusercontent.com`) | hard |
+| Outbound HTTPS | `github.com` and `api.github.com`, for the GitHub App and the controller | hard |
 | Target storage | exists, active, and accepts `images` content | hard |
 | Linked-clone support | storage type is `lvmthin`, `zfspool`, `rbd`, or file-based with qcow2. Otherwise `linkedClone: false` | warn |
 | Free space | 50 GiB free on the VM storage: the template's disk, and room for workers | hard |
-| Download space | 4 GiB free in `/var/tmp`, on the host's root filesystem, where the runner image is downloaded before it is imported | hard |
+| Runner image | the file `--image` names exists, and its `actions/runner` version is known: `--runner-version`, or the Packer manifest next to it (the image's name with `.json`). Without `--image`, an install continues only if an earlier run imported its template | hard |
 | Free memory and CPU | host RAM and threads against `maxRunners` × worker size plus existing VMs and the controller's 512 MiB | warn |
 | LAN bridge | the bridge exists, and the host has an address on it for the API, or `--pve-address` names one | hard |
 | LAN NIC offloads | on a node that is itself a VM (a virtio NIC under the LAN bridge), its offloads are off, now and at boot. `parcon install` and `parcon update` turn them off; `parcon check` warns until they are | warn |
@@ -331,15 +317,14 @@ Adding a key means adding it to the registry in `internal/settings/keys.go`.
    carries the comment `proxmox-actions-runners`.
 7. **Host NIC offloads**, only on a node that is itself a VM: see *Host NIC offloads*. Then **KVM async page
    faults**, only on a node that is a VM on KVM: see *Host KVM async page faults*.
-8. **Verify the release**: download `SHA256SUMS` and `SHA256SUMS.sig` and check the signature. The runner image is
-   then downloaded into a temporary directory under `/var/tmp` that is removed afterward, and checked against
-   `SHA256SUMS`.
-9. **Import the runner template** in `par-runners` from `par-runner-<ver>.qcow2` into the first free VMID of the
+8. **Runner image**: the file `--image` names, and its `actions/runner` version, from `--runner-version` or the
+   Packer manifest next to it. An install that already imported this release's template continues without it.
+9. **Import the runner template** in `par-runners` from the image into the first free VMID of the
    reserved IDs at the end of the range (`qm create` + `qm set --scsi0 <storage>:0,import-from=<file>`), with a
    cloud-init drive, the guest agent enabled, and `net0` on `parnet` with `firewall=1`. Give it the worker firewall
    (options `enable`, `dhcp`, `policy_in DROP`, `policy_out ACCEPT`, and the rule `GROUP par-worker`), which every
    clone copies. Tag it `par-managed`, `par-template`, `par-tv-<import time in Unix seconds>`,
-   `par-rv-<actions/runner version>` (from the image's manifest), and `par-release-<ver>`, and convert it to a
+   `par-rv-<actions/runner version>`, and `par-release-<ver>`, and convert it to a
    template. See *Runner image*.
 10. **Configure the controller** (see *Controller service contract*):
     - `/etc/proxmox-actions-runners/config.yaml`, rendered from the settings, with no `github.apps` yet
@@ -616,28 +601,26 @@ last. `parcon install` on a node with a finished install of an older release upd
 install (the `par-runners` pool exists, with parcon's comment), it continues it. Each runner template carries a
 `par-release-<version>` tag of the release that imported it.
 
-- **Update** (`parcon update`) is in place, run on the host:
-  - It finds the newest release (with `--pre`, the newest pre-release too). If that is newer than the host's
-    `parcon`, it shows the plan, verifies the release's signature, replaces `/usr/local/bin/parcon` with the
-    release's, and runs it to do the rest, so each release's own code updates the node to it.
-  - The release's runner image is imported as a new template, and the controller removes the old one once its
-    workers are gone.
+- **Update** (`parcon update`) is in place, run on the host with the new `parcon`, which looks up and downloads
+  nothing:
+  - It installs itself as `/usr/local/bin/parcon` if it isn't that file already, so the new release's own code updates
+    the node to it.
+  - With `--image PATH`, it imports the image as a new runner template, and the controller removes the old one once
+    its workers are gone. Without it, the template stays.
   - The worker network and firewall are compared with what this release sets up, and corrected where they differ.
   - An install from a release with a controller VM (or, before that, a gateway VM) can't be updated in place:
     `parcon update` refuses and says to run that release's `parcon uninstall`, then `parcon install`. Its settings
     (versions 1 to 3) are refused the same way.
   - The controller is the new `parcon` itself: `parcon` writes the config and unit the new release renders, restarts
     `parcon.service`, and waits for its sessions. Running workers keep going, and the restarted controller adopts
-    them. With `--assets`, an update from local files works the same way.
+    them.
   - On a node that is itself a VM, the LAN NIC's offloads are turned off if they aren't yet (see *Host NIC
     offloads*), and on KVM, `no-kvm-apf` is set for the next boot if it isn't yet (see *Host KVM async page faults*).
   - Each piece already at the release is left alone, so `parcon update` again continues an update that stopped. An
     install newer than the host's `parcon` is refused rather than downgraded.
-  - `--force` runs every step, even one already done for the release, whether or not a newer release exists: it
-    imports the runner template again (the controller removes the old one once unused), sets up the worker network
-    and firewall again, rewrites the controller's config and unit and restarts it, and runs the host tuning. It
-    repairs what the release tags can't show, such as a template imported by a run that was killed partway. The
-    safety checks stay: the release's signature, the plan and its question, and the lock.
+  - `--force` runs every step, even one already done for the release: it sets up the worker network and firewall
+    again, rewrites the controller's config and unit and restarts it, and runs the host tuning; with `--image`, it
+    imports the image too. The safety checks stay: the plan and its question, and the lock.
 - **Uninstall** (`parcon uninstall`) first deletes the scale sets in GitHub, for every target
   (`parcon github scaleset delete` as the controller, which also unregisters their runners; with `-target URL` it
   deletes one target's, and a target GitHub refuses doesn't stop the others), then stops and disables

@@ -194,7 +194,7 @@ jobs:
           printf '%s\n' "$RELEASE_SIGNING_KEY" >"$key"
           openssl pkeyutl -sign -rawin -inkey "$key" -in dist/SHA256SUMS -out dist/SHA256SUMS.sig
           rm -f "$key"
-      - name: Check the signature against parcon's keys
+      - name: Check the signature against the published keys
         run: |
           for pub in internal/release/keys/*.pem; do
             if openssl pkeyutl -verify -rawin -pubin -inkey "$pub" -in dist/SHA256SUMS \
@@ -203,7 +203,7 @@ jobs:
               exit 0
             fi
           done
-          echo "::error::no key in internal/release/keys verifies the signature, so parcon would refuse the release"
+          echo "::error::no key in internal/release/keys verifies the signature, so users could not verify the release"
           exit 1
       - name: Upload the assets and publish the draft release
         env:

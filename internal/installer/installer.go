@@ -7,7 +7,6 @@ package installer
 
 import (
 	"context"
-	"crypto/ed25519"
 	"crypto/x509"
 	"errors"
 	"fmt"
@@ -49,10 +48,6 @@ const (
 const (
 	// FreeGiB is what the VM storage needs for the default install: the template's disk, and room for a worker.
 	FreeGiB = 50
-	// DownloadDir holds the runner image between download and import, on the host's root filesystem; DownloadGiB is
-	// what it needs, with room to grow.
-	DownloadDir = "/var/tmp"
-	DownloadGiB = 4
 )
 
 // ControllerStopTimeout is how long parcon.service may take to stop or restart: longer than its TimeoutStopSec
@@ -65,7 +60,7 @@ const HelperURL = "https://klponce.github.io/proxmox-actions-runners/app/v1/"
 // BinaryPath is where parcon lives on the host.
 const BinaryPath = "/usr/local/bin/parcon"
 
-// Installer runs host commands. Every field but Roots, Assets, and StopAfter must be set; New fills them for the
+// Installer runs host commands. Every field but Roots, Image, RunnerVersion, and StopAfter must be set; New fills them for the
 // real host.
 type Installer struct {
 	PVE    pvecli.PVE
@@ -91,11 +86,11 @@ type Installer struct {
 	Self string
 	// Version is this parcon's release. Install and update bring the node to it.
 	Version release.Version
-	// Source is where releases come from, and Keys the release signing keys parcon trusts.
-	Source release.Source
-	Keys   []ed25519.PublicKey
-	// Assets, if set, is a directory holding the release's assets and SHA256SUMS, used instead of downloading.
-	Assets string
+	// Image is the runner image to import as a new template, a par-runner-<version>.qcow2 built from
+	// images/runner; empty imports none. RunnerVersion is its actions/runner version; empty reads it from the
+	// image's Packer manifest next to it.
+	Image         string
+	RunnerVersion string
 	// Roots stands in for the system CAs when checking the API's certificate; nil means the real ones.
 	Roots *x509.CertPool
 	// Reach checks that the host reaches an HTTPS host.
@@ -113,10 +108,6 @@ type Installer struct {
 
 // New returns an Installer for this host, writing its progress to out.
 func New(out *term.Out, self string, version release.Version, dryRun bool) (*Installer, error) {
-	keys, err := release.TrustedKeys()
-	if err != nil {
-		return nil, err
-	}
 	exec := pvecli.OSExec{}
 	return &Installer{
 		PVE:             pvecli.PVE{Exec: exec},
@@ -134,8 +125,6 @@ func New(out *term.Out, self string, version release.Version, dryRun bool) (*Ins
 		ConvertManifest: github.ConvertManifest,
 		Self:            self,
 		Version:         version,
-		Source:          release.GitHub{},
-		Keys:            keys,
 		Reach:           reachHTTPS,
 		Now:             time.Now,
 		Sleep:           sleep,

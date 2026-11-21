@@ -34,7 +34,7 @@ func (in *Installer) Install(ctx context.Context, opts InstallOptions) error {
 	if v, ok, err := in.InstalledRelease(ctx); err != nil {
 		return err
 	} else if ok && v.Compare(in.Version) < 0 {
-		// install.sh from a newer release, on a node with an older install: update it to this release.
+		// A newer parcon on a node with an older install: update it to this release.
 		return in.Upgrade(ctx, v, false, false)
 	} else if ok {
 		return fmt.Errorf("%w: release %s; run parcon update to update it, parcon update --force to redo it, or "+
@@ -55,6 +55,16 @@ func (in *Installer) Install(ctx context.Context, opts InstallOptions) error {
 	}
 	if opts.App == AppManual && opts.ClientID == "" && len(s.GitHub.Apps) == 0 {
 		return errors.New("--app manual needs --client-id, the existing App's Client ID")
+	}
+	// The runner image: an install that already imported this release's template continues without one.
+	if in.Image != "" {
+		if _, err := in.image(); err != nil {
+			return err
+		}
+	} else if has, err := in.hasTemplate(ctx); err != nil {
+		return err
+	} else if !has {
+		return errNoImage
 	}
 
 	in.Out.Step("Preflight checks")
@@ -109,13 +119,7 @@ func (in *Installer) install(ctx context.Context, s *settings.Settings, opts Ins
 		return nil
 	}
 
-	in.Out.Step("Release %s", in.Version)
-	assets, cleanup, err := in.assets(ctx)
-	if err != nil {
-		return err
-	}
-	defer cleanup()
-	if err := in.importTemplate(ctx, s, assets, false); err != nil {
+	if err := in.importTemplate(ctx, s, false); err != nil {
 		return err
 	}
 	if err := in.configureController(ctx, s); err != nil {
@@ -215,8 +219,12 @@ func (in *Installer) printPlan(ctx context.Context, s *settings.Settings, warnin
 	p("  datacenter firewall: IP set %s (private, CGNAT, and link-local ranges, the LAN, this host and its", BlockedIPSet)
 	p("    controller) and security group %s (DNS to %s, then drop %s); host rule: DHCP in on %s", FirewallGroup,
 		dns, BlockedIPSet, VNet)
-	p("  runner template in %s, VMIDs %d-%d reserved for templates; its firewall: in dropped, group %s", RunnerPool,
-		r.End-config.ReservedVMIDs+1, r.End, FirewallGroup)
+	source := "the one an earlier run imported"
+	if img, err := in.image(); err == nil {
+		source = fmt.Sprintf("imported from %s (actions/runner %s)", img.path, img.runnerVersion)
+	}
+	p("  runner template in %s, %s, VMIDs %d-%d reserved for templates; its firewall: in dropped, group %s",
+		RunnerPool, source, r.End-config.ReservedVMIDs+1, r.End, FirewallGroup)
 	wk := s.EffectiveWorker()
 	p("Workers: VMIDs %d-%d on %s (%s), at most %d, each %d vCPU and %s", r.Start, r.End-config.ReservedVMIDs, VNet,
 		s.Network.WorkerSubnet, s.ScaleSet.MaxRunners, wk.Cores, config.FormatMiB(wk.MemoryMiB))
