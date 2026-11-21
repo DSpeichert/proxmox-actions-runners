@@ -269,15 +269,15 @@ See [docs/install.md](docs/install.md) for the full design.
   honors `--dry-run`, or log it with `Changer.Log` and skip it in a dry run, as for files written in a VM.
 - Every step checks what already exists before it creates anything, so a re-run continues. Save what an install
   learns (the App's IDs) to the settings as soon as it is known.
-- Secrets never touch the host's disk, a command line, the output, or an error. They travel only in `Cmd.Stdin`, to
-  `qm guest exec --pass-stdin`. A test runs a whole install with sentinel secrets and checks every command line,
-  output, error, and host file for them; keep it passing.
+- Secrets never touch the host's disk unencrypted, a command line, the output, or an error. They travel only in
+  `Cmd.Stdin`, to `systemd-creds encrypt`. A test runs a whole install with sentinel secrets and checks every command
+  line, output, error, and host file for them; keep it passing.
 - Use only tools that ship with Proxmox VE 9, through `pvecli` or `hostsys`. Parse their JSON in Go.
 - `parcon` downloads nothing. It installs the binary the user runs and imports the runner image they name with
   `--image` (its `actions/runner` version from the Packer manifest next to it, or `--runner-version`); whoever puts
   them on the node, as root, vouches for them. Don't add release lookups or downloads back.
-- Push the controller's config as `config.yaml.new`, have the controller's own `parcon check config` accept it, and
-  only then move it into place. A config the controller's version can't read must never replace a working one.
+- Render the controller's config, check it with the controller's own validation (`settings.ControllerConfig`), and
+  write it atomically. The controller is the same `parcon`, so it reads whatever this one writes.
 - Hold the lock (`Installer.Lock`) in every command that changes the node.
 - `install/install.sh` stays a bootstrap: Bash with `set -euo pipefail`, the body in `main` called on the last line
   so a truncated `curl | bash` download can't run, and nothing but downloading `parcon`, checking it against the
