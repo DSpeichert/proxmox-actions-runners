@@ -75,3 +75,27 @@ func TestRelativePathStillRefused(t *testing.T) {
 		t.Error("a relative tokenSecretFile parsed")
 	}
 }
+
+// systemd gives credentials mode 0440 in the service's private directory; anywhere else a secret file must be 0600.
+func TestReadSecretFileAcceptsCredentials(t *testing.T) {
+	dir := t.TempDir()
+	cred := filepath.Join(dir, CredToken)
+	if err := os.WriteFile(cred, []byte("secret\n"), 0o440); err != nil {
+		t.Fatal(err)
+	}
+	other := filepath.Join(t.TempDir(), "pve-token")
+	if err := os.WriteFile(other, []byte("secret\n"), 0o440); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(credentialsEnv, "")
+	if _, err := ReadSecretFile(cred); err == nil {
+		t.Error("a 0440 file outside the service was accepted")
+	}
+	t.Setenv(credentialsEnv, dir)
+	if got, err := ReadSecretFile(cred); err != nil || got != "secret" {
+		t.Errorf("credential: %q, %v", got, err)
+	}
+	if _, err := ReadSecretFile(other); err == nil {
+		t.Error("a 0440 file outside the credentials directory was accepted")
+	}
+}

@@ -64,6 +64,12 @@ func Path() string {
 	return DefaultPath
 }
 
+// inCredentialsDir reports whether path is a file directly in the service's credentials directory.
+func inCredentialsDir(path string) bool {
+	dir := credentialsDir()
+	return dir != "" && filepath.Dir(filepath.Clean(path)) == filepath.Clean(dir)
+}
+
 // isCredentialPath reports whether path is inside the credentials directory.
 func isCredentialPath(path string) bool { return strings.HasPrefix(path, CredentialsDir+"/") }
 

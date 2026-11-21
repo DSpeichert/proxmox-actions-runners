@@ -8,8 +8,9 @@ import (
 )
 
 // ReadSecretFile reads a secret, such as the Proxmox token secret, from a file the config names. The file must not
-// be accessible to group or others, like an SSH private key. Surrounding whitespace, such as a trailing newline, is
-// removed. Errors name the file but never include its contents.
+// be accessible to group or others, like an SSH private key, unless it is one of the service's systemd credentials:
+// systemd gives those mode 0440 in a directory only the service can open. Surrounding whitespace, such as a trailing
+// newline, is removed. Errors name the file but never include its contents.
 func ReadSecretFile(path string) (string, error) {
 	info, err := os.Stat(path)
 	if err != nil {
@@ -18,7 +19,7 @@ func ReadSecretFile(path string) (string, error) {
 	if !info.Mode().IsRegular() {
 		return "", fmt.Errorf("secret file %s is not a regular file", path)
 	}
-	if perm := info.Mode().Perm(); perm&0o077 != 0 {
+	if perm := info.Mode().Perm(); perm&0o077 != 0 && !inCredentialsDir(path) {
 		return "", fmt.Errorf("secret file %s has mode %04o; it must not be accessible to group or others (use 0600)",
 			path, perm)
 	}
