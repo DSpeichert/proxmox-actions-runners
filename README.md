@@ -42,7 +42,8 @@ confirmation, and changes nothing before that (`--dry-run` stops at the plan). A
 - creates the Proxmox pools, role, user, API token, and ACLs
 - creates the **worker network**, a Proxmox SDN VNet with SDN DHCP that the host routes to the internet with SNAT,
   and the **worker firewall**, Proxmox's own, which keeps workers off your LAN, the host, and each other
-- creates a small **controller VM** that runs the controller
+- sets up the **controller** as `parcon.service` on the host, sandboxed by systemd, with its secrets encrypted by
+  `systemd-creds`
 - creates your **GitHub App**: it prints a link that you open in a browser on any device, where you choose your
   organization or personal account and create the App on GitHub. You paste one line back, install the App with
   GitHub's own install page, and the installer learns the organization or repository from it. The host itself needs
@@ -50,20 +51,21 @@ confirmation, and changes nothing before that (`--dry-run` stops at the plan). A
 - imports the **runner template** from the runner image published with the release
 - registers the scale set with GitHub
 
-`parcon install -h` lists the settings you can choose, such as the bridge, static addresses, the worker subnet, or
+`parcon install -h` lists the settings you can choose, such as the bridge, the worker subnet, or
 `--set worker.memory=16GiB`. If a step fails, fix the cause and run `parcon install` again: it continues where it
 stopped.
 
-The host itself is barely touched: `parcon`, its settings, Proxmox objects (the worker firewall's IP set, security
-group, and one host rule among them), and, on a node that is itself a VM, a udev rule for its NIC and a kernel
-parameter. `parcon` adds no packages or services, and `parcon uninstall` removes all of it. Isolation comes from the
+The host itself is barely touched: `parcon`, its settings, the controller's service with its config and encrypted
+credentials, Proxmox objects (the worker firewall's IP set, security group, and one host rule among them), and, on a
+node that is itself a VM, a udev rule for its NIC and a kernel parameter. `parcon` adds no packages, and
+`parcon uninstall` removes all of it. Isolation comes from the
 Proxmox firewall at each worker's NIC, so it doesn't depend on how your LAN or VLANs are set up. See
 [docs/install.md](docs/install.md) for the full design.
 
 ## Managing it
 
-`parcon` on the Proxmox host is how you manage the runners. The controller VM needs no login: `parcon`
-reaches into them through the guest agent for what it does.
+`parcon` on the Proxmox host is how you manage the runners, as root. The controller runs on the same host as
+`parcon.service`; its logs are in `journalctl -u parcon`.
 
 | Command | What it does |
 | ------- | ------------ |
@@ -170,7 +172,7 @@ jobs:
 The new limit applies to running workers too: raising it gives them more time, and lowering it destroys any already
 older than the new limit.
 
-`parcon` renders the controller's config, `/etc/proxmox-actions-runners/config.yaml` in the controller VM, from its
+`parcon` renders the controller's config, `/etc/proxmox-actions-runners/config.yaml` on the host, from its
 settings on the host, and rewrites it whenever they change, so don't edit it by hand. The config can do more than
 the settings expose yet, such as several scale sets or a per-scale-set `worker:` block. Its format, also in
 [`deploy/config.example.yaml`](deploy/config.example.yaml):
@@ -179,8 +181,8 @@ the settings expose yet, such as several scale sets or a per-scale-set `worker:`
 proxmox:
   url: https://192.0.2.1:8006/api2/json
   tokenId: par@pve!controller
-  tokenSecretFile: /etc/proxmox-actions-runners/pve-token
-  caCertFile: /etc/proxmox-actions-runners/pve-ca.pem  # the node's CA; omit for a certificate the system trusts
+  tokenSecretFile: ${CREDENTIALS_DIRECTORY}/parcon.pve-token  # a systemd credential of parcon.service
+  caCertFile: ${CREDENTIALS_DIRECTORY}/parcon.pve-ca.pem       # the node's CA; omit for a certificate the system trusts
   tlsServerName: pve1.example.com  # a name the API's certificate is issued for, since the URL uses an IP
   node: pve1
   pool: par-runners
@@ -193,7 +195,7 @@ proxmox:
 github:
   apps:                            # one per organization or account; left out until the installer has created them
     - clientId: Iv23liEXAMPLE0000000
-      privateKeyFile: /etc/proxmox-actions-runners/github-app-Iv23liEXAMPLE0000000.pem
+      privateKeyFile: ${CREDENTIALS_DIRECTORY}/parcon.github-app-Iv23liEXAMPLE0000000
   targets:                         # every scale set is registered with every target
     - configUrl: https://github.com/my-org
       clientId: Iv23liEXAMPLE0000000
@@ -257,16 +259,17 @@ GitHub stops accepting a self-hosted runner that doesn't update itself 30 days a
 keep up with releases. The controller checks for new `actions/runner` releases and logs a warning when the template
 has been behind for 7 days and an error after 21. `parcon status` and `parcon check template` show the same.
 
-## Controller VM
+## Controller
 
-`parcon install` creates the controller VM from an image published with each release, built with Packer from
-`images/controller/` on the same Ubuntu 26.04 base as the runner image. Unlike workers, it is long-lived and installs
-security updates with `unattended-upgrades`. It has the `parcon` binary in `/usr/local/bin`, the `parcon` system user
-it runs as, and its unit, [`deploy/parcon.service`](deploy/parcon.service). Only `parcon` can read its config and
-secrets in `/etc/proxmox-actions-runners`. `parcon install` enables the unit once the GitHub App exists, and
-`parcon update` has the VM download the new release's `parcon`, checked against the release's signed checksums.
+The controller is `parcon` itself, run by `parcon.service` on the host as a user that exists only while it runs
+(`DynamicUser=`), in a systemd sandbox: no capabilities, a read-only system, no access to `/etc/pve`, `/root`, or
+parcon's own files, and bounded memory. It gets its config and secrets as systemd credentials: the Proxmox API token
+and each GitHub App's key are encrypted with `systemd-creds` (the host's key, and the TPM2 if the node has one) in
+`/etc/credstore.encrypted/parcon.*`, and only the service sees them decrypted. Its API token can only manage the
+runner pool. The host commands that need its secrets, such as waiting for a GitHub App's installation, run in the same
+sandbox through `systemd-run`.
 
-See [docs/install.md](docs/install.md#controller-image) for the details.
+See [docs/install.md](docs/install.md#controller-service-contract) for the details.
 
 ## Worker network and firewall
 
@@ -274,9 +277,8 @@ Workers attach only to the SDN VNet `parnet`. The host has the subnet's first ad
 and SNATs it to the internet; SDN DHCP hands out addresses, with the host's DNS server. Each worker's NIC has the
 Proxmox firewall on: nothing comes in that the worker didn't start, and the security group `par-worker` lets DNS
 through to the host's resolver, then drops the worker subnet (SDN's own IP set for the VNet) and everything in the IP
-set `par-blocked`, which holds private, CGNAT, and link-local ranges, your LAN, every address of the host, and the
-controller VM. Workers reach the
-internet, and nothing else. The controller refuses to start a worker whose firewall isn't on.
+set `par-blocked`, which holds private, CGNAT, and link-local ranges, your LAN, and every address of the host, which
+the controller runs on. Workers reach the internet, and nothing else. The controller refuses to start a worker whose firewall isn't on.
 
 The firewall applies only while the datacenter firewall is on. `parcon status` and `parcon check` fail if it is
 turned off. See [docs/install.md](docs/install.md#networking) for the details.
@@ -287,8 +289,10 @@ turned off. See [docs/install.md](docs/install.md#networking) for the details.
   *Limitations*.
 - **Clone storage** that supports linked clones: LVM-thin, ZFS, RBD, or qcow2/raw files. Plain LVM and iSCSI need
   `linkedClone: false`.
-- **A LAN bridge with internet egress** (usually `vmbr0`) for the controller VM. Workers never attach to it: they
-  get a dedicated network that the host routes, which the installer creates.
+- **A LAN bridge with internet egress** (usually `vmbr0`), where the host's address for the API is. Workers never
+  attach to it: they get a dedicated network that the host routes, which the installer creates.
+- **systemd 254 or newer**, which Proxmox VE 9 has, for the controller's credentials. A TPM2 is used if the node has
+  one, but none is needed.
 - **Proxmox SDN** available, which it is by default on PVE 9 (`ifupdown2` and the `source /etc/network/interfaces.d/*`
   line in `/etc/network/interfaces`), and **SDN DHCP** set up as Proxmox's
   [SDN docs](https://pve.proxmox.com/pve-docs/chapter-pvesdn.html) say: `apt install dnsmasq`, then
@@ -343,8 +347,11 @@ These are deliberate. The project supports exactly the setup `parcon install` cr
 
 - **Single standalone node only.** Proxmox clusters aren't supported, even if workers would run on only one node,
   and `parcon install` refuses to run on a cluster member. The maintainer has no hardware to test clusters.
-- **One installation layout.** No container image, Kubernetes deployment, other hypervisors, or controller running
-  outside its VM. The repository is public, so you are welcome to fork it for other setups.
+- **One installation layout.** The controller runs as a service on the Proxmox host; no container image, Kubernetes
+  deployment, or other hypervisors. The repository is public, so you are welcome to fork it for other setups.
+- **The controller shares the host's kernel.** systemd's sandbox and an API token limited to the runner pool contain
+  it, but a kernel exploit from the controller would reach the host. It runs no job code and listens on no port:
+  only GitHub's answers and the Proxmox API reach it.
 - **One worker network.** Every scale set and every organization or repository shares the same worker network and
   runner pool. Keep jobs with different trust levels apart with separate scale sets and GitHub runner groups, or on
   separate nodes: a hostile job from one target runs next to the others' workers.
@@ -364,8 +371,8 @@ These are deliberate. The project supports exactly the setup `parcon install` cr
 ## Repository layout (planned)
 
 ```
-cmd/parcon/            `parcon`: install, status, config, update, check, and uninstall on the host; the controller
-                       service and the steps that need its secrets in the controller VM
+cmd/parcon/            `parcon`: install, status, config, target, update, check, and uninstall on the host; the
+                       controller service and the steps that need its secrets, in its sandbox
 internal/config/       the controller's config: loading, defaults, validation
 internal/settings/     the host's settings, the config keys, and the controller config rendered from them
 internal/installer/    install, check, status, config, update, and uninstall on the host
@@ -382,7 +389,7 @@ images/common/         what the image builds share: Ubuntu pin, base and cleanup
 images/controller/     Packer build of the controller VM image with parcon (CI)
 images/runner/         Packer build of the runner template image (CI)
 .github/               CI, the release build, and the daily actions/runner check
-deploy/                example config, systemd unit for the controller VM
+deploy/                example config
 site/                  GitHub Pages helper page for creating the GitHub App
 docs/                  design notes
 ```
@@ -393,18 +400,20 @@ docs/                  design notes
 - Self-hosted runners run untrusted code. Be very careful before using them with **public** repositories,
   where anyone who opens a pull request can run code on your infrastructure.
 - Workers sit on their own network, which the host routes to the internet. The Proxmox firewall at each worker's NIC
-  drops traffic to the LAN, the Proxmox host, the controller VM, other workers, and private and link-local ranges,
+  drops traffic to the LAN, the Proxmox host and its controller, other workers, and private and link-local ranges,
   and everything inbound the worker didn't start. It needs the datacenter firewall on. Don't bake reusable
   credentials into the template.
 - The Proxmox token is scoped to the runner pool, so the controller can't modify other VMs.
-- The GitHub App's private key goes straight from GitHub into the controller VM and never touches the Proxmox host.
-  Neither does the Proxmox token's secret: `parcon` pipes it into the controller VM when it creates it. The host's
-  settings hold nothing secret.
+- The GitHub App's private key goes straight from GitHub to `systemd-creds`, which encrypts it on the host; so does
+  the Proxmox token's secret. Only `parcon.service` and the commands `parcon` runs in its sandbox get them decrypted,
+  and they never reach a command line, the output, or the disk unencrypted. The host's settings hold nothing secret.
+- The controller runs as a transient user in a systemd sandbox, with no capabilities and no access to Proxmox's own
+  secrets in `/etc/pve`. `systemd-analyze security parcon.service` shows its exposure.
 - Releases are signed. `install.sh` checks `parcon` against the checksum written into it, and `parcon` accepts a
   release only if its `SHA256SUMS` carries a signature from a key built into it, then checks every file it downloads
   against those checksums.
-- Metrics, once added (deferred past v0.1), will be served over HTTPS on the LAN without authentication. Don't expose
-  the controller VM beyond your LAN.
+- Metrics, once added (deferred past v0.1), will be served on the host without authentication. Don't expose them
+  beyond your LAN.
 - The GitHub App private key and the Proxmox token are read from files and never logged. JIT configs are
   single-use. They are written straight into the VM that uses them through the guest agent, and are never
   stored in cloud-init snippets or VM config.

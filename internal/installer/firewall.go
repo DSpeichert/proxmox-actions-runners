@@ -12,7 +12,6 @@ import (
 	"github.com/klponce/proxmox-actions-runners/internal/config"
 	"github.com/klponce/proxmox-actions-runners/internal/pvecli"
 	"github.com/klponce/proxmox-actions-runners/internal/settings"
-	"github.com/klponce/proxmox-actions-runners/internal/vmtags"
 )
 
 // The worker firewall's objects in the datacenter firewall. Uninstall finds them by these names, and the host's
@@ -80,10 +79,10 @@ func (in *Installer) hostDNS(ctx context.Context, s *settings.Settings) (netip.A
 }
 
 // blocked returns what workers must not reach, beyond the worker subnet itself: the always-blocked ranges, the host's
-// networks on the LAN bridge, every address the host has on any other interface (the API listens on all of them),
-// and the controller VM once it has an address. The worker subnet, with the host's address on it, is SDN's own IP set
+// networks on the LAN bridge, and every address the host has on any other interface (the API listens on all of them,
+// and the controller runs on the host). The worker subnet, with the host's address on it, is SDN's own IP set
 // for the VNet (vnetSubnets), which follows the subnet without parcon copying it.
-func (in *Installer) blocked(ctx context.Context, s *settings.Settings, controller netip.Addr) ([]string, error) {
+func (in *Installer) blocked(ctx context.Context, s *settings.Settings) ([]string, error) {
 	addrs, err := in.Sys.Addrs(ctx)
 	if err != nil {
 		return nil, err
@@ -102,12 +101,6 @@ func (in *Installer) blocked(ctx context.Context, s *settings.Settings, controll
 	}
 	if pve, err := in.pveAddress(ctx, s); err == nil {
 		block = append(block, pve.String())
-	}
-	if controller.IsValid() {
-		block = append(block, controller.String())
-	}
-	if p, err := netip.ParsePrefix(s.Network.ControllerIP); err == nil {
-		block = append(block, p.Addr().String())
 	}
 	slices.Sort(block)
 	return slices.Compact(block), nil
@@ -160,9 +153,9 @@ func ruleArgs(r pvecli.Rule) []string {
 // configureFirewall creates or corrects the worker firewall's objects: the blocked IP set, the security group, and
 // the host's DHCP rule. Each change keeps workers at least as restricted as before it: entries are added to the IP
 // set before stale ones go, and new group rules go in above the old ones before those are removed.
-func (in *Installer) configureFirewall(ctx context.Context, s *settings.Settings, controller netip.Addr) error {
+func (in *Installer) configureFirewall(ctx context.Context, s *settings.Settings) error {
 	in.Out.Step("Worker firewall")
-	block, err := in.blocked(ctx, s, controller)
+	block, err := in.blocked(ctx, s)
 	if err != nil {
 		return err
 	}
@@ -292,11 +285,7 @@ func (in *Installer) templateFirewall(ctx context.Context, vmid string) error {
 // firewallDrift returns what differs between the worker firewall and what configureFirewall sets up, or nothing.
 func (in *Installer) firewallDrift(ctx context.Context, s *settings.Settings) []string {
 	var drift []string
-	controller := netip.Addr{}
-	if vm, ok, err := in.systemVM(ctx, vmtags.Controller); err == nil && ok {
-		controller, _ = in.agentIPv4(ctx, vm.VMID)
-	}
-	if want, err := in.blocked(ctx, s, controller); err != nil {
+	if want, err := in.blocked(ctx, s); err != nil {
 		drift = append(drift, err.Error())
 	} else if have, err := in.PVE.IPSet(ctx, BlockedIPSet); err != nil {
 		drift = append(drift, "IP set "+BlockedIPSet+" is missing")

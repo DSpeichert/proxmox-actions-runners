@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"os"
 	"slices"
 	"strings"
 	"sync"
@@ -20,8 +21,9 @@ import (
 	"github.com/klponce/proxmox-actions-runners/internal/vmtags"
 )
 
-// StatusSchema is the version of `parcon status --json`'s format.
-const StatusSchema = 2
+// StatusSchema is the version of `parcon status --json`'s format. Version 3 reports the controller's service, where
+// version 2 reported its VM.
+const StatusSchema = 3
 
 // StatusLevel is how a status line is judged.
 type StatusLevel string
@@ -52,7 +54,7 @@ type Report struct {
 	LatestError string `json:"latestError,omitempty"`
 
 	Host       []Finding                   `json:"host"`
-	Controller *SystemVMStatus             `json:"controller,omitempty"`
+	Controller *ControllerStatus           `json:"controller,omitempty"`
 	GitHub     []Finding                   `json:"github"`
 	ScaleSets  []controller.ScaleSetStatus `json:"scaleSets,omitempty"`
 	Templates  []TemplateStatus            `json:"templates"`
@@ -63,12 +65,10 @@ type Report struct {
 	SettingsWarnings []string `json:"settingsWarnings,omitempty"`
 }
 
-// SystemVMStatus is the controller VM.
-type SystemVMStatus struct {
-	VMID     int       `json:"vmid"`
-	Running  bool      `json:"running"`
-	Release  string    `json:"release,omitempty"`
-	Address  string    `json:"address,omitempty"`
+// ControllerStatus is the controller's service.
+type ControllerStatus struct {
+	// State is parcon.service's state: active, inactive, failed, and so on.
+	State    string    `json:"state"`
 	Findings []Finding `json:"findings"`
 }
 
@@ -105,9 +105,6 @@ func (r *Report) Failed() bool {
 	}
 	return slices.ContainsFunc(all, func(f Finding) bool { return f.Level == FAIL })
 }
-
-// guestTimeout bounds each command status runs in a VM, so a hung guest can't hang status.
-const guestTimeout = 15 * time.Second
 
 // githubTimeout bounds each GitHub lookup status makes: the answer is useful, but not worth a long wait.
 const githubTimeout = 10 * time.Second
@@ -168,13 +165,10 @@ func (in *Installer) Status(ctx context.Context) (*Report, error) {
 		return worst(r.Host)
 	})
 	var snapshot *controller.Status
-	ctrl, hasController := findSystemVM(vms, vmtags.Controller)
-	if hasController {
-		part(fmt.Sprintf("controller VM %d", ctrl.VMID), func() StatusLevel {
-			r.Controller, snapshot = in.controllerStatus(ctx, ctrl, s)
-			return worst(r.Controller.Findings)
-		})
-	}
+	part("the controller's service", func() StatusLevel {
+		r.Controller, snapshot = in.controllerStatus(ctx, s)
+		return worst(r.Controller.Findings)
+	})
 	part("the latest release on GitHub", func() StatusLevel {
 		ctx, cancel := context.WithTimeout(ctx, githubTimeout)
 		defer cancel()
@@ -196,12 +190,12 @@ func (in *Installer) Status(ctx context.Context) (*Report, error) {
 	wg.Wait()
 	progress("")
 
-	if gateway, ok := findSystemVM(vms, vmtags.Gateway); ok {
-		r.Host = append(r.Host, Finding{FAIL, fmt.Sprintf("gateway VM %d is from an older release, which this "+
-			"release can't update; run parcon uninstall, then parcon install", gateway.VMID)})
-	}
-	if !hasController {
-		r.Host = append(r.Host, Finding{FAIL, "there is no controller VM; run parcon install"})
+	for _, tag := range []string{vmtags.Controller, vmtags.Gateway} {
+		if vm, ok := findSystemVM(vms, tag); ok {
+			r.Host = append(r.Host, Finding{FAIL, fmt.Sprintf("VM %d (%s) is from an older release, which this "+
+				"release can't update; run parcon uninstall with that release, then parcon install", vm.VMID,
+				vm.Name)})
+		}
 	}
 	r.GitHub = append(githubFindings(s, snapshot, in.Now()), runner)
 	if snapshot != nil {
@@ -243,10 +237,8 @@ func (in *Installer) hostFindings(ctx context.Context, s *settings.Settings) []F
 	f := []Finding{{OK, fmt.Sprintf("parcon %s at %s, settings at %s", in.Version, in.BinaryPath, in.SettingsPath)}}
 	var missing []string
 	pools, _ := in.PVE.Pools(ctx)
-	for _, p := range []string{SystemPool, RunnerPool} {
-		if !slices.ContainsFunc(pools, func(x pvecli.Pool) bool { return x.ID == p }) {
-			missing = append(missing, "pool "+p)
-		}
+	if !slices.ContainsFunc(pools, func(x pvecli.Pool) bool { return x.ID == RunnerPool }) {
+		missing = append(missing, "pool "+RunnerPool)
 	}
 	if roles, _ := in.PVE.Roles(ctx); !slices.ContainsFunc(roles, func(r pvecli.Role) bool { return r.ID == Role }) {
 		missing = append(missing, "role "+Role)
@@ -300,89 +292,74 @@ func (in *Installer) networkFindings(ctx context.Context, s *settings.Settings) 
 	return f
 }
 
-// guest runs a command in a VM for status, and returns its trimmed output.
-func (in *Installer) guest(ctx context.Context, vmid int, argv ...string) (string, error) {
-	out, err := in.guestExec(ctx, vmid, guestTimeout, nil, argv...)
-	return strings.TrimSpace(string(out)), err
-}
-
-func (in *Installer) systemVMStatus(ctx context.Context, vm proxmox.VM) *SystemVMStatus {
-	st := &SystemVMStatus{VMID: vm.VMID, Running: vm.Status == "running"}
-	st.Release, _ = vmtags.String(vm, vmtags.ReleasePrefix)
-	if !st.Running {
-		st.Findings = append(st.Findings, Finding{FAIL, fmt.Sprintf("VM %d isn't running; start it with qm start %d",
-			vm.VMID, vm.VMID)})
-		return st
+// controllerStatus reports the controller's service: whether it runs, whether its unit, config, and credentials
+// are what the settings want, and what it last reported.
+func (in *Installer) controllerStatus(ctx context.Context, s *settings.Settings) (*ControllerStatus,
+	*controller.Status) {
+	st := &ControllerStatus{State: in.serviceState(ctx)}
+	add := func(level StatusLevel, format string, args ...any) {
+		st.Findings = append(st.Findings, Finding{level, fmt.Sprintf(format, args...)})
 	}
-	if err := in.PVE.AgentPing(ctx, vm.VMID); err != nil {
-		st.Findings = append(st.Findings, Finding{FAIL, "its guest agent doesn't answer"})
-		return st
-	}
-	if a, ok := in.agentIPv4(ctx, vm.VMID); ok {
-		st.Address = a.String()
-	}
-	return st
-}
-
-func orNone(s string) string {
-	if s == "" {
-		return "unknown"
-	}
-	return s
-}
-
-func (in *Installer) controllerStatus(ctx context.Context, vm proxmox.VM, s *settings.Settings) (
-	*SystemVMStatus, *controller.Status,
-) {
-	st := in.systemVMStatus(ctx, vm)
-	if len(st.Findings) > 0 {
+	if _, err := os.Stat(in.UnitPath); err != nil {
+		add(FAIL, "%s isn't set up; run parcon install", ServiceName)
 		return st, nil
 	}
-	version, err := in.guest(ctx, vm.VMID, "runuser", "-u", "parcon", "--", "parcon", "version")
-	if err != nil {
-		version = "unknown"
-	}
-	st.Findings = append(st.Findings, Finding{OK, fmt.Sprintf("running, release %s, %s, parcon %s",
-		orNone(st.Release), orNone(st.Address), version)})
-	if version != in.Version.String() && in.Version != (release.Version{}) {
-		st.Findings = append(st.Findings, Finding{WARN, fmt.Sprintf("the controller runs parcon %s and this host "+
-			"parcon %s; run parcon update", version, in.Version)})
-	}
-
-	if out, err := in.guest(ctx, vm.VMID, "systemctl", "is-active", "parcon.service"); err != nil {
-		st.Findings = append(st.Findings, Finding{FAIL, fmt.Sprintf("parcon.service is %s; see journalctl -u parcon "+
-			"in VM %d", out, vm.VMID)})
+	if st.State == "active" {
+		add(OK, "%s is active", ServiceName)
 	} else {
-		st.Findings = append(st.Findings, Finding{OK, "parcon.service is active"})
+		add(FAIL, "%s is %s; see journalctl -u parcon", ServiceName, st.State)
 	}
-
+	if in.unitDrift() {
+		add(WARN, "%s isn't the unit this parcon writes; run parcon config apply", in.UnitPath)
+	}
 	if want, _, err := in.RenderConfig(ctx, s); err != nil {
-		st.Findings = append(st.Findings, Finding{FAIL, "the settings don't render a config: " + err.Error()})
-	} else if have, err := in.guest(ctx, vm.VMID, "runuser", "-u", "parcon", "--", "cat", config.DefaultPath); err != nil {
-		st.Findings = append(st.Findings, Finding{FAIL, "can't read the controller's config: " + err.Error()})
-	} else if have != strings.TrimSpace(string(want)) {
-		st.Findings = append(st.Findings, Finding{WARN, "the controller's config doesn't match the settings; run " +
-			"parcon config apply"})
+		add(FAIL, "the settings don't render a config: %v", err)
+	} else if have, err := os.ReadFile(in.ConfigPath); err != nil {
+		add(FAIL, "can't read the controller's config: %v", err)
+	} else if string(have) != string(want) {
+		add(WARN, "the controller's config doesn't match the settings; run parcon config apply")
 	} else {
-		st.Findings = append(st.Findings, Finding{OK, "its config matches the settings"})
+		add(OK, "its config matches the settings")
+	}
+	missing := []string{}
+	if !in.hasCredential(config.CredToken) {
+		missing = append(missing, "the Proxmox API token")
+	}
+	for _, a := range s.GitHub.Apps {
+		if !in.hasCredential(config.CredAppKey(a.ClientID)) {
+			missing = append(missing, "GitHub App "+appName(a)+"'s key")
+		}
+	}
+	if len(missing) > 0 {
+		add(FAIL, "missing from %s: %s", in.CredStoreDir, strings.Join(missing, ", "))
+	} else {
+		add(OK, "its secrets are encrypted in %s", in.CredStoreDir)
 	}
 
-	// The status file is in parcon's runtime directory, so it is read as parcon.
-	out, err := in.guest(ctx, vm.VMID, "runuser", "-u", "parcon", "--", "cat", controller.StatusPath)
-	if err != nil {
-		return st, nil
-	}
-	var snap controller.Status
-	if json.Unmarshal([]byte(out), &snap) != nil || snap.Schema != controller.StatusSchema {
+	snap := in.readStatus()
+	if snap == nil {
 		return st, nil
 	}
 	if age := in.Now().Sub(snap.UpdatedAt); age > 2*time.Minute {
-		st.Findings = append(st.Findings, Finding{WARN, fmt.Sprintf("its last pass was %s ago", ago(age))})
+		add(WARN, "its last pass was %s ago", ago(age))
 	}
 	if snap.LastError != "" {
-		st.Findings = append(st.Findings, Finding{WARN, "its last pass failed: " + snap.LastError})
+		add(WARN, "its last pass failed: %s", snap.LastError)
 	}
-	return st, &snap
+	return st, snap
+}
+
+// readStatus reads the status file the controller writes after each pass, or nil if there is none it can read.
+func (in *Installer) readStatus() *controller.Status {
+	data, err := os.ReadFile(in.StatusPath)
+	if err != nil {
+		return nil
+	}
+	var snap controller.Status
+	if json.Unmarshal(data, &snap) != nil || snap.Schema != controller.StatusSchema {
+		return nil
+	}
+	return &snap
 }
 
 func githubFindings(s *settings.Settings, snap *controller.Status, now time.Time) []Finding {
@@ -527,7 +504,7 @@ func (r *Report) Render(w io.Writer, now time.Time) {
 		line(f)
 	}
 	if r.Controller != nil {
-		p("\nController VM %d", r.Controller.VMID)
+		p("\nController (%s)", ServiceName)
 		for _, f := range r.Controller.Findings {
 			line(f)
 		}

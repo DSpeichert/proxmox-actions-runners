@@ -27,7 +27,7 @@ behind the invariants and the alternatives that were rejected.
 - **Target**: an organization or a personal account's repository the runners serve. `parcon install` sets up the
   first and `parcon target add` more. Every scale set is registered with every target, and `runners.max` caps the
   workers of all of them together. Each organization or account has its own private GitHub App, shared by its
-  targets; its key is `github-app-<Client ID>.pem` in the controller VM. Workers carry their target's key in a
+  targets; its key is the controller's credential `parcon.github-app-<Client ID>`. Workers carry their target's key in a
   `par-tg-` tag.
 - **JIT config**: a single-use, just-in-time runner registration config from GitHub. It registers one ephemeral
   runner. Treat it as a credential until it is used.
@@ -35,22 +35,23 @@ behind the invariants and the alternatives that were rejected.
   controller uses it for scale set registration, the message session, and JIT configs.
 - **Template**: a versioned, immutable Proxmox VM template imported from the runner image (`images/runner/`), which
   CI builds with Packer and publishes with each release. Nothing is built on the node.
-- **Controller VM**: the VM `parcon install` creates to run the `parcon` controller. It lives in the `par-system` pool,
-  outside the token's reach.
+- **Controller service**: `parcon.service` on the host, which runs `parcon run` as a transient user (`DynamicUser=`)
+  in a systemd sandbox. It gets its config and its secrets (the API token, each App's key) as systemd credentials,
+  the secrets encrypted with `systemd-creds` in `/etc/credstore.encrypted/parcon.*`. The host commands run the
+  controller's own commands in the same sandbox with `systemd-run`.
 - **Worker network**: the Proxmox SDN VNet (`parnet` in the simple zone `parzone`) that workers attach to. Its one
   subnet has the host as gateway, with SNAT, and SDN DHCP (`dnsmasq@parzone`) hands out the rest with the host's DNS
   server.
 - **Worker firewall**: the Proxmox firewall on each worker's NIC (`firewall=1`), copied from its template: inbound
   DROP, DHCP allowed, and the datacenter security group `par-worker`, which allows DNS to the host's resolver and
   drops SDN's IP set of the worker subnet (`+sdn/parnet-all`) and the IP set `par-blocked` (private, CGNAT, and
-  link-local ranges, the LAN, the host, the controller). Rules use scoped references (`+sdn/`, `+dc/`), which a
+  link-local ranges, the LAN, the host and its controller). Rules use scoped references (`+sdn/`, `+dc/`), which a
   worker's own IP sets can't shadow. It applies only while the datacenter firewall is on, which the user turns on.
 - **Host commands**: `parcon install`, `status`, `config`, `target`, `update`, `check`, and `uninstall`, run as root
-  on the Proxmox VE 9 node (`internal/installer`). They are the user's interface: the controller VM needs no login,
-  and `parcon` reaches into it through the guest agent. `install/install.sh` is the bootstrap that downloads and
+  on the Proxmox VE 9 node (`internal/installer`). They are the user's interface. `install/install.sh` is the bootstrap that downloads and
   verifies the release's `parcon` and runs `parcon install`. See [docs/install.md](docs/install.md).
 - **Host settings**: `/etc/proxmox-actions-runners/settings.yaml` on the host (`internal/settings`), the source of
-  truth for the install. `parcon` renders the controller VM's `config.yaml` from it. It holds nothing secret.
+  truth for the install. `parcon` renders the controller's `config.yaml` from it. It holds nothing secret.
 - **Worker**: a VM cloned from the template to run one job.
 - **Linked clone**: a copy-on-write clone of the template. It is fast and saves space. Full clones are also
   supported.
@@ -91,22 +92,26 @@ Keep these true. If a change needs to break one, discuss it first.
    existing template: a new runner image is imported as a new template instead, and the controller deletes an old
    one only once no worker uses it. The smoke-test clones of `parcon install` and `parcon check network` (`par-build`,
    in the reserved VMIDs) belong to `parcon`, which destroys them, including ones a failed run left. The Proxmox
-   token's ACLs enforce the same limit: the controller VM sits in `par-system`, and the firewall's datacenter objects
-   are outside the token's reach too.
+   token's ACLs enforce the same limit: it can act only on the runner pool, and the firewall's datacenter objects are
+   outside its reach too.
 6. **GitHub-matching defaults.** Default worker hardware is 2 vCPU, 8 GiB RAM, and 14 GiB of free disk space,
    matching `ubuntu-latest` for private repositories. The free space is added on top of the template's disk size,
    because a clone's disk can grow but never shrink below its template's. The defaults are defined in exactly one
    place (`internal/config`) and can be overridden per controller and per scale set.
 7. **Secrets never leak.** The GitHub App private key, the Proxmox API token, installation tokens, and JIT configs
-   must never be logged, put in error messages, or stored in VM notes, tags, config, or cloud-init snippets. Pass
-   JIT configs to the running VM only through the QEMU guest agent. Cloud-init carries only non-secret settings.
+   must never be logged, put in error messages, or stored in VM notes, tags, config, or cloud-init snippets. The App
+   keys and the token's secret are kept only as credentials encrypted with `systemd-creds`, which they reach on its
+   stdin. Pass JIT configs to the running VM only through the QEMU guest agent. Cloud-init carries only non-secret
+   settings.
 8. **Minimal host footprint.** `parcon` changes the Proxmox host only where the project needs it: itself
-   (`/usr/local/bin/parcon`) and its settings (`/etc/proxmox-actions-runners/settings.yaml`), what the runners run
+   (`/usr/local/bin/parcon`) and its settings (`/etc/proxmox-actions-runners/settings.yaml`), the controller's
+   service (`parcon.service`, its config next to the settings, and its credentials `parcon.*` in
+   `/etc/credstore.encrypted`), what the runners run
    on (pools, role, user, token, ACLs, VMs, the worker network's SDN zone, VNet, and subnet, and the worker
    firewall's IP set, security group, and host DHCP rule, through `pveum`, `qm`, `pvesh`, and `pvesm`), and host
    tuning the runners can't work well without, such as turning off the LAN NIC's
    offloads and KVM's async page faults on a node that is itself a VM. A change that is merely convenient doesn't
-   qualify, and whatever can run inside the controller VM runs there. `parcon` runs no service on the host,
+   qualify. `parcon` runs one service on the host, the controller, sandboxed (see *Controller service guidelines*),
    installs no packages, never reboots it, and doesn't edit files that Proxmox or the user manages, such as
    `/etc/network/interfaces` or `storage.cfg`: a change outside Proxmox's tools goes in a file of its own, named as
    ours. The one exception is `/etc/kernel/cmdline`, which has no room for a file of ours: on a systemd-boot node
@@ -116,7 +121,7 @@ Keep these true. If a change needs to break one, discuss it first.
    `parcon` prints before it changes anything, and `parcon uninstall` must remove it.
 9. **Workers are isolated.** Workers attach only to the worker network, and every worker's NIC has the worker
    firewall: inbound DROP, and outbound only DHCP, DNS to the host's resolver, and the internet, never the LAN, the
-   Proxmox host, the controller VM, other workers, or private and link-local ranges. The controller starts no worker
+   Proxmox host (the controller's included), other workers, or private and link-local ranges. The controller starts no worker
    whose firewall isn't on with that group, and `parcon status` fails while the datacenter firewall is off. The
    controller reaches workers only through the Proxmox API and the guest agent, never over the network.
 
@@ -125,11 +130,12 @@ Keep these true. If a change needs to break one, discuss it first.
 ```
 cmd/parcon/            `parcon` binary. On the host: `install`, `status`, `config`, `target`, `update`, `check`,
                        `uninstall`.
-                       In the controller VM: `run`, `check`, `github app create|import|wait-installation`,
+                       In the controller's sandbox: `run`, `check`, `github app wait-installation`,
                        `github scaleset delete`. Flags, wiring, signals
 internal/config/       the controller's config schema, every default (install defaults included), validation
 internal/settings/     the host settings, the `parcon config` key registry, rendering the controller's config
-internal/installer/    the host commands: preflight, plan, install steps, status, config, update, uninstall
+internal/installer/    the host commands: preflight, plan, install steps, status, config, target, update,
+                       uninstall; the controller's unit, sandbox, and credentials
 internal/pvecli/       Proxmox through pvesh, pveum, and qm on the host; the Changer that logs every change
 internal/hostsys/      host facts: addresses, routes, NICs, ethtool, memory, the API's certificate
 internal/release/      release lookup, SHA256SUMS signature verification, verified downloads; keys/ holds the
@@ -144,7 +150,7 @@ install/               install.sh, the bootstrap that verifies and runs parcon i
 images/common/         what every image build shares: the Ubuntu and plugin pins, base and cleanup steps, boot test
 images/controller/     Packer (qemu builder): the controller VM image with parcon, shipped as a release asset
 images/runner/         Packer (qemu builder): the runner template image, shipped as a release asset
-deploy/                example config, systemd unit for the controller VM
+deploy/                example config
 .devcontainer/         development container with every tool below, at pinned versions
 .github/workflows/     the check-and-release pipeline, the pull requests' commit check, the daily actions/runner
                        check, and the helper page on GitHub Pages
@@ -236,12 +242,11 @@ expects, and the suite has already caught a missing privilege (`Pool.Audit`) tha
   it, and read it with `Encoded()` only to hand it to the guest agent.
 - Expose Prometheus metrics for queue depth, desired vs. actual workers, clone and boot latency, VM count by state,
   reaped VMs, and API failures. A job that stays queued is the main signal operators need. *Deferred past v0.1:*
-  `parcon` will serve `/metrics`, `/healthz`, and `/readyz` over plain HTTP on `127.0.0.1:9465` only, and nginx in
-  the controller VM will serve them over HTTPS on port 9464. Don't make `parcon` listen on the LAN or handle TLS
-  itself.
+  `parcon` will serve `/metrics`, `/healthz`, and `/readyz` over plain HTTP on `127.0.0.1:9465` only. Don't make
+  `parcon` listen on the LAN or handle TLS itself.
 - Authenticate to GitHub only as a GitHub App (Client ID, installation ID, private key). Don't add PAT support.
 - Never log the manifest-flow code. It can be exchanged for the App's private key until it is used or expires.
-  `parcon github app` commands read the code and keys from stdin, never from arguments.
+  `parcon` spends it in its own process and pipes the App's key straight into `systemd-creds encrypt`.
 - `github.apps` and a target's App are optional when the config is parsed, because `parcon install` checks Proxmox
   before it creates the App. A command that talks to GitHub as an App (`parcon run`, `parcon check github`,
   `parcon github scaleset delete`) calls `(*config.Config).RequireGitHub` first; one that needs only public GitHub
@@ -253,12 +258,13 @@ expects, and the suite has already caught a missing privilege (`Pool.Audit`) tha
 
 See [docs/install.md](docs/install.md) for the full design.
 
-- Keep invariant 8. If a feature seems to need a new host change, first see whether it can live in the controller
-  VM. If it can't, and the runners need it, make it idempotent, list it in the plan, report it in
+- Keep invariant 8. If a feature seems to need a new host change, first see whether it can live in the controller's
+  sandbox. If it can't, and the runners need it, make it idempotent, list it in the plan, report it in
   `parcon check` and `parcon status`, and undo it in `uninstall`.
 - Preflight checks come first and change nothing. They include root, Proxmox VE 9.x, KVM, standalone node, clock
   sync, tools, storage, space, the LAN bridge and its NIC's offloads, KVM async page faults, SDN support, `dnsmasq`
-  for SDN DHCP, the datacenter firewall, the host's DNS server, worker subnet overlap, and name or ID clashes. Add a check whenever a later step could fail on host state.
+  for SDN DHCP, the datacenter firewall, the host's DNS server, worker subnet overlap, systemd's credentials, an older
+  release's controller VM, and name or ID clashes. Add a check whenever a later step could fail on host state.
 - Show the plan and ask before any change; `--dry-run` stops at the plan and `--yes` answers the question. Without
   a terminal, a question fails and names `--yes`: never guess an answer.
 - Send every change through `pvecli.Changer` (commands, and files with `WriteFile` and `Remove`), which logs it and
@@ -289,7 +295,11 @@ See [docs/install.md](docs/install.md) for the full design.
   machine-id and SSH host keys, and clean cloud-init state before converting to a template.
 - Scripts run as root in the Packer build VM. They must be idempotent and exit non-zero on failure.
 - Keep the image's disk small. Every worker's disk is the template's size plus `freeDiskGiB`, and the root
-  filesystem must grow to fill the disk at first boot. The compressed image must stay well under GitHub's 2 GiB
+  filesystem must grow to fill the disk at first boot.
+- The image boots with `net.ifnames=0` (`images/common/base.sh`), so the first NIC is `eth0`, the name Proxmox's
+  cloud-init network config gives it. With predictable names, the dracut initrd brings it up as `ens18` before
+  cloud-init can rename it, netplan's config for `eth0` never applies, and every boot waits two minutes for an `eth0`
+  that never appears. The boot test catches that. The compressed image must stay well under GitHub's 2 GiB
   release-asset limit.
 - Pin the `actions/runner` version and its SHA-256 (`runner_version` and `runner_sha256` in `runner.pkr.hcl`) and
   disable runner auto-update. GitHub stops accepting a runner that doesn't update itself 30 days after a newer
@@ -320,23 +330,21 @@ See [docs/install.md](docs/install.md) for the full design.
   (`config.VMIDRange.Workers`). A new template reports `template: 0` for about 10s, and in the worker IDs it would
   look like a half-created worker clone and be destroyed.
 
-## Controller image guidelines (`images/controller/`)
+## Controller service guidelines (`internal/installer/service.go`)
 
-- It starts from the same pinned Ubuntu 26.04 cloud image and build VM as the runner (`images/common/ubuntu.pkr.hcl`,
-  linked into each image directory) and runs `images/common/base.sh` (the guest agent) and
-  `images/common/auto-updates.sh` (`unattended-upgrades`) first.
-  Unlike workers, the controller VM is long-lived and patches itself. It holds no machine identity either:
-  `images/common/cleanup.sh` runs last.
-- Keep its disk small: 6 GiB, the VM's disk size. A built image holds about 2.5 GiB, but a kernel update needs room for
-  two kernels and a new initramfs, which 4 GiB can't hold.
-- Every image boots with `net.ifnames=0` (`images/common/base.sh`), so the first NIC is `eth0`, the name Proxmox's
-  cloud-init network config gives it. With predictable names, the dracut initrd brings it up as `ens18` before
-  cloud-init can rename it, netplan's config for `eth0` never applies (a static address is lost), and every boot
-  waits two minutes for an `eth0` that never appears. The boot test catches that.
-- The controller image, the host commands, and the controller all follow the *Controller VM contract* in
-  [docs/install.md](docs/install.md): the `parcon` user, `/usr/local/bin/parcon`, `parcon.service`
-  ([deploy/parcon.service](deploy/parcon.service), installed but not enabled by the image), and the modes of
-  `/etc/proxmox-actions-runners` and its files. Change it there, not here.
+- The controller is `parcon run`, started by `parcon.service`, which `parcon` renders (`renderUnit`). The host
+  commands run the controller's own commands (`parcon check`, `parcon github …`) as the controller with
+  `controllerExec`, which uses `systemd-run` with the same `sandboxProperties`. Never run code that holds the App
+  keys or the token outside that sandbox, and never read a credential back on the host.
+- Keep the sandbox as strict as the controller allows: `DynamicUser=`, no capabilities, a read-only system, no access
+  to `/etc/pve`, root's files, parcon's own directory, the credential stores, or systemd's credential key, a system
+  call filter, and memory and task caps. Loosen it only for something the controller can't work without, and check
+  `systemd-analyze security parcon.service` on a node (the integration suite does).
+- Secrets go only to `writeCredential`, on `systemd-creds encrypt`'s stdin, and reach the controller only through
+  `ImportCredential=parcon.*`. The config names them as `${CREDENTIALS_DIRECTORY}/<credential>`
+  (`config.CredentialPath`).
+- The controller, the unit, and the host commands follow the *Controller service contract* in
+  [docs/install.md](docs/install.md). Change it there, not here.
 
 ## Commits and releases (`.github/`)
 

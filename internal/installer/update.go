@@ -6,15 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"strconv"
 	"strings"
 	"syscall"
-	"time"
 
-	"github.com/klponce/proxmox-actions-runners/internal/config"
 	"github.com/klponce/proxmox-actions-runners/internal/release"
 	"github.com/klponce/proxmox-actions-runners/internal/settings"
-	"github.com/klponce/proxmox-actions-runners/internal/vmtags"
 )
 
 // UpdateOptions are the choices for an update.
@@ -116,19 +112,15 @@ type upgradeStep struct {
 }
 
 // Upgrade brings the node from release installed to this parcon's release: the runner template, the worker network
-// and firewall, the controller's parcon and config, and the host's NIC offloads and KVM async page faults. Each piece already at
+// and firewall, the controller's config and service, and the host's NIC offloads and KVM async page faults. Each piece already at
 // this release is left alone, unless force redoes it.
 func (in *Installer) Upgrade(ctx context.Context, installed release.Version, confirmed, force bool) error {
 	if installed.Compare(in.Version) > 0 {
 		return fmt.Errorf("the node runs release %s, newer than this parcon %s; run parcon update", installed,
 			in.Version)
 	}
-	if gateway, ok, err := in.systemVM(ctx, vmtags.Gateway); err != nil {
+	if err := in.refuseOlderLayout(ctx); err != nil {
 		return err
-	} else if ok {
-		return fmt.Errorf("gateway VM %d is from an older release: release %s replaces it with the Proxmox "+
-			"firewall and can't update it in place; run parcon uninstall, then parcon install", gateway.VMID,
-			in.Version)
 	}
 	s, err := in.loadSettings()
 	if err != nil {
@@ -178,36 +170,27 @@ func (in *Installer) Upgrade(ctx context.Context, installed release.Version, con
 
 // upgradeSteps works out what an upgrade to this release has to do. None means the node is at this release. With
 // force, every step runs, even one already done for this release: it imports the runner template again, sets up the
-// worker network and firewall again, reinstalls the controller's parcon and config, and runs the host tuning. The safety checks stay: the release's signature, the plan and its question, the lock, and the controller's
-// check of its new config.
+// worker network and firewall again, rewrites the controller's config and unit and restarts it, and runs the host
+// tuning. The safety checks stay: the release's signature, the plan and its question, and the lock.
 func (in *Installer) upgradeSteps(ctx context.Context, s *settings.Settings, force bool) ([]upgradeStep, error) {
 	vms, err := in.vms(ctx)
 	if err != nil {
 		return nil, err
 	}
-	controller, ok := findSystemVM(vms, vmtags.Controller)
-	if !ok || controller.Status != "running" {
-		return nil, errors.New("the controller VM isn't running; start it, then run parcon update again")
-	}
 	hasTemplate := false
 	for _, vm := range tagged(vms, RunnerPool, in.releaseTag()) {
 		hasTemplate = hasTemplate || vm.Template
 	}
-	out, err := in.asParcon(ctx, controller.VMID, guestTimeout, nil, "parcon", "version")
-	if err != nil {
-		return nil, fmt.Errorf("ask the controller's parcon for its version: %w", err)
-	}
-	controllerVersion := strings.TrimSpace(string(out))
 	want, _, err := in.RenderConfig(ctx, s)
 	if err != nil {
 		return nil, err
 	}
-	have, err := in.asParcon(ctx, controller.VMID, guestTimeout, nil, "cat", config.DefaultPath)
-	configDrift := err != nil || strings.TrimSpace(string(have)) != strings.TrimSpace(string(want))
-	needBinary := controllerVersion != in.Version.String()
-	// Settings from before several targets are saved in the new format, and the one App's key moves to its own path.
-	migrate := s.MigratedFrom() != 0
-	configDrift = configDrift || migrate
+	have, err := os.ReadFile(in.ConfigPath)
+	newBinary := !sameFile(in.Self, in.BinaryPath)
+	// The controller is this parcon: a new release (which an update installed before it ran this one) or a new
+	// binary needs a restart, as does a config or unit that differs.
+	restart := newBinary || s.Installed != in.Version.String() || err != nil || !bytes.Equal(have, want) ||
+		in.unitDrift()
 	network := append(in.networkDrift(ctx, s), in.firewallDrift(ctx, s)...)
 	offloads := in.offloadPlan(ctx, s)
 	asyncPF := in.asyncPFPlan(ctx)
@@ -228,7 +211,7 @@ func (in *Installer) upgradeSteps(ctx context.Context, s *settings.Settings, for
 	}
 
 	var steps []upgradeStep
-	if !sameFile(in.Self, in.BinaryPath) {
+	if newBinary {
 		steps = append(steps, upgradeStep{plan: fmt.Sprintf("install parcon %s as %s", in.Version, in.BinaryPath),
 			do: func(context.Context) error { return in.installBinary() }})
 	}
@@ -258,62 +241,19 @@ func (in *Installer) upgradeSteps(ctx context.Context, s *settings.Settings, for
 			if err := in.createNetwork(ctx, s); err != nil {
 				return err
 			}
-			addr, _ := in.agentIPv4(ctx, controller.VMID)
-			return in.configureFirewall(ctx, s, addr)
+			return in.configureFirewall(ctx, s)
 		}})
 	}
-	if needBinary || force {
+	if restart || force {
 		steps = append(steps, upgradeStep{
-			plan: fmt.Sprintf("replace parcon %s in controller VM %d with %s", controllerVersion, controller.VMID,
-				in.Version),
+			plan: fmt.Sprintf("render the controller's config and %s from the settings, restart the controller "+
+				"(running workers keep going), and wait for its sessions", ServiceName),
 			do: func(ctx context.Context) error {
-				a, err := fetch(ctx)
-				if err != nil {
+				in.Out.Step("Controller")
+				if err := in.writeConfig(ctx, s); err != nil {
 					return err
 				}
-				return in.upgradeControllerBinary(ctx, controller.VMID, a)
-			},
-		})
-	}
-	if needBinary || configDrift || force {
-		plan := "render the controller's config from the settings, restart the controller, and wait for its sessions"
-		if migrate && len(s.GitHub.Apps) > 0 {
-			plan = fmt.Sprintf("save %s in format %d, copy the GitHub App key to %s in controller VM %d, then %s, "+
-				"then remove %s", in.SettingsPath, settings.Version, config.AppKeyFile(s.GitHub.Apps[0].ClientID),
-				controller.VMID, plan, config.LegacyAppKeyFile)
-		} else if migrate {
-			plan = fmt.Sprintf("save %s in format %d, then %s", in.SettingsPath, settings.Version, plan)
-		}
-		steps = append(steps, upgradeStep{
-			plan: plan,
-			do: func(ctx context.Context) error {
-				in.Out.Step("Controller config")
-				// The key is copied before the settings are saved in the new format, so a re-run after a failure
-				// still knows to copy it.
-				if err := in.migrateAppKey(ctx, controller.VMID, s); err != nil {
-					return err
-				}
-				if migrate {
-					if err := in.saveSettings(s); err != nil {
-						return err
-					}
-				}
-				if err := in.pushConfig(ctx, controller.VMID, s); err != nil {
-					return err
-				}
-				if err := in.restartController(ctx, controller.VMID, s); err != nil {
-					return err
-				}
-				if migrate && len(s.GitHub.Apps) > 0 {
-					in.Change.Log(fmt.Sprintf("controller VM %d: rm -f %s", controller.VMID, config.LegacyAppKeyFile))
-					if !in.Change.DryRun {
-						if _, err := in.asParcon(ctx, controller.VMID, guestTimeout, nil, "rm", "-f",
-							config.LegacyAppKeyFile); err != nil {
-							return err
-						}
-					}
-				}
-				return nil
+				return in.restartController(ctx, s)
 			},
 		})
 	}
@@ -330,47 +270,17 @@ func (in *Installer) upgradeSteps(ctx context.Context, s *settings.Settings, for
 		}
 		steps = append(steps, upgradeStep{plan: strings.Join(asyncPF, "\n  "), do: in.tuneAsyncPF})
 	}
-	if len(steps) == 0 && controller.HasTag(in.releaseTag()) {
+	if len(steps) == 0 && s.Installed == in.Version.String() {
 		return nil, nil
 	}
-	// The release tag goes on the controller last: it marks a finished update.
+	// The settings record the release last: it marks a finished update.
 	return append(steps, upgradeStep{
-		plan: fmt.Sprintf("tag controller VM %d with release %s", controller.VMID, in.Version),
-		do: func(ctx context.Context) error {
+		plan: fmt.Sprintf("record release %s in %s", in.Version, in.SettingsPath),
+		do: func(context.Context) error {
 			defer cleanup()
-			tags := strings.Join(append(in.controllerSpec(s).tags, in.releaseTag()), ";")
-			return in.run(ctx, "qm", "set", strconv.Itoa(controller.VMID), "--tags", tags)
+			return in.markInstalled(s)
 		},
 	}), nil
-}
-
-// upgradeControllerBinary has the controller VM download the release's parcon itself, check it against the
-// checksum from the verified SHA256SUMS, and put it in place. The binary is far too big for the guest agent to carry,
-// and the controller's config and secrets never leave the VM. The service restarts with the new config next.
-func (in *Installer) upgradeControllerBinary(ctx context.Context, vmid int, a *release.Assets) error {
-	in.Out.Step("Upgrade the controller's parcon")
-	name := BinaryAsset(in.Version)
-	sum, ok := a.Sums.Hex(name)
-	if !ok {
-		return fmt.Errorf("release %s has no %s", in.Version, name)
-	}
-	if in.Assets != "" {
-		return fmt.Errorf("the controller VM downloads its parcon from the release, which local assets can't give it")
-	}
-	in.Change.Log(fmt.Sprintf("controller VM %d: download %s, check its sha256, install it as /usr/local/bin/parcon",
-		vmid, name))
-	if in.Change.DryRun {
-		return nil
-	}
-	_, err := in.guestExec(ctx, vmid, 5*time.Minute, nil, "sh", "-c", `set -e
-		curl -fsSL --retry 3 -o /usr/local/bin/parcon.new "$1"
-		echo "$2  /usr/local/bin/parcon.new" | sha256sum -c --quiet -
-		chmod 0755 /usr/local/bin/parcon.new
-		mv /usr/local/bin/parcon.new /usr/local/bin/parcon`, "sh", release.AssetURL(in.Version, name), sum)
-	if err != nil {
-		return fmt.Errorf("upgrading the controller's parcon failed: %w", err)
-	}
-	return nil
 }
 
 // sameFile reports whether two paths hold the same bytes: the host's parcon is this one.

@@ -14,7 +14,7 @@ import (
 )
 
 // sameRelease makes ti an update of its node to the release it is already at, served signed as a real update
-// would be, with the controller VM able to download its parcon.
+// would be.
 func sameRelease(t *testing.T, ti *testInstaller) release.Version {
 	t.Helper()
 	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
@@ -22,13 +22,6 @@ func sameRelease(t *testing.T, ti *testInstaller) release.Version {
 	v := src.publish(t, priv, ti.Version.String())
 	ti.Source, ti.Keys, ti.Assets, ti.Yes = src, []ed25519.PublicKey{pub}, "", true
 	ti.Self = ti.BinaryPath
-	ti.node.guest = func(vm *fakeVM, argv []string, _ []byte) (int, string, string, bool) {
-		if argv[0] == "sh" && strings.Contains(argv[2], "curl -fsSL --retry 3 -o /usr/local/bin/parcon.new") {
-			vm.files["parcon-version"] = v.String()
-			return 0, "", "", true
-		}
-		return 0, "", "", false
-	}
 	return v
 }
 
@@ -49,8 +42,8 @@ func TestUpgradeForceRunsEveryStep(t *testing.T) {
 	out := ti.stdout.String()
 	for _, want := range []string{"import the 0.2.0 runner template again",
 		"check the worker network and firewall, and set them up again",
-		"replace parcon 0.2.0 in controller VM 100 with 0.2.0", "render the controller's config",
-		"check the LAN NIC's offloads", "check KVM async page faults", "tag controller VM 100 with release 0.2.0",
+		"render the controller's config", "check the LAN NIC's offloads", "check KVM async page faults",
+		"record release 0.2.0",
 		"importing a new one anyway"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("forced update lacks %q:\n%s", want, out)
@@ -61,7 +54,7 @@ func TestUpgradeForceRunsEveryStep(t *testing.T) {
 	if now := n.vmsTagged(vmtags.Template); len(now) != len(templates)+1 || !slices.Contains(now, templates[0]) {
 		t.Errorf("templates %v, then %v", templates, now)
 	}
-	if !n.ran("qm guest exec 100 --timeout 480 -- systemctl try-restart parcon.service") {
+	if !n.ran("systemctl try-restart parcon.service") {
 		t.Errorf("the controller wasn't restarted: %v", n.lines())
 	}
 }
@@ -117,7 +110,7 @@ func TestUpgradeRefusesAGatewayInstall(t *testing.T) {
 	ti.node.vms[99] = &fakeVM{id: 99, pool: SystemPool, tags: []string{vmtags.Managed, vmtags.Gateway},
 		running: true, config: map[string]string{}}
 	err := ti.Upgrade(context.Background(), v, true, false)
-	if err == nil || !strings.Contains(err.Error(), "run parcon uninstall, then parcon install") {
+	if err == nil || !strings.Contains(err.Error(), "run parcon uninstall with the release that installed it") {
 		t.Errorf("Upgrade = %v", err)
 	}
 }

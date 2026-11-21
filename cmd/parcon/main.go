@@ -1,27 +1,27 @@
-// Command parcon installs, runs, and manages proxmox-actions-runners.
+// Command parcon installs, runs, and manages proxmox-actions-runners on a Proxmox VE node.
 //
-// On the Proxmox host, run as root, it installs the runners, reports their state, changes their settings, updates
-// them, and uninstalls them. In the controller VM, it runs the controller as a service, and does the steps that need
-// the controller's secrets, which never leave that VM. The host reaches those through the guest agent.
+// Run as root, it installs the runners, reports their state, changes their settings, updates them, and uninstalls
+// them. The controller itself is parcon too: parcon.service runs it on the host, as a transient user in a systemd
+// sandbox, with its config and secrets as systemd credentials. The steps that need those secrets run in the same
+// sandbox, which the host commands start with systemd-run.
 //
 // Usage on the Proxmox host:
 //
 //	parcon install [flags]
 //	parcon status [-json]
 //	parcon config get <key> | get --all | set <key> <value> | describe [<key>] | apply
+//	parcon target list [-json] | add -github-url URL | remove URL
 //	parcon update [-pre] [-yes] [-dry-run]
 //	parcon check [network|config|proxmox|github|template]
 //	parcon uninstall [-yes] [-dry-run]
 //	parcon version
 //
-// Usage in the controller VM:
+// Usage in the controller's sandbox, with its credentials:
 //
 //	parcon run [-config path] [-log-level level]
 //	parcon check config|proxmox|github|template [-config path]
-//	parcon github app create [-key-file path] < code
-//	parcon github app import [-key-file path] < key.pem
-//	parcon github app wait-installation -client-id id [-key-file path] [-timeout duration]
-//	parcon github scaleset delete [-config path]
+//	parcon github app wait-installation -client-id id [-account login] [-repository name]
+//	parcon github scaleset delete [-config path] [-target URL]
 package main
 
 import (
@@ -31,6 +31,7 @@ import (
 	"os"
 	"runtime/debug"
 
+	"github.com/klponce/proxmox-actions-runners/internal/config"
 	"github.com/klponce/proxmox-actions-runners/internal/installer"
 )
 
@@ -58,11 +59,11 @@ const hostUsage = `usage on the Proxmox host, as root:
   parcon check                          check this node, and after an install, the controller too
   parcon check network                  check the worker network from a throwaway worker
   parcon check config|proxmox|github|template
-                                        run one of the controller's checks in the controller VM
+                                        run one of the controller's checks, in its sandbox
   parcon version
 `
 
-const vmUsage = `usage in the controller VM:
+const serviceUsage = `usage in the controller's sandbox (parcon.service, or systemd-run from parcon on the host):
   parcon version
   parcon run [-config path] [-log-level level]
                                         run the controller until SIGINT or SIGTERM
@@ -70,25 +71,24 @@ const vmUsage = `usage in the controller VM:
   parcon check proxmox [-config path]   check the Proxmox VE API, token privileges, and storage
   parcon check github [-config path]    check the GitHub App credentials and scale set registration
   parcon check template [-config path]  check the runner template and its actions/runner version
-  parcon github app create [-key-file path] < code
-                                        create the GitHub App from the manifest code on stdin, write its key,
-                                        and print its clientId, appId, slug, owner, and ownerType as JSON
-  parcon github app import [-key-file path] < key.pem
-                                        write an existing GitHub App's private key from stdin
-  parcon github app wait-installation -client-id id [-key-file path] [-timeout duration]
+  parcon github app wait-installation -client-id id [-account login] [-repository name] [-key-file path]
+                                        [-timeout duration]
                                         wait until the App is installed and print its installationId,
                                         account, accountType, and (for a personal account) repositories
                                         as JSON
-  parcon github scaleset delete [-config path]
+  parcon github scaleset delete [-config path] [-target URL]
                                         remove the configured scale sets and their runners from GitHub
 `
 
+// inService reports whether parcon runs in the controller's sandbox, with its credentials. Tests replace it.
+var inService = config.InService
+
 // usage is the usage text for where parcon runs.
 func usageText() string {
-	if hostMode() {
-		return hostUsage
+	if inService() {
+		return serviceUsage
 	}
-	return vmUsage
+	return hostUsage
 }
 
 // errUsage marks a command-line mistake, which exits with status 2 like the flag package does.
@@ -124,7 +124,7 @@ func run(args []string, stdout, stderr io.Writer) error {
 		fmt.Fprint(stdout, usageText())
 		return nil
 	}
-	if hostMode() {
+	if !inService() {
 		return runHost(args, stdout, stderr)
 	}
 	switch args[0] {
@@ -135,9 +135,9 @@ func run(args []string, stdout, stderr io.Writer) error {
 	case "github":
 		return runGitHub(args[1:], stdout, stderr)
 	case "install", "uninstall", "status", "update", "config", "target":
-		return fmt.Errorf("parcon %s runs on the Proxmox host, not in the controller VM", args[0])
+		return fmt.Errorf("parcon %s runs on the Proxmox host as root, not in the controller's sandbox", args[0])
 	default:
-		fmt.Fprintf(stderr, "unknown command %q\n%s", args[0], vmUsage)
+		fmt.Fprintf(stderr, "unknown command %q\n%s", args[0], serviceUsage)
 		return errUsage
 	}
 }
@@ -161,7 +161,8 @@ func runHost(args []string, stdout, stderr io.Writer) error {
 	case "target":
 		err = runTarget(args[1:], stdout, stderr)
 	case "run", "github":
-		return fmt.Errorf("parcon %s runs in the controller VM; parcon install sets it up", args[0])
+		return fmt.Errorf("parcon %s runs in the controller's sandbox, with its credentials: parcon.service and "+
+			"the host commands start it there", args[0])
 	default:
 		fmt.Fprintf(stderr, "unknown command %q\n%s", args[0], hostUsage)
 		return errUsage

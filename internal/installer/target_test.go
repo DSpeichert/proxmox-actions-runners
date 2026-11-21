@@ -3,6 +3,7 @@ package installer
 import (
 	"context"
 	"os"
+	"path/filepath"
 	"reflect"
 	"slices"
 	"strings"
@@ -27,12 +28,16 @@ func loadGitHub(t *testing.T, ti *testInstaller) *settings.GitHub {
 	return &s.GitHub
 }
 
-// pushedConfig is the controller's config, as the installer last pushed it.
+// pushedConfig is the controller's config, as the installer last wrote it.
 func pushedConfig(t *testing.T, ti *testInstaller) *config.Config {
 	t.Helper()
-	cfg, err := config.Parse([]byte(ti.controller(t).files[config.DefaultPath]))
-	must(t, err)
-	return cfg
+	return ti.controllerConfig(t)
+}
+
+// hasCredential reports whether the controller has a credential.
+func hasCredential(ti *testInstaller, name string) bool {
+	_, err := os.Stat(filepath.Join(ti.CredStoreDir, name))
+	return err == nil
 }
 
 func TestAddTargetOfAnotherAccount(t *testing.T) {
@@ -53,7 +58,7 @@ func TestAddTargetOfAnotherAccount(t *testing.T) {
 		t.Errorf("settings github = %+v\nwant %+v", got, want)
 	}
 	cfg := pushedConfig(t, ti)
-	if len(cfg.GitHub.Targets) != 2 || cfg.GitHub.Apps[1].PrivateKeyFile != config.AppKeyFile("Iv23liUSER") {
+	if len(cfg.GitHub.Targets) != 2 || cfg.GitHub.Apps[1].PrivateKeyFile != config.CredentialPath(config.CredAppKey("Iv23liUSER")) {
 		t.Errorf("pushed config github = %+v", cfg.GitHub)
 	}
 	out := ti.stdout.String()
@@ -66,11 +71,13 @@ func TestAddTargetOfAnotherAccount(t *testing.T) {
 		}
 	}
 	// The installation is bound to the account and the repository, and the controller restarted with it.
-	if !ti.node.ran("qm guest exec 100 --timeout 960 -- runuser -u parcon -- parcon github app wait-installation " +
-		"-client-id Iv23liUSER -account octocat -repository hello") {
+	if !slices.ContainsFunc(ti.node.lines(), func(l string) bool {
+		return strings.HasPrefix(l, "systemd-run ") && strings.HasSuffix(l, " github app wait-installation "+
+			"-client-id Iv23liUSER -account octocat -repository hello")
+	}) {
 		t.Errorf("wait-installation:\n%s", strings.Join(ti.node.lines(), "\n"))
 	}
-	if !ti.node.ran("qm guest exec 100 --timeout 480 -- systemctl try-restart parcon.service") {
+	if !ti.node.ran("systemctl try-restart parcon.service") {
 		t.Error("the controller wasn't restarted")
 	}
 }
@@ -82,7 +89,7 @@ func TestAddTargetReusesTheAccountsApp(t *testing.T) {
 	ti.stdout.Reset()
 
 	must(t, addTarget(t, ti, "https://github.com/Octocat/world", ""))
-	if ti.node.ran("qm guest exec 100 --timeout 60 -- runuser -u parcon -- parcon github app create") {
+	if strings.Contains(ti.stdout.String(), "Created GitHub App") {
 		t.Error("created another App for the same account")
 	}
 	if !strings.Contains(ti.stdout.String(), "GitHub App: octocat-runners, which already serves "+
@@ -148,8 +155,8 @@ func TestAddTargetWithAnAppOfAnotherAccount(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "which already has App Iv23liUSER") {
 		t.Fatalf("AddTarget = %v", err)
 	}
-	if _, ok := ti.controller(t).files[config.AppKeyFile("Iv23liTHIRD")]; ok {
-		t.Error("the extra App's key is still in the controller VM")
+	if hasCredential(ti, config.CredAppKey("Iv23liTHIRD")) {
+		t.Error("the extra App's key is still a credential")
 	}
 	if g := loadGitHub(t, ti); len(g.Apps) != 2 {
 		t.Errorf("apps = %+v", g.Apps)
@@ -166,8 +173,8 @@ func TestAddTargetWithAnExistingApp(t *testing.T) {
 		t.Fatal(err)
 	}
 	ti.assertNoSecrets(t, err)
-	if key := ti.controller(t).files[config.AppKeyFile("Iv23liEXISTING")]; key != appKeyPEM {
-		t.Errorf("key in the controller = %q", key)
+	if key := ti.node.credentials[config.CredAppKey("Iv23liEXISTING")]; key != appKeyPEM {
+		t.Errorf("key encrypted for the controller = %q", key)
 	}
 }
 
@@ -180,7 +187,7 @@ func TestAddTargetDryRunChangesNothing(t *testing.T) {
 		t.Error("the settings changed")
 	}
 	for _, l := range ti.node.lines() {
-		if strings.Contains(l, "parcon github app") || strings.Contains(l, "try-restart") {
+		if strings.Contains(l, "systemd-") || strings.Contains(l, "try-restart") {
 			t.Errorf("a dry run ran %s", l)
 		}
 	}
@@ -207,18 +214,18 @@ func TestRemoveTarget(t *testing.T) {
 	del := slices.IndexFunc(lines, func(l string) bool {
 		return strings.HasSuffix(l, "parcon github scaleset delete -target https://github.com/octocat/hello")
 	})
-	push := slices.IndexFunc(lines, func(l string) bool { return strings.Contains(l, "mv "+config.DefaultPath) })
-	if del < 0 || push < del {
-		t.Errorf("scale set deleted at %d, config pushed at %d:\n%s", del, push, strings.Join(lines, "\n"))
+	restart := slices.IndexFunc(lines, func(l string) bool { return strings.Contains(l, "try-restart") })
+	if del < 0 || restart < del {
+		t.Errorf("scale set deleted at %d, controller restarted at %d:\n%s", del, restart, strings.Join(lines, "\n"))
 	}
-	if _, ok := ti.controller(t).files[config.AppKeyFile("Iv23liUSER")]; !ok {
+	if !hasCredential(ti, config.CredAppKey("Iv23liUSER")) {
 		t.Error("the App's key was removed while world still uses it")
 	}
 
 	// world is the App's last target, so its key goes too.
 	must(t, ti.RemoveTarget(context.Background(), "https://github.com/octocat/world"))
-	if _, ok := ti.controller(t).files[config.AppKeyFile("Iv23liUSER")]; ok {
-		t.Error("the unused App's key is still in the controller VM")
+	if hasCredential(ti, config.CredAppKey("Iv23liUSER")) {
+		t.Error("the unused App's key is still a credential")
 	}
 	if g := loadGitHub(t, ti); len(g.Apps) != 1 || len(g.Targets) != 1 {
 		t.Errorf("settings github = %+v", g)
@@ -238,7 +245,12 @@ func TestRemoveTargetStopsWhenGitHubRefuses(t *testing.T) {
 	ti := installed(t)
 	must(t, addTarget(t, ti, "https://github.com/octocat/hello", userManifestCode))
 	before, _ := os.ReadFile(ti.SettingsPath)
-	ti.node.failOnce["qm guest exec 100 --timeout 120 -- runuser -u parcon -- parcon github scaleset delete"] = true
+	ti.node.controller = func(argv []string) (int, string, string, bool) {
+		if strings.HasPrefix(strings.Join(argv, " "), "github scaleset delete") {
+			return 1, "", "GitHub refuses", true
+		}
+		return 0, "", "", false
+	}
 	err := ti.RemoveTarget(context.Background(), "https://github.com/octocat/hello")
 	if err == nil || !strings.Contains(err.Error(), "nothing else changed") {
 		t.Fatalf("RemoveTarget = %v", err)

@@ -2,7 +2,6 @@ package installer
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"slices"
@@ -10,7 +9,6 @@ import (
 	"time"
 
 	"github.com/klponce/proxmox-actions-runners/internal/config"
-	"github.com/klponce/proxmox-actions-runners/internal/controller"
 	"github.com/klponce/proxmox-actions-runners/internal/proxmox"
 	"github.com/klponce/proxmox-actions-runners/internal/settings"
 	"github.com/klponce/proxmox-actions-runners/internal/vmtags"
@@ -44,8 +42,7 @@ func (in *Installer) AddTarget(ctx context.Context, opts TargetOptions) error {
 	if t := s.GitHub.Target(url); t != nil && t.Complete() {
 		return fmt.Errorf("%s is already a target; parcon target list shows them", t.URL)
 	}
-	vm, err := in.finishedController(ctx)
-	if err != nil {
+	if err := in.finishedController(ctx); err != nil {
 		return err
 	}
 	app := s.GitHub.AppFor(owner)
@@ -60,11 +57,11 @@ func (in *Installer) AddTarget(ctx context.Context, opts TargetOptions) error {
 		in.Out.Say("  GitHub App: %s, which already serves %s; install it for %s if it isn't", appName(*app),
 			strings.Join(s.GitHub.TargetsOf(app.ClientID), ", "), url)
 	case opts.App == AppManual:
-		in.Out.Say("  GitHub App: the existing App %s, its private key pasted here and piped into controller VM %d",
-			opts.ClientID, vm.VMID)
+		in.Out.Say("  GitHub App: the existing App %s, its private key pasted here and encrypted for the "+
+			"controller in %s", opts.ClientID, in.CredStoreDir)
 	default:
-		in.Out.Say("  GitHub App: a new one for %s, which you create in a browser; its key goes straight into "+
-			"controller VM %d", owner, vm.VMID)
+		in.Out.Say("  GitHub App: a new one for %s, which you create in a browser; its key is encrypted for the "+
+			"controller in %s", owner, in.CredStoreDir)
 	}
 	what := "the organization, for all its repositories"
 	if repo != "" {
@@ -72,8 +69,8 @@ func (in *Installer) AddTarget(ctx context.Context, opts TargetOptions) error {
 	}
 	in.Out.Say("  GitHub: scale set %s (runs-on %s) for %s", s.ScaleSet.Name, runsOn(s), what)
 	in.Out.Say("  host: save the target in %s", in.SettingsPath)
-	in.Out.Say("  controller VM %d: push the config and restart the controller (running workers keep going), and "+
-		"wait for every target's session", vm.VMID)
+	in.Out.Say("  controller: write its config and restart %s (running workers keep going), and wait for every "+
+		"target's session", ServiceName)
 	in.Out.Say("Workers: at most %d at once (runners.max), shared by all %d targets", s.ScaleSet.MaxRunners,
 		len(s.GitHub.CompleteTargets())+1)
 	if in.Change.DryRun {
@@ -88,9 +85,6 @@ func (in *Installer) AddTarget(ctx context.Context, opts TargetOptions) error {
 	}
 	defer unlock()
 
-	if err := in.migrateAppKey(ctx, vm.VMID, s); err != nil {
-		return err
-	}
 	if s.GitHub.Target(url) == nil {
 		s.GitHub.Targets = append(s.GitHub.Targets, settings.Target{URL: url})
 		if err := s.Validate(); err != nil {
@@ -101,17 +95,17 @@ func (in *Installer) AddTarget(ctx context.Context, opts TargetOptions) error {
 		}
 	}
 	in.Out.Step("GitHub App")
-	clientID, err := in.ensureApp(ctx, vm.VMID, s, owner, opts.App, opts.ClientID)
+	clientID, err := in.ensureApp(ctx, s, owner, opts.App, opts.ClientID)
 	if err != nil {
 		return err
 	}
-	if err := in.bindInstallation(ctx, vm.VMID, s, clientID, url, "parcon target add --github-url "+url); err != nil {
+	if err := in.bindInstallation(ctx, s, clientID, url, "parcon target add --github-url "+url); err != nil {
 		return err
 	}
-	if err := in.checkGitHub(ctx, vm.VMID); err != nil {
+	if err := in.checkGitHub(ctx); err != nil {
 		return err
 	}
-	if err := in.restartController(ctx, vm.VMID, s); err != nil {
+	if err := in.restartController(ctx, s); err != nil {
 		return err
 	}
 	in.Out.Say("\nWorkflows in %s can use the runners now:\n\n  runs-on: %s", url, runsOn(s))
@@ -134,8 +128,7 @@ func (in *Installer) RemoveTarget(ctx context.Context, url string) error {
 	if len(s.GitHub.Targets) == 1 {
 		return fmt.Errorf("%s is the only target; parcon uninstall removes the install", t.URL)
 	}
-	vm, err := in.finishedController(ctx)
-	if err != nil {
+	if err := in.finishedController(ctx); err != nil {
 		return err
 	}
 	removed := *t
@@ -152,12 +145,12 @@ func (in *Installer) RemoveTarget(ctx context.Context, url string) error {
 		in.Out.Say("  GitHub: delete scale set %s for %s, which unregisters its runners; a job running on one of them "+
 			"fails", s.ScaleSet.Name, removed.URL)
 	}
-	in.Out.Say("  controller VM %d: push the config without it and restart the controller, which destroys its "+
-		"workers, now: %s", vm.VMID, vmids(workers))
+	in.Out.Say("  controller: write its config without it and restart %s, which destroys its workers, now: %s",
+		ServiceName, vmids(workers))
 	if appGoes {
 		app := s.GitHub.AppByID(removed.ClientID)
-		in.Out.Say("  controller VM %d: remove the key of App %s, which no other target uses (the App itself stays "+
-			"in GitHub; delete it there if you like)", vm.VMID, appName(*app))
+		in.Out.Say("  controller: remove the key of App %s, which no other target uses, from %s (the App itself "+
+			"stays in GitHub; delete it there if you like)", appName(*app), in.CredStoreDir)
 	}
 	in.Out.Say("  host: save the settings in %s", in.SettingsPath)
 	if in.Change.DryRun {
@@ -175,9 +168,8 @@ func (in *Installer) RemoveTarget(ctx context.Context, url string) error {
 	// The scale sets go first, with the config that still names the target and its App; if GitHub refuses, nothing
 	// else has changed, and a re-run tries again.
 	if removed.Complete() {
-		in.Change.Log(fmt.Sprintf("controller VM %d: parcon github scaleset delete -target %s", vm.VMID, removed.URL))
-		out, err := in.asParcon(ctx, vm.VMID, 2*time.Minute, nil, "parcon", "github", "scaleset", "delete",
-			"-target", removed.URL)
+		in.Change.Log("as the controller: parcon github scaleset delete -target " + removed.URL)
+		out, err := in.controllerExec(ctx, 2*time.Minute, "github", "scaleset", "delete", "-target", removed.URL)
 		if err != nil {
 			return fmt.Errorf("deleting the scale set in GitHub failed; nothing else changed: %w%s", err, indent(out))
 		}
@@ -191,20 +183,18 @@ func (in *Installer) RemoveTarget(ctx context.Context, url string) error {
 			return a.ClientID == removed.ClientID
 		})
 	}
-	if err := in.pushConfig(ctx, vm.VMID, s); err != nil {
+	if err := in.writeConfig(ctx, s); err != nil {
 		return err
 	}
 	if err := in.saveSettings(s); err != nil {
 		return fmt.Errorf("the controller has the new config, but saving the settings failed; run parcon config "+
 			"apply once it is fixed: %w", err)
 	}
-	if err := in.restartController(ctx, vm.VMID, s); err != nil {
+	if err := in.restartController(ctx, s); err != nil {
 		return err
 	}
 	if appGoes {
-		key := config.AppKeyFile(removed.ClientID)
-		in.Change.Log(fmt.Sprintf("controller VM %d: rm -f %s", vm.VMID, key))
-		if _, err := in.asParcon(ctx, vm.VMID, guestTimeout, nil, "rm", "-f", key); err != nil {
+		if err := in.removeCredential(config.CredAppKey(removed.ClientID)); err != nil {
 			return err
 		}
 	}
@@ -226,21 +216,12 @@ type TargetStatus struct {
 }
 
 // Targets lists the organizations and repositories the runners serve. It only reads.
-func (in *Installer) Targets(ctx context.Context) ([]TargetStatus, error) {
+func (in *Installer) Targets(context.Context) ([]TargetStatus, error) {
 	s, err := in.loadSettings()
 	if err != nil {
 		return nil, err
 	}
-	var snap *controller.Status
-	if vm, ok, err := in.systemVM(ctx, vmtags.Controller); err == nil && ok && vm.Status == "running" {
-		if out, err := in.guest(ctx, vm.VMID, "runuser", "-u", "parcon", "--", "cat",
-			controller.StatusPath); err == nil {
-			var st controller.Status
-			if json.Unmarshal([]byte(out), &st) == nil && st.Schema == controller.StatusSchema {
-				snap = &st
-			}
-		}
-	}
+	snap := in.readStatus()
 	var out []TargetStatus
 	for _, t := range s.GitHub.Targets {
 		ts := TargetStatus{URL: t.URL, ClientID: t.ClientID, InstallationID: t.InstallationID, SetUp: t.Complete()}
@@ -262,23 +243,21 @@ func (in *Installer) Targets(ctx context.Context) ([]TargetStatus, error) {
 	return out, nil
 }
 
-// finishedController returns the controller VM of a finished install, running the same parcon as the host: adding
-// or removing a target pushes a config that version must read.
-func (in *Installer) finishedController(ctx context.Context) (proxmox.VM, error) {
-	if _, installed, err := in.InstalledRelease(ctx); err != nil {
-		return proxmox.VM{}, err
-	} else if !installed {
-		return proxmox.VM{}, errors.New("parcon isn't installed on this node yet; run parcon install, which sets up " +
-			"the first target")
-	}
-	vm, ok, err := in.systemVM(ctx, vmtags.Controller)
+// finishedController checks that the node has a finished install, at this parcon's release: adding or removing a
+// target writes a config and unit this parcon renders, for the controller this parcon is.
+func (in *Installer) finishedController(ctx context.Context) error {
+	v, installed, err := in.InstalledRelease(ctx)
 	if err != nil {
-		return proxmox.VM{}, err
+		return err
 	}
-	if !ok || vm.Status != "running" {
-		return proxmox.VM{}, errors.New("the controller VM isn't running; start it, then run this again")
+	if !installed {
+		return errors.New("parcon isn't installed on this node yet; run parcon install, which sets up the first " +
+			"target")
 	}
-	return vm, in.sameVersion(ctx, vm.VMID)
+	if v != in.Version {
+		return fmt.Errorf("the node is at release %s and this parcon is %s; run parcon update first", v, in.Version)
+	}
+	return nil
 }
 
 // targetWorkers returns the workers of a target, by its key. Workers from before several targets carry no target

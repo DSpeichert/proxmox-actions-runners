@@ -13,8 +13,8 @@ import (
 	"github.com/klponce/proxmox-actions-runners/internal/github"
 )
 
-// StatusPath is where parcon run writes the controller's status in the controller VM. `parcon status` on the host
-// reads it through the guest agent. It is a report, not state: the controller never reads it back (AGENTS.md,
+// StatusPath is where parcon run writes the controller's status, in its service's runtime directory. `parcon status`
+// on the host reads it. It is a report, not state: the controller never reads it back (AGENTS.md,
 // invariant 3), and it holds nothing secret.
 const StatusPath = "/run/parcon/status.json"
 

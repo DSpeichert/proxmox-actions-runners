@@ -206,7 +206,7 @@ workers alone, so restarting or upgrading it doesn't cancel jobs.
   token's ACLs. ([User Management](https://pve.proxmox.com/wiki/User_Management))
 - **Scope everything to a resource pool.** Grant the VM privileges on the runner pool only (the templates live there
   too), and the datastore and SDN privileges on the target storage and the worker VNet only. The token then can't
-  touch any other VM on the cluster, including the controller VM in `par-system`, or the datacenter firewall.
+  touch any other VM on the cluster, or the datacenter firewall.
 - **Guest-agent privileges** changed between releases. PVE 9 splits them into `VM.GuestAgent.Audit`, `FileRead`,
   `FileWrite`, `FileSystemMgmt`, and `Unrestricted`. Earlier releases gate the agent behind `VM.Monitor`. The
   controller needs only `Audit` for `agent/ping` and `FileWrite` for `agent/file-write` (JIT delivery). Without
@@ -257,7 +257,7 @@ network and enforces isolation with the Proxmox firewall at each worker's NIC:
 - Each worker's own firewall, copied from its template, drops everything inbound that the worker didn't start and
   sends outbound traffic through the security group `par-worker`: DNS to the host's resolver, then drop the worker
   subnet, through the IP set SDN generates for the VNet (`+sdn/parnet-all`), and the IP set `par-blocked` (private,
-  CGNAT, and link-local ranges, the LAN, every address of the host, and the controller VM). Its rules use the
+  CGNAT, and link-local ranges, the LAN, and every address of the host, which the controller runs on). Its rules use the
   firewall's scoped references (`+sdn/`, `+dc/`, from Proxmox VE 8.3), so SDN keeps the subnet's set current and no
   IP set of the same name elsewhere can shadow either one. The firewall sits in the host's bridge, where a job with root in its VM can't change it.
 - The controller never talks to workers over the network. It uses the Proxmox API and the guest agent, and it starts
@@ -273,7 +273,7 @@ Alternatives considered:
 | ------ | ------- |
 | A gateway VM on the LAN and the worker network, with dnsmasq and nftables (releases up to 0.4) | One more VM to build, release, patch, and replace on every update, and a single point of failure. It kept the host from routing worker traffic, but didn't stop workers from reaching each other |
 | Workers on an existing bridge or VLAN | Isolation depends on the user's switch and router setup, which `parcon` can't check |
-| Route through the controller VM | Puts hostile traffic next to the VM that holds the secrets |
+| Route through a controller VM | Puts hostile traffic next to the VM that holds the secrets |
 
 The trade-off accepted with the firewall: the host routes untrusted traffic, and isolation holds only while the
 datacenter firewall is on. `parcon status` and `parcon check` fail while it is off, and `parcon update` refuses to
@@ -326,41 +326,53 @@ Run jobs that must be protected from untrusted code on a separate node.
 
 ## Managing the install from the host
 
-`parcon` on the Proxmox host installs and manages everything; the controller VM needs no login. The
+`parcon` on the Proxmox host installs and manages everything, and runs the controller there as a systemd service. The
 first design had a Bash installer that did the install and upgrades, and left day-to-day changes to editing the
 controller's config inside its VM. That made the VMs something users had to log into, split the logic between Bash
-and Go, and kept the only record of how the node was set up in the controller VM's config.
+and Go, and kept the only record of how the node was set up in the controller VM's config. Earlier releases
+then kept the controller in a VM of its own, which `parcon` configured through the guest agent.
 
-- **One tool, in Go.** The install's logic (preflight checks, the plan, idempotent steps, the GitHub App flow) now
-  lives in `internal/installer` next to the controller, typed and tested against a fake node. `install.sh` shrinks
-  to a bootstrap that downloads and verifies `parcon` and runs it.
-- **The host holds the settings; the controller VM holds the secrets.** The settings on the host are the source of
-  truth, and `parcon` renders the controller's config from them. They hold nothing secret: the Proxmox token's
-  secret and the App's private key go into the controller VM on a command's stdin and never leave it. The host's
-  root can read any VM's disk anyway, but keeping secrets off the host's disk keeps them out of backups of the host
-  and out of anything that reads its files.
+- **One tool, in Go.** The install's logic (preflight checks, the plan, idempotent steps, the GitHub App flow) lives
+  in `internal/installer` next to the controller, typed and tested against a fake node. `install.sh` is a bootstrap
+  that downloads and verifies `parcon` and runs it.
+- **The controller is a sandboxed service on the host.** `parcon.service` runs `parcon run` as a transient user
+  (`DynamicUser=`) with no capabilities, a read-only system, no access to `/etc/pve`, root's files, or parcon's own,
+  a system call filter, and a memory cap. It is the same binary as the host commands, so the config's format and the
+  code that reads it never drift apart, and an update is one binary and a restart. It needs no VM image of its own,
+  no 2 GiB of RAM, and no guest-agent plumbing.
+- **The host holds the settings; systemd holds the secrets.** The settings on the host are the source of truth, and
+  `parcon` renders the controller's config from them. They hold nothing secret. The Proxmox token's secret and each
+  App's private key go on `systemd-creds encrypt`'s stdin as soon as `parcon` has them, and are kept encrypted with
+  the host's key, and its TPM2 if it has one. Only the service, and the commands the host runs in its sandbox with
+  `systemd-run`, see them decrypted, in a directory nothing else can read. A backup of `/etc` alone doesn't hold
+  them in the clear.
 - **Local tools, not the API.** On the host, `parcon` drives Proxmox through `pvesh`, `pveum`, and `qm` as root.
   Importing a disk from a local file needs `root@pam`, which has no API token, and the tools need no credentials of
-  their own, so the host holds none. The controller keeps its scoped API token (invariant 5).
-- **Changes a restart can pick up.** `parcon config set` pushes a new config and restarts the controller rather than
+  their own. The controller keeps its scoped API token (invariant 5), so even on the host it can manage only the
+  runner pool.
+- **Changes a restart can pick up.** `parcon config set` writes a new config and restarts the controller rather than
   reloading it in place. The controller rebuilds its state from Proxmox tags on every start (invariant 3), so a
   restart costs a few seconds and running workers keep their jobs.
-- **No service on the host.** `parcon` runs only when the user runs it. Its status report comes from the controller,
-  which writes a snapshot in its VM after each pass, so nothing on the host needs to stay running or listen.
+
+The trade-off accepted: the controller shares the host's kernel, so a kernel exploit from it would reach the host,
+where a VM would have needed a hypervisor escape too. What reaches the controller is GitHub's answers over HTTPS and
+the Proxmox API's; it runs no job code, listens on no port, and has no access to Proxmox's own secrets. The sandbox
+and the scoped token are what contain it.
 
 Alternatives that were rejected:
 
 | Option | Why not |
 | ------ | ------- |
 | Keep the Bash installer and add a host CLI | Two implementations of the same steps, in two languages, drifting apart |
-| Keep the settings in the controller VM | Network settings (the worker subnet, the controller's address) have no place there, and every command would need the VM to answer |
-| Secrets on the host too | Makes the controller VM easy to replace, but puts the App's private key on the host's disk |
+| A controller VM (releases before this one) | A second image to build, release, boot-test, and patch; 2 GiB of RAM; a guest-agent channel for every command; and a controller binary that could lag the host's. Its isolation is stronger, but the controller handles no untrusted code |
+| The controller in an LXC container | Shares the host's kernel like a service, with more to manage: a container template, `pct` instead of systemd's own sandbox and credentials |
+| Secrets in plain files the service can read | Simpler, but in the clear on the host's disk and in its backups |
 | A root API token for the host | A credential stored on the host for what the local tools do without one |
-| A host service or timer | Invariant 8: nothing on the host runs unless the user runs it |
+| A static `parcon` system user | One more account on the host to create and remove; `DynamicUser=` gives the same isolation with nothing left behind |
 
 ### Release trust
 
-`parcon update` replaces itself, then the controller's `parcon` and the VM images, from a release on GitHub. Its
+`parcon update` replaces itself, which is the controller too, and imports the runner image, from a release on GitHub. Its
 trust anchor is a release signing key: the release workflow signs `SHA256SUMS` with an Ed25519 key held in a GitHub
 environment that only the release job on `main` can use, and `parcon` carries the public keys and refuses a release none of them verifies.
 It is checked with Go's standard library, so it adds no dependency.

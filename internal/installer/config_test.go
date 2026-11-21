@@ -3,12 +3,12 @@ package installer
 import (
 	"context"
 	"errors"
+	"os"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/klponce/proxmox-actions-runners/internal/config"
 	"github.com/klponce/proxmox-actions-runners/internal/controller"
 	"github.com/klponce/proxmox-actions-runners/internal/github"
 	"github.com/klponce/proxmox-actions-runners/internal/settings"
@@ -35,13 +35,12 @@ func TestSetConfig(t *testing.T) {
 	if err != nil || s.Worker.MemoryMiB != 16384 {
 		t.Fatalf("settings = %+v, %v", s, err)
 	}
-	cfg, err := config.Parse([]byte(ti.controller(t).files[config.DefaultPath]))
-	if err != nil || cfg.ScaleSets[0].Worker.MemoryMiB != 16384 {
-		t.Errorf("controller config: %+v, %v", cfg, err)
+	cfg := ti.controllerConfig(t)
+	if cfg.ScaleSets[0].Worker.MemoryMiB != 16384 {
+		t.Errorf("controller config: %+v", cfg)
 	}
-	for _, want := range []string{"parcon check config -config /etc/proxmox-actions-runners/config.yaml.new",
-		"systemctl try-restart parcon.service", "journalctl -u parcon.service"} {
-		if !ti.node.ran("qm guest exec 100") || !strings.Contains(strings.Join(ti.node.lines(), "\n"), want) {
+	for _, want := range []string{"systemctl try-restart parcon.service", "journalctl -u parcon.service"} {
+		if !ti.node.ran(want) {
 			t.Errorf("didn't run %s", want)
 		}
 	}
@@ -82,39 +81,16 @@ func TestSetConfig(t *testing.T) {
 	}
 }
 
-func TestSetConfigRefusesAnotherControllerVersion(t *testing.T) {
+// Before the controller is set up, a setting only changes the settings.
+func TestSetConfigBeforeTheController(t *testing.T) {
 	ti := installed(t)
-	ti.controller(t).files["parcon-version"] = "0.1.0"
-	err := ti.SetConfig(context.Background(), "runners.max", "2")
-	if err == nil || !strings.Contains(err.Error(), "run parcon update first") {
-		t.Errorf("SetConfig = %v", err)
+	must(t, os.Remove(ti.UnitPath))
+	must(t, ti.SetConfig(context.Background(), "runners.max", "2"))
+	if s, _ := settings.Load(ti.SettingsPath); s.ScaleSet.MaxRunners != 2 {
+		t.Error("the settings didn't change")
 	}
-	if s, _ := settings.Load(ti.SettingsPath); s.ScaleSet.MaxRunners != 1 {
-		t.Error("the settings changed")
-	}
-}
-
-func TestSetConfigRollsBackWhenTheControllerRefuses(t *testing.T) {
-	ti := installed(t)
-	ti.node.guest = func(_ *fakeVM, argv []string, _ []byte) (int, string, string, bool) {
-		if strings.Contains(strings.Join(argv, " "), "parcon check config -config") {
-			return 1, "", "invalid config:\n  - surprise", true
-		}
-		return 0, "", "", false
-	}
-	err := ti.SetConfig(context.Background(), "runners.max", "2")
-	if err == nil || !strings.Contains(err.Error(), "refuses the new config") {
-		t.Fatalf("SetConfig = %v", err)
-	}
-	c := ti.controller(t)
-	if _, ok := c.files[config.DefaultPath+".new"]; ok {
-		t.Error("config.yaml.new is left")
-	}
-	if cfg, _ := config.Parse([]byte(c.files[config.DefaultPath])); cfg.ScaleSets[0].MaxRunners != 1 {
-		t.Error("the controller's config changed")
-	}
-	if s, _ := settings.Load(ti.SettingsPath); s.ScaleSet.MaxRunners != 1 {
-		t.Error("the settings changed")
+	if ti.controllerConfig(t).MaxWorkers != 1 || ti.node.ran("systemctl try-restart") {
+		t.Error("the controller changed")
 	}
 }
 
@@ -124,14 +100,13 @@ func TestStatus(t *testing.T) {
 		return github.RunnerRelease{Version: "2.338.0"}, nil
 	}
 	t.Cleanup(func() { latestRunnerRelease = github.LatestRunnerRelease })
-	c := ti.controller(t)
 	desired := 1
 	snap := controller.Status{Schema: controller.StatusSchema, Version: "0.2.0", UpdatedAt: ti.Now(),
 		ScaleSets: []controller.ScaleSetStatus{{Target: "https://github.com/my-org", TargetKey: "my-org",
 			Name: "proxmox-ubuntu-26.04", ID: 3, SessionOpen: true,
 			SessionSince: ti.Now().Add(-2 * time.Hour), Desired: &desired,
 			Stats: &github.Stats{AvailableJobs: 1, RunningJobs: 1, RegisteredRunners: 1, BusyRunners: 1}}}}
-	c.files[controller.StatusPath] = jsonOf(snap)
+	must(t, os.WriteFile(ti.StatusPath, []byte(jsonOf(snap)), 0o600))
 	ti.node.vms[10000] = &fakeVM{id: 10000, name: "par-proxmox-ubuntu-26-04-abcde", pool: RunnerPool, running: true,
 		tags: []string{"par-managed", "par-worker", "par-ready", "par-ss-proxmox-ubuntu-26.04",
 			"par-created-" + strconv.FormatInt(ti.Now().Add(-12*time.Minute).Unix(), 10)}, config: map[string]string{}}
@@ -149,7 +124,7 @@ func TestStatus(t *testing.T) {
 		t.Errorf("progress:\n%s", progress)
 	}
 	for _, want := range []string{"ok    node pve1, its settings, and its VMs (",
-		"ok    controller VM 100 (", "ok    the latest release on GitHub (",
+		"ok    the controller's service (", "ok    the latest release on GitHub (",
 		"ok    the host's Proxmox objects and tuning (",
 		"ok    the runner template against actions/runner's latest release ("} {
 		if !strings.Contains(progress, want) {
@@ -163,7 +138,8 @@ func TestStatus(t *testing.T) {
 		"up to date with the latest release, 0.2.0",
 		"ok    pools, role, token, and the worker network parzone/parnet",
 		"ok    worker subnet 10.251.0.0/22 with SNAT and DHCP; firewall group par-worker and IP set par-blocked",
-		"Controller VM 100", "parcon.service is active", "its config matches the settings",
+		"Controller (parcon.service)", "parcon.service is active", "its config matches the settings",
+		"its secrets are encrypted in",
 		"scale set proxmox-ubuntu-26.04 (ID 3): listening for jobs for 2h",
 		"jobs: 1 waiting, 1 running; runners: 1 (1 busy, 0 idle)",
 		"template 10096 has actions/runner 2.338.0, the latest",
@@ -202,7 +178,7 @@ func TestStatus(t *testing.T) {
 	ti.node.services["dnsmasq@parzone.service"] = true
 
 	// A stopped controller, a config that drifted, and a stale runner fail or warn.
-	c.files[config.DefaultPath] = "# edited by hand\n"
+	must(t, os.WriteFile(ti.ConfigPath, []byte("# edited by hand\n"), 0o600))
 	latestRunnerRelease = func(context.Context) (github.RunnerRelease, error) {
 		return github.RunnerRelease{Version: "2.339.0", PublishedAt: ti.Now().Add(-25 * 24 * time.Hour)}, nil
 	}
@@ -218,11 +194,10 @@ func TestStatus(t *testing.T) {
 func TestSetConfigMaxLifetime(t *testing.T) {
 	ti := installed(t)
 	must(t, ti.SetConfig(context.Background(), "worker.maxLifetime", "36h"))
-	cfg, err := config.Parse([]byte(ti.controller(t).files[config.DefaultPath]))
-	if err != nil || cfg.ScaleSets[0].MaxLifetime != 36*time.Hour {
-		t.Fatalf("controller config: %+v, %v", cfg, err)
+	if cfg := ti.controllerConfig(t); cfg.ScaleSets[0].MaxLifetime != 36*time.Hour {
+		t.Fatalf("controller config: %+v", cfg)
 	}
-	if !ti.node.ran("qm guest exec 100 --timeout 480 -- systemctl try-restart parcon.service") {
+	if !ti.node.ran("systemctl try-restart parcon.service") {
 		t.Error("the controller wasn't restarted")
 	}
 	if out := ti.stdout.String(); !strings.Contains(out, "worker.maxLifetime: 6h -> 36h, which applies to every "+

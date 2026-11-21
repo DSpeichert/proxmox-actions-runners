@@ -75,7 +75,7 @@ type Options struct {
 	GitHub map[string]GitHub
 	// Releases looks up actions/runner releases.
 	Releases Releases
-	// Owner names this controller in GitHub's session list, such as the controller VM's hostname.
+	// Owner names this controller in GitHub's session list, such as the node's hostname.
 	Owner  string
 	Logger *slog.Logger
 
@@ -271,7 +271,7 @@ func (c *Controller) serve(ctx context.Context, s *scaleSetState) {
 }
 
 // register makes sure a scale set exists in GitHub and learns its ID, retrying until ctx ends, because GitHub may be
-// unreachable while the controller VM boots. It reports false if ctx ended first.
+// unreachable while the node boots. It reports false if ctx ended first.
 func (c *Controller) register(ctx context.Context, s *scaleSetState) bool {
 	backoff := time.Second
 	for {

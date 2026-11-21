@@ -7,7 +7,6 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
-	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -15,9 +14,6 @@ import (
 	"strings"
 	"testing"
 
-	"go.yaml.in/yaml/v3"
-
-	"github.com/klponce/proxmox-actions-runners/internal/config"
 	"github.com/klponce/proxmox-actions-runners/internal/release"
 	"github.com/klponce/proxmox-actions-runners/internal/settings"
 	"github.com/klponce/proxmox-actions-runners/internal/vmtags"
@@ -45,10 +41,9 @@ func (s *signedSource) publish(t *testing.T, key ed25519.PrivateKey, version str
 	v, err := release.ParseVersion(version)
 	must(t, err)
 	assets := map[string]string{
-		runnerImage(v):     "runner image " + version,
-		runnerManifest(v):  `{"builds":[{"custom_data":{"runner_version":"2.339.0"}}]}`,
-		controllerImage(v): "controller image " + version,
-		BinaryAsset(v):     "parcon " + version,
+		runnerImage(v):    "runner image " + version,
+		runnerManifest(v): `{"builds":[{"custom_data":{"runner_version":"2.339.0"}}]}`,
+		BinaryAsset(v):    "parcon " + version,
 	}
 	var sums strings.Builder
 	for name, content := range assets {
@@ -115,33 +110,27 @@ func TestUpgradeBringsTheNodeToTheRelease(t *testing.T) {
 	src := &signedSource{files: map[string][]byte{}}
 	v := src.publish(t, priv, "0.3.0")
 	ti.Source, ti.Keys, ti.Assets, ti.Version, ti.Yes = src, []ed25519.PublicKey{pub}, "", v, true
-	ti.Self = ti.BinaryPath // the new parcon, as an update runs it
-	ti.node.guest = func(vm *fakeVM, argv []string, _ []byte) (int, string, string, bool) {
-		if argv[0] == "sh" && strings.Contains(argv[2], "curl -fsSL --retry 3 -o /usr/local/bin/parcon.new") {
-			if !strings.HasSuffix(argv[4], "/v0.3.0/parcon-0.3.0-linux-amd64") || len(argv[5]) != 64 {
-				t.Errorf("controller download args %v", argv[3:])
-			}
-			vm.files["parcon-version"] = "0.3.0"
-			return 0, "", "", true
-		}
-		return 0, "", "", false
-	}
+	// The new parcon, as an update runs it: the old one installed it in place first.
+	must(t, os.WriteFile(ti.BinaryPath, []byte("parcon 0.3.0"), 0o755))
+	ti.Self = ti.BinaryPath
 
 	installedV, _ := release.ParseVersion("0.2.0")
 	must(t, ti.Upgrade(context.Background(), installedV, true, false))
 	out := ti.stdout.String()
-	for _, want := range []string{"import the 0.3.0 runner template",
-		"replace parcon 0.2.0 in controller VM 100 with 0.3.0", "render the controller's config",
-		"tag controller VM 100 with release 0.3.0"} {
+	for _, want := range []string{"import the 0.3.0 runner template", "render the controller's config",
+		"record release 0.3.0"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("plan lacks %q:\n%s", want, out)
 		}
 	}
 	n := ti.node
-	if tmpl := n.vmsTagged("par-release-0.3.0"); len(tmpl) != 2 { // the template and the controller
-		t.Errorf("VMs of 0.3.0: %v", tmpl)
+	if tmpl := n.vmsTagged("par-release-0.3.0"); len(tmpl) != 1 {
+		t.Errorf("templates of 0.3.0: %v", tmpl)
 	}
-	if !n.ran("qm guest exec 100 --timeout 480 -- systemctl try-restart parcon.service") {
+	if s, _ := settings.Load(ti.SettingsPath); s.Installed != "0.3.0" {
+		t.Errorf("installed = %q", s.Installed)
+	}
+	if !n.ran("systemctl try-restart parcon.service") {
 		t.Errorf("the controller wasn't restarted: %v", n.lines())
 	}
 
@@ -164,71 +153,39 @@ func TestUpgradeRefusesADowngrade(t *testing.T) {
 
 func TestInstallOnAnOlderInstallUpdatesIt(t *testing.T) {
 	ti := installed(t)
-	c := ti.controller(t)
-	c.tags = []string{vmtags.Managed, vmtags.Controller, "par-release-0.1.0"}
-	c.files["parcon-version"] = "0.1.0"
+	s, err := settings.Load(ti.SettingsPath)
+	must(t, err)
+	s.Installed = "0.1.0"
+	must(t, s.Save(ti.SettingsPath))
 	ti.Yes = true
-	err := ti.Install(context.Background(), defaultOptions())
-	// Local assets can't carry the controller's parcon, so the update stops there, after planning it.
-	if err == nil || !strings.Contains(err.Error(), "local assets") {
-		t.Fatalf("Install = %v", err)
-	}
+	must(t, ti.Install(context.Background(), defaultOptions()))
 	if !strings.Contains(ti.stdout.String(), "Update proxmox-actions-runners 0.1.0 to 0.2.0") {
 		t.Errorf("output:\n%s", ti.stdout)
 	}
-	_ = errors.New
+	if s, _ := settings.Load(ti.SettingsPath); s.Installed != "0.2.0" {
+		t.Errorf("installed = %q", s.Installed)
+	}
+	if !ti.node.ran("systemctl try-restart parcon.service") {
+		t.Error("the controller wasn't restarted with the new release")
+	}
 }
 
-// Settings from a release before several targets are saved in the new format, and the one App's key moves to its
-// own path: copied first, removed only once the controller runs with the config that names the new path.
-func TestUpgradeMovesSettingsFromVersion2(t *testing.T) {
+// A node with an older release's controller VM can't be updated in place.
+func TestUpgradeRefusesAControllerVMInstall(t *testing.T) {
 	ti := installed(t)
-	data, err := os.ReadFile(ti.SettingsPath)
-	must(t, err)
-	var doc map[string]any
-	must(t, yaml.Unmarshal(data, &doc))
-	doc["version"] = 2
-	doc["github"] = map[string]any{"configUrl": "https://github.com/my-org",
-		"app": map[string]any{"clientId": "Iv23liEXAMPLE", "installationId": 7, "slug": "my-runners"}}
-	data, err = yaml.Marshal(doc)
-	must(t, err)
-	must(t, os.WriteFile(ti.SettingsPath, data, 0o600))
-	c := ti.controller(t)
-	newKey := config.AppKeyFile("Iv23liEXAMPLE")
-	delete(c.files, newKey)
-	c.files[config.LegacyAppKeyFile] = "the App's key"
-	ti.Yes = true
-
+	ti.node.vms[100] = &fakeVM{id: 100, name: "par-controller", pool: SystemPool,
+		tags: []string{vmtags.Managed, vmtags.Controller, "par-release-0.1.0"}, running: true,
+		config: map[string]string{}}
 	v, _ := release.ParseVersion("0.2.0")
-	must(t, ti.Upgrade(context.Background(), v, true, false))
-	if !strings.Contains(ti.stdout.String(), "in format 3, copy the GitHub App key to "+newKey) {
-		t.Errorf("plan:\n%s", ti.stdout)
+	err := ti.Upgrade(context.Background(), v, true, false)
+	if err == nil || !strings.Contains(err.Error(), "VM 100 (par-controller) is from an older release") {
+		t.Errorf("Upgrade = %v", err)
 	}
-	s, err := settings.Load(ti.SettingsPath)
-	must(t, err)
-	if s.MigratedFrom() != 0 || len(s.GitHub.Targets) != 1 || s.GitHub.Apps[0].Owner != "my-org" {
-		t.Errorf("settings after the update = %+v", s.GitHub)
-	}
-	if c.files[newKey] != "the App's key" || c.files[config.LegacyAppKeyFile] != "" {
-		t.Errorf("keys after the update: new %q, old %q", c.files[newKey], c.files[config.LegacyAppKeyFile])
-	}
-	// The key is copied before the config naming it is pushed, and the old one removed only after the restart.
-	order := []string{"cp -p", "mv " + config.DefaultPath + ".new", "systemctl try-restart",
-		"rm -f " + config.LegacyAppKeyFile}
-	at := 0
-	for _, l := range ti.node.lines() {
-		if at < len(order) && strings.Contains(l, order[at]) {
-			at++
-		}
-	}
-	if at != len(order) {
-		t.Errorf("steps out of order, missing %q:\n%s", order[min(at, len(order)-1)], strings.Join(ti.node.lines(), "\n"))
-	}
-
-	// Done once, it isn't done again.
-	ti.stdout.Reset()
-	must(t, ti.Upgrade(context.Background(), v, true, false))
-	if !strings.Contains(ti.stdout.String(), "nothing needs updating") {
-		t.Errorf("second update:\n%s", ti.stdout)
+	d := settings.Default()
+	checks := ti.Preflight(context.Background(), &d, ModeInstall)
+	if !slices.ContainsFunc(checks, func(c Check) bool {
+		return c.Desc == "no controller VM from an older release" && !c.OK
+	}) {
+		t.Errorf("preflight passes a controller VM: %v", checks)
 	}
 }

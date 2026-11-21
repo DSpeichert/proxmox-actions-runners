@@ -9,8 +9,8 @@ import (
 )
 
 func TestTargetUsage(t *testing.T) {
-	defer func(f func() bool) { hostMode = f }(hostMode)
-	hostMode = func() bool { return true }
+	defer func(f func() bool) { inService = f }(inService)
+	inService = func() bool { return false }
 	tests := []struct {
 		args []string
 		want string

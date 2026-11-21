@@ -1,9 +1,10 @@
 // Package settings is the Proxmox host's record of how this node's runners are set up: the network, storage, and
-// VMIDs the installer used, the GitHub target and App it learned, and the scale set and worker hardware the user
-// chose. parcon keeps it in /etc/proxmox-actions-runners/settings.yaml on the host and renders the controller VM's
+// VMIDs the installer used, the GitHub targets and Apps it learned, and the scale set and worker hardware the user
+// chose. parcon keeps it in /etc/proxmox-actions-runners/settings.yaml on the host and renders the controller's
 // config.yaml from it, so the settings are the source of truth and the controller's config follows them.
 //
-// Nothing secret is in them: the App's private key and the Proxmox token live only in the controller VM.
+// Nothing secret is in them: the Apps' private keys and the Proxmox token are systemd credentials, encrypted, which
+// only the controller's service gets.
 package settings
 
 import (
@@ -24,16 +25,12 @@ import (
 	"github.com/klponce/proxmox-actions-runners/internal/pvecli"
 )
 
-// DefaultPath is where the settings live on the host. The directory has the same name as the controller VM's, but
-// the file has a different one, so the two are never confused.
+// DefaultPath is where the settings live on the host, next to the controller's config.
 const DefaultPath = "/etc/proxmox-actions-runners/settings.yaml"
 
-// Version is the settings file's format version. Version 3 holds several GitHub Apps and targets; Parse migrates
-// version 2, which held one of each.
-const Version = 3
-
-// DHCP is the value of an address setting that asks for DHCP.
-const DHCP = "dhcp"
+// Version is the settings file's format version. Version 4 is the first with the controller as a service on the
+// host; earlier versions had a controller VM, and parcon update can't move one.
+const Version = 4
 
 // Settings is the whole settings file.
 type Settings struct {
@@ -44,27 +41,18 @@ type Settings struct {
 	ScaleSet ScaleSet `yaml:"scaleSet"`
 	// Worker is the worker hardware the user set. A zero field means the GitHub-matching default in internal/config.
 	Worker config.Worker `yaml:"worker,omitempty"`
-
-	// migratedFrom is the version Parse migrated the file from, or 0.
-	migratedFrom int
+	// Installed is the release of the finished install. parcon install sets it last, so an install that stopped
+	// partway has none, and parcon update sets it to the release it updated to.
+	Installed string `yaml:"installed,omitempty"`
 }
 
-// MigratedFrom returns the format version the settings were read in, if Parse migrated them, or 0. The file is
-// rewritten in the current format by the next command that saves the settings.
-func (s *Settings) MigratedFrom() int { return s.migratedFrom }
-
-// Network is the controller VM's LAN side, and the worker network.
+// Network is the host's LAN side, and the worker network.
 type Network struct {
-	// Bridge is the LAN bridge the controller VM attaches to.
+	// Bridge is the LAN bridge: the API's address is on it, workers are kept off its LAN, and its NIC's offloads
+	// are turned off.
 	Bridge string `yaml:"bridge"`
-	// VLAN is the VLAN tag on the bridge; 0 means none.
-	VLAN int `yaml:"vlan,omitempty"`
 	// PVEAddress is the address the controller reaches the API on. Empty means the host's first address on Bridge.
 	PVEAddress string `yaml:"pveAddress,omitempty"`
-	// ControllerIP is "dhcp" or a static address with its prefix, such as 192.0.2.10/24.
-	ControllerIP string `yaml:"controllerIP"`
-	// LANGateway is the LAN's router, needed with a static address.
-	LANGateway string `yaml:"lanGateway,omitempty"`
 	// WorkerSubnet is the worker network's IPv4 subnet. The host takes its first address, and SDN DHCP hands out
 	// the rest.
 	WorkerSubnet string `yaml:"workerSubnet"`
@@ -79,14 +67,14 @@ type Proxmox struct {
 // GitHub is the organizations and repositories the runners serve and the Apps they use, as learned during the install
 // and parcon target add.
 type GitHub struct {
-	// Apps are the GitHub Apps whose keys are in the controller VM. A private App can only be installed on the
+	// Apps are the GitHub Apps whose keys the controller holds. A private App can only be installed on the
 	// account that owns it, so there is one per organization or personal account.
 	Apps []App `yaml:"apps,omitempty"`
 	// Targets are the organizations and repositories the runners serve. The first is the one parcon install set up.
 	Targets []Target `yaml:"targets,omitempty"`
 }
 
-// App identifies a GitHub App. Its private key is only in the controller VM.
+// App identifies a GitHub App. Its private key is a systemd credential only the controller gets.
 type App struct {
 	ClientID string `yaml:"clientId"`
 	// Slug is the App's name in its URLs, when parcon created it: it makes the App's install link.
@@ -197,7 +185,6 @@ func Default() Settings {
 		Version: Version,
 		Network: Network{
 			Bridge:       config.DefaultBridge,
-			ControllerIP: DHCP,
 			WorkerSubnet: config.DefaultWorkerSubnet,
 		},
 		Proxmox: Proxmox{
@@ -232,23 +219,16 @@ func Parse(data []byte) (*Settings, error) {
 	var v struct {
 		Version int `yaml:"version"`
 	}
-	if yaml.Unmarshal(data, &v) == nil && v.Version == 1 {
-		// Version 1 is the gateway VM's layout. Its install can't be updated in place.
-		return nil, errors.New("these settings are from a release with a gateway VM, which this release replaces " +
-			"with the Proxmox firewall; run parcon uninstall, then parcon install")
+	if yaml.Unmarshal(data, &v) == nil && v.Version >= 1 && v.Version < Version {
+		// Versions 1 to 3 had a controller VM, and version 1 a gateway VM too. Such an install can't be updated in
+		// place.
+		return nil, errors.New("these settings are from a release with a controller VM, which this release " +
+			"replaces with a service on the host; run parcon uninstall with the release that installed it, then " +
+			"parcon install")
 	}
-	var s Settings
-	if v.Version == 2 {
-		old, err := decodeStrict[settingsV2](data)
-		if err != nil {
-			return nil, err
-		}
-		s = old.migrate()
-	} else {
-		var err error
-		if s, err = decodeStrict[Settings](data); err != nil {
-			return nil, err
-		}
+	s, err := decodeStrict[Settings](data)
+	if err != nil {
+		return nil, err
 	}
 	if s.Version != Version {
 		return nil, fmt.Errorf("version %d isn't supported; this parcon reads version %d", s.Version, Version)
@@ -337,19 +317,8 @@ func (s *Settings) Validate() error {
 	if !idPattern.MatchString(n.Bridge) {
 		add("network.bridge", "%q is not a bridge name", n.Bridge)
 	}
-	if n.VLAN < 0 || n.VLAN > 4094 {
-		add("network.vlan", "%d must be 1 to 4094, or 0 for none", n.VLAN)
-	}
 	if a, err := netip.ParseAddr(n.PVEAddress); n.PVEAddress != "" && (err != nil || !a.Is4()) {
 		add("network.pveAddress", "%q must be an IPv4 address", n.PVEAddress)
-	}
-	static := n.ControllerIP != DHCP
-	if p, err := netip.ParsePrefix(n.ControllerIP); static && (err != nil || !p.Addr().Is4()) {
-		add("network.controllerIP", "%q must be dhcp or an IPv4 address with its prefix, such as 192.0.2.10/24",
-			n.ControllerIP)
-	}
-	if a, err := netip.ParseAddr(n.LANGateway); static && (err != nil || !a.Is4()) {
-		add("network.lanGateway", "the LAN router's IPv4 address is required with a static address")
 	}
 	if sub, err := netip.ParsePrefix(n.WorkerSubnet); err != nil || !sub.Addr().Is4() {
 		add("network.workerSubnet", "%q must be an IPv4 subnet, such as %s", n.WorkerSubnet, config.DefaultWorkerSubnet)

@@ -22,7 +22,7 @@ type Env struct {
 const configHeader = "# Written by parcon on the Proxmox host from its settings, and rewritten whenever they change.\n" +
 	"# Change them there with `parcon config set KEY VALUE`, not here.\n"
 
-// ControllerConfig renders the controller VM's config.yaml from the settings and the node, and checks it the way
+// ControllerConfig renders the controller's config.yaml from the settings and the node, and checks it the way
 // the controller will: with config.Parse. It returns the parsed config and the file's bytes.
 func ControllerConfig(s *Settings, env Env) (*config.Config, []byte, error) {
 	linked := env.LinkedClone
@@ -30,7 +30,7 @@ func ControllerConfig(s *Settings, env Env) (*config.Config, []byte, error) {
 		Proxmox: config.Proxmox{
 			URL:             fmt.Sprintf("https://%s/api2/json", netip.AddrPortFrom(env.PVEAddress, 8006)),
 			TokenID:         config.DefaultTokenID,
-			TokenSecretFile: config.TokenSecretFile,
+			TokenSecretFile: config.CredentialPath(config.CredToken),
 			Node:            env.Node,
 			Pool:            config.DefaultPool,
 			Storage:         s.Proxmox.Storage,
@@ -53,18 +53,18 @@ func ControllerConfig(s *Settings, env Env) (*config.Config, []byte, error) {
 	}
 	switch env.TLS.Mode {
 	case hostsys.TLSNodeCA:
-		c.Proxmox.CACertFile = config.CACertFile
+		c.Proxmox.CACertFile = config.CredentialPath(config.CredCACert)
 		c.Proxmox.TLSServerName = env.TLS.ServerName
 	case hostsys.TLSSystem:
 		c.Proxmox.TLSServerName = env.TLS.ServerName
 	case hostsys.TLSPin:
 		c.Proxmox.TLSFingerprint = env.TLS.Fingerprint
 	}
-	// An App comes once its key is in the controller, which is when the installer learns its Client ID, and a
+	// An App comes once its key is a credential, which is when the installer learns its Client ID, and a
 	// target once its App is installed there. Until then the controller doesn't serve it.
 	for _, a := range s.GitHub.Apps {
 		c.GitHub.Apps = append(c.GitHub.Apps, config.GitHubApp{ClientID: a.ClientID,
-			PrivateKeyFile: config.AppKeyFile(a.ClientID)})
+			PrivateKeyFile: config.CredentialPath(config.CredAppKey(a.ClientID))})
 	}
 	for _, t := range s.GitHub.CompleteTargets() {
 		c.GitHub.Targets = append(c.GitHub.Targets, config.Target{ConfigURL: t.URL, ClientID: t.ClientID,

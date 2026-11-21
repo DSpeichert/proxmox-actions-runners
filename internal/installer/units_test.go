@@ -98,14 +98,6 @@ func TestWorkerSubnetMustBeFree(t *testing.T) {
 	if c := check(t, ti.Preflight(context.Background(), &s, ModeInstall), "worker subnet"); !c.OK {
 		t.Errorf("our own route: %+v", c)
 	}
-
-	// Nor may it overlap a static LAN address.
-	s.Network.WorkerSubnet = "198.51.100.0/24"
-	s.Network.ControllerIP, s.Network.LANGateway = "198.51.100.10/24", "198.51.100.1"
-	if c := check(t, ti.Preflight(context.Background(), &s, ModeInstall), "worker subnet"); c.OK ||
-		!strings.Contains(c.Reason, "overlaps the LAN") {
-		t.Errorf("static LAN: %+v", c)
-	}
 }
 
 func TestNamesInUseBySomeoneElse(t *testing.T) {
@@ -121,7 +113,7 @@ func TestNamesInUseBySomeoneElse(t *testing.T) {
 		t.Errorf("%+v", c)
 	}
 	// An earlier run's objects are ours.
-	ti.node.pools[SystemPool] = PoolComment
+	ti.node.pools[RunnerPool] = PoolComment
 	if c := check(t, ti.Preflight(context.Background(), &s, ModeInstall), "names free"); !c.OK {
 		t.Errorf("ours: %+v", c)
 	}
@@ -344,18 +336,6 @@ func TestVMIDChoices(t *testing.T) {
 		t.Error("full reserved IDs: no error")
 	}
 
-	ti := newTestInstaller(t)
-	s := settings.Default()
-	s.Proxmox.VMIDRange = config.VMIDRange{Start: 100, End: 199}
-	ti.node.vms[200] = &fakeVM{id: 200, config: map[string]string{}}
-	ti.node.vms[201] = &fakeVM{id: 201, config: map[string]string{}}
-	if id, err := ti.systemVMID(context.Background(), &s); err != nil || id != 202 {
-		t.Errorf("systemVMID in the range = %d, %v", id, err)
-	}
-	s = settings.Default()
-	if id, err := ti.systemVMID(context.Background(), &s); err != nil || id != 100 {
-		t.Errorf("systemVMID = %d, %v", id, err)
-	}
 }
 
 func TestManagedVMsOrder(t *testing.T) {
@@ -378,14 +358,13 @@ func TestBlocked(t *testing.T) {
 		{"ifname":"vmbr1","addr_info":[{"local":"198.51.100.7","prefixlen":24}]},
 		{"ifname":"parnet","addr_info":[{"local":"10.251.0.1","prefixlen":22}]}]`
 	s := settings.Default()
-	s.Network.ControllerIP, s.Network.LANGateway = "192.0.2.11/24", "192.0.2.1"
 	// The worker subnet and the host's address on it aren't listed: the group drops them through SDN's own IP set.
-	block, err := ti.blocked(context.Background(), &s, netipMust("192.0.2.12"))
+	block, err := ti.blocked(context.Background(), &s)
 	if err != nil {
 		t.Fatal(err)
 	}
 	want := []string{"10.0.0.0/8", "100.64.0.0/10", "169.254.0.0/16", "172.16.0.0/12",
-		"192.0.2.0/24", "192.0.2.11", "192.0.2.12", "192.0.2.5", "192.168.0.0/16", "198.51.100.7"}
+		"192.0.2.0/24", "192.0.2.5", "192.168.0.0/16", "198.51.100.7"}
 	if !slices.Equal(block, want) {
 		t.Errorf("block = %v", block)
 	}

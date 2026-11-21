@@ -35,19 +35,17 @@ func privileges() string {
 	return strings.Join(slices.Compact(privs), ",")
 }
 
-// createAccess creates the pools, the role, and the user. The system pool comes first: its comment marks the
-// install as ours.
+// createAccess creates the runner pool, the role, and the user. The pool comes first: its comment marks the install
+// as ours.
 func (in *Installer) createAccess(ctx context.Context) error {
 	in.Out.Step("Proxmox access objects")
 	pools, err := in.PVE.Pools(ctx)
 	if err != nil {
 		return err
 	}
-	for _, pool := range []string{SystemPool, RunnerPool} {
-		if !slices.ContainsFunc(pools, func(p pvecli.Pool) bool { return p.ID == pool }) {
-			if err := in.run(ctx, "pveum", "pool", "add", pool, "--comment", PoolComment); err != nil {
-				return err
-			}
+	if !slices.ContainsFunc(pools, func(p pvecli.Pool) bool { return p.ID == RunnerPool }) {
+		if err := in.run(ctx, "pveum", "pool", "add", RunnerPool, "--comment", PoolComment); err != nil {
+			return err
 		}
 	}
 	roles, err := in.PVE.Roles(ctx)
@@ -203,9 +201,8 @@ func (in *Installer) networkDrift(ctx context.Context, s *settings.Settings) []s
 }
 
 // Asset names of a release.
-func runnerImage(v release.Version) string     { return "par-runner-" + v.String() + ".qcow2" }
-func runnerManifest(v release.Version) string  { return "par-runner-" + v.String() + ".json" }
-func controllerImage(v release.Version) string { return "parcon-" + v.String() + ".qcow2" }
+func runnerImage(v release.Version) string    { return "par-runner-" + v.String() + ".qcow2" }
+func runnerManifest(v release.Version) string { return "par-runner-" + v.String() + ".json" }
 
 // BinaryAsset is the release's parcon binary.
 func BinaryAsset(v release.Version) string { return "parcon-" + v.String() + "-linux-amd64" }

@@ -1,12 +1,12 @@
 # Example controller config. parcon on the Proxmox host renders the real one from its settings and writes it to
-# /etc/proxmox-actions-runners/config.yaml in the controller VM; change it there with `parcon config set`, since the
+# /etc/proxmox-actions-runners/config.yaml on the host; change it there with `parcon config set`, since the
 # next change rewrites the file. All values here are placeholders.
 
 proxmox:
   url: https://192.0.2.1:8006/api2/json
   tokenId: par@pve!controller
-  tokenSecretFile: /etc/proxmox-actions-runners/pve-token
-  caCertFile: /etc/proxmox-actions-runners/pve-ca.pem  # the node's CA; omit for a certificate the system trusts
+  tokenSecretFile: ${CREDENTIALS_DIRECTORY}/parcon.pve-token  # a systemd credential of parcon.service
+  caCertFile: ${CREDENTIALS_DIRECTORY}/parcon.pve-ca.pem  # the node's CA; omit for a certificate the system trusts
   tlsServerName: pve1.example.com  # a name the API's certificate is issued for, since the URL uses an IP
   node: pve1
   pool: par-runners
@@ -20,9 +20,9 @@ proxmox:
 github:
   apps:                            # one per organization or account; written by the installer's App setup
     - clientId: Iv23liEXAMPLE0000000
-      privateKeyFile: /etc/proxmox-actions-runners/github-app-Iv23liEXAMPLE0000000.pem
+      privateKeyFile: ${CREDENTIALS_DIRECTORY}/parcon.github-app-Iv23liEXAMPLE0000000
     - clientId: Iv23liEXAMPLE0000001
-      privateKeyFile: /etc/proxmox-actions-runners/github-app-Iv23liEXAMPLE0000001.pem
+      privateKeyFile: ${CREDENTIALS_DIRECTORY}/parcon.github-app-Iv23liEXAMPLE0000001
   targets:                         # every scale set is registered with every target
     - configUrl: https://github.com/my-org
       clientId: Iv23liEXAMPLE0000000

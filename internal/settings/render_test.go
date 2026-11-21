@@ -27,7 +27,7 @@ func TestControllerConfigBeforeTheApp(t *testing.T) {
 	}
 	p := c.Proxmox
 	if p.URL != "https://192.0.2.5:8006/api2/json" || p.TokenID != "par@pve!controller" || p.Node != "pve1" ||
-		p.CACertFile != config.CACertFile || p.TLSServerName != "pve1" || p.Pool != "par-runners" ||
+		p.CACertFile != "${CREDENTIALS_DIRECTORY}/parcon.pve-ca.pem" || p.TokenSecretFile != "${CREDENTIALS_DIRECTORY}/parcon.pve-token" || p.TLSServerName != "pve1" || p.Pool != "par-runners" ||
 		p.VNet != "parnet" || !p.UseLinkedClone() || p.VMIDRange != (config.VMIDRange{Start: 10000, End: 10099}) {
 		t.Errorf("proxmox = %+v", p)
 	}
@@ -68,8 +68,8 @@ func TestControllerConfigWithTheApp(t *testing.T) {
 		t.Error(err)
 	}
 	wantGitHub := config.GitHub{
-		Apps: []config.GitHubApp{{ClientID: "Iv23liEXAMPLE", PrivateKeyFile: config.AppKeyFile("Iv23liEXAMPLE")},
-			{ClientID: "Iv23liUSER", PrivateKeyFile: config.AppKeyFile("Iv23liUSER")}},
+		Apps: []config.GitHubApp{{ClientID: "Iv23liEXAMPLE", PrivateKeyFile: config.CredentialPath(config.CredAppKey("Iv23liEXAMPLE"))},
+			{ClientID: "Iv23liUSER", PrivateKeyFile: config.CredentialPath(config.CredAppKey("Iv23liUSER"))}},
 		Targets: []config.Target{{ConfigURL: "https://github.com/my-org", ClientID: "Iv23liEXAMPLE", InstallationID: 7}},
 	}
 	if !reflect.DeepEqual(c.GitHub, wantGitHub) {

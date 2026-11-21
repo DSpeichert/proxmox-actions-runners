@@ -34,14 +34,14 @@ func TestSettingsFlags(t *testing.T) {
 		t.Errorf("defaults = %+v", s)
 	}
 
-	s, sf, err = parseSettingsFlags(t, "--bridge", "vmbr1", "--vlan", "20", "--vmid-range", "20000-20099",
-		"--scale-set", "big", "--labels", "big,linux", "--controller-ip", "192.0.2.10/24", "--lan-gateway", "192.0.2.1",
+	s, sf, err = parseSettingsFlags(t, "--bridge", "vmbr1", "--pve-address", "192.0.2.5", "--vmid-range", "20000-20099",
+		"--scale-set", "big", "--labels", "big,linux",
 		"--github-url", "https://github.com/my-org/", "--set", "runners.max=4", "--set", "worker.memory=16GiB",
 		"--app", "manual", "--client-id", "Iv23liEXAMPLE")
 	if err != nil || !sf.given {
 		t.Fatalf("flags: %v, given %v", err, sf.given)
 	}
-	if s.Network.Bridge != "vmbr1" || s.Network.VLAN != 20 || s.Proxmox.VMIDRange != (config.VMIDRange{Start: 20000, End: 20099}) ||
+	if s.Network.Bridge != "vmbr1" || s.Network.PVEAddress != "192.0.2.5" || s.Proxmox.VMIDRange != (config.VMIDRange{Start: 20000, End: 20099}) ||
 		!slices.Equal(s.ScaleSet.Labels, []string{"big", "linux"}) || s.ScaleSet.MaxRunners != 4 ||
 		s.Worker.MemoryMiB != 16384 || !slices.Equal(s.GitHub.Targets, []settings.Target{{URL: "https://github.com/my-org"}}) || sf.clientID != "Iv23liEXAMPLE" {
 		t.Errorf("settings = %+v", s)
@@ -63,7 +63,7 @@ func TestSettingsFlagsRefuse(t *testing.T) {
 		{[]string{"--set", "worker.memory=16GB"}, "use GiB or MiB"},
 		{[]string{"--set", "worker.disk=1"}, "unknown key"},
 		{[]string{"--app", "browser"}, "--app must be manifest or manual"},
-		{[]string{"--controller-ip", "192.0.2.10/24"}, "network.lanGateway"},
+		{[]string{"--pve-address", "pve1"}, "network.pveAddress"},
 	} {
 		if _, _, err := parseSettingsFlags(t, tt.args...); err == nil || !strings.Contains(err.Error(), tt.want) {
 			t.Errorf("%v: %v, want %q", tt.args, err, tt.want)
@@ -72,19 +72,19 @@ func TestSettingsFlagsRefuse(t *testing.T) {
 }
 
 func TestCommandsRunWhereTheyBelong(t *testing.T) {
-	defer func(f func() bool) { hostMode = f }(hostMode)
+	defer func(f func() bool) { inService = f }(inService)
 	var stdout, stderr bytes.Buffer
 
-	hostMode = func() bool { return false }
+	inService = func() bool { return true }
 	for _, cmd := range []string{"install", "status", "update", "config", "uninstall", "target"} {
 		if err := run([]string{cmd}, &stdout, &stderr); err == nil || !strings.Contains(err.Error(), "runs on the Proxmox host") {
-			t.Errorf("%s in the VM: %v", cmd, err)
+			t.Errorf("%s in the sandbox: %v", cmd, err)
 		}
 	}
 
-	hostMode = func() bool { return true }
+	inService = func() bool { return false }
 	for _, cmd := range []string{"run", "github"} {
-		if err := run([]string{cmd}, &stdout, &stderr); err == nil || !strings.Contains(err.Error(), "runs in the controller VM") {
+		if err := run([]string{cmd}, &stdout, &stderr); err == nil || !strings.Contains(err.Error(), "runs in the controller's sandbox") {
 			t.Errorf("%s on the host: %v", cmd, err)
 		}
 	}

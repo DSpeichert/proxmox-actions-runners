@@ -9,6 +9,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"errors"
+	"maps"
 	"math/big"
 	"os"
 	"os/exec"
@@ -102,7 +103,7 @@ func (l *linkAnswerer) Choose(p string, _ []string) (int, error) {
 // assertNoSecrets checks that no secret reached a command line, the output, or the host's files.
 func (ti *testInstaller) assertNoSecrets(t *testing.T, errs ...error) {
 	t.Helper()
-	secrets := []string{tokenSecret, manifestCode, userManifestCode, "SENTINEL-app-key"}
+	secrets := []string{tokenSecret, manifestCode, userManifestCode, appKeyLine}
 	for _, l := range ti.node.lines() {
 		for _, s := range secrets {
 			if strings.Contains(l, s) {
@@ -138,13 +139,18 @@ func (ti *testInstaller) assertNoSecrets(t *testing.T, errs ...error) {
 	})
 }
 
-func (ti *testInstaller) controller(t *testing.T) *fakeVM {
+// controllerConfig returns the controller's config.
+func (ti *testInstaller) controllerConfig(t *testing.T) *config.Config {
 	t.Helper()
-	ids := ti.node.vmsTagged(vmtags.Controller)
-	if len(ids) != 1 {
-		t.Fatalf("controller VMs: %v", ids)
+	data, err := os.ReadFile(ti.ConfigPath)
+	if err != nil {
+		t.Fatal(err)
 	}
-	return ti.node.vms[ids[0]]
+	cfg, err := config.Parse(data)
+	if err != nil {
+		t.Fatalf("controller config: %v\n%s", err, data)
+	}
+	return cfg
 }
 
 func TestInstall(t *testing.T) {
@@ -169,8 +175,8 @@ func TestInstall(t *testing.T) {
 		Apps:    []settings.App{{ClientID: "Iv23liEXAMPLE", Slug: "my-runners", Owner: "my-org"}},
 		Targets: []settings.Target{{URL: "https://github.com/my-org", ClientID: "Iv23liEXAMPLE", InstallationID: 7}},
 	}
-	if !reflect.DeepEqual(s.GitHub, wantGitHub) || s.Version != settings.Version {
-		t.Errorf("settings github = %+v, want %+v", s.GitHub, wantGitHub)
+	if !reflect.DeepEqual(s.GitHub, wantGitHub) || s.Version != settings.Version || s.Installed != "0.2.0" {
+		t.Errorf("settings github = %+v, want %+v; installed %q", s.GitHub, wantGitHub, s.Installed)
 	}
 	// The installation is looked up on the account that owns the new App, never taken on trust.
 	if !slices.ContainsFunc(ti.node.lines(), func(l string) bool {
@@ -181,7 +187,7 @@ func TestInstall(t *testing.T) {
 
 	// Proxmox objects.
 	n := ti.node
-	if n.pools[SystemPool] != PoolComment || n.pools[RunnerPool] != PoolComment {
+	if _, ok := n.pools[SystemPool]; ok || n.pools[RunnerPool] != PoolComment {
 		t.Errorf("pools = %v", n.pools)
 	}
 	if !strings.Contains(n.roles[Role], "VM.GuestAgent.FileWrite") || strings.Contains(n.roles[Role], "Unrestricted") {
@@ -201,9 +207,9 @@ func TestInstall(t *testing.T) {
 		t.Errorf("subnets = %+v", n.subnets)
 	}
 
-	// The worker firewall: what workers must not reach, including the LAN, the host, and the controller, and
-	// the group that lets DNS through to the host's resolver and drops the rest of it.
-	for _, want := range []string{"10.0.0.0/8", "192.168.0.0/16", "192.0.2.0/24", "192.0.2.5", "192.0.2.100"} {
+	// The worker firewall: what workers must not reach, including the LAN and the host the controller runs on,
+	// and the group that lets DNS through to the host's resolver and drops the rest of it.
+	for _, want := range []string{"10.0.0.0/8", "192.168.0.0/16", "192.0.2.0/24", "192.0.2.5"} {
 		if !slices.Contains(n.ipsets[BlockedIPSet], want) {
 			t.Errorf("IP set %s = %v, lacks %s", BlockedIPSet, n.ipsets[BlockedIPSet], want)
 		}
@@ -219,8 +225,7 @@ func TestInstall(t *testing.T) {
 		t.Errorf("host rules = %+v", n.hostRules)
 	}
 
-	// VMs: a template with the worker firewall in the reserved IDs, the controller outside the range, no
-	// smoke-test clone left.
+	// VMs: a template with the worker firewall in the reserved IDs, and no smoke-test clone left.
 	tmpl := n.vmsTagged(vmtags.Template)
 	if len(tmpl) != 1 || tmpl[0] != 10096 || !n.vms[10096].template ||
 		!slices.Contains(n.vms[10096].tags, "par-rv-2.338.0") {
@@ -235,27 +240,44 @@ func TestInstall(t *testing.T) {
 	if len(n.vmsTagged(vmtags.Build)) != 0 {
 		t.Error("the smoke-test clone is left")
 	}
-	c := ti.controller(t)
-	if c.id != 100 || !slices.Contains(c.tags, "par-release-0.2.0") || c.config["net0"] != "virtio,bridge=vmbr0" {
-		t.Errorf("controller = %+v", c)
-	}
-	if g := n.vmsTagged(vmtags.Gateway); len(g) != 0 {
-		t.Errorf("gateway = %v", g)
+	if len(n.vms) != 1 {
+		t.Errorf("VMs: %v, want only the template", slices.Collect(maps.Keys(n.vms)))
 	}
 
-	// The controller's files: the config with the App, the token, and the CA.
-	cfg, err := config.Parse([]byte(c.files[config.DefaultPath]))
-	if err != nil {
-		t.Fatalf("controller config: %v\n%s", err, c.files[config.DefaultPath])
+	// The controller: its config with the App, the CA, its unit, its secrets encrypted, and its service on.
+	cfg := ti.controllerConfig(t)
+	if err := cfg.RequireGitHub(); err != nil || cfg.Proxmox.URL != "https://192.0.2.5:8006/api2/json" ||
+		cfg.Proxmox.TokenSecretFile != "${CREDENTIALS_DIRECTORY}/parcon.pve-token" ||
+		cfg.GitHub.Apps[0].PrivateKeyFile != "${CREDENTIALS_DIRECTORY}/parcon.github-app-Iv23liEXAMPLE" {
+		t.Errorf("controller config: %v, %+v, %+v", err, cfg.Proxmox, cfg.GitHub)
 	}
-	if err := cfg.RequireGitHub(); err != nil || cfg.Proxmox.URL != "https://192.0.2.5:8006/api2/json" {
-		t.Errorf("controller config: %v, %+v", err, cfg.Proxmox)
+	if ca, err := os.ReadFile(ti.CACertPath); err != nil || len(ca) == 0 {
+		t.Errorf("CA: %v", err)
 	}
-	if c.files[config.TokenSecretFile] != tokenSecret+"\n" || c.files[config.CACertFile] == "" {
-		t.Errorf("controller files: %v", slices.Collect(mapKeys(c.files)))
+	if n.credentials["parcon.pve-token"] != tokenSecret || n.credentials["parcon.github-app-Iv23liEXAMPLE"] != appKeyPEM {
+		t.Errorf("credentials: %v", slices.Collect(maps.Keys(n.credentials)))
 	}
-	if _, left := c.files[config.DefaultPath+".new"]; left {
-		t.Error("config.yaml.new is left")
+	for _, name := range []string{"parcon.pve-token", "parcon.github-app-Iv23liEXAMPLE"} {
+		if st, err := os.Stat(filepath.Join(ti.CredStoreDir, name)); err != nil || st.Mode().Perm() != 0o600 {
+			t.Errorf("credential %s: %v", name, err)
+		}
+	}
+	unit, err := os.ReadFile(ti.UnitPath)
+	if err != nil || !strings.Contains(string(unit), "DynamicUser=yes\n") ||
+		!strings.Contains(string(unit), "LoadCredential=parcon.config:"+ti.ConfigPath+"\n") ||
+		!strings.Contains(string(unit), "LoadCredential=parcon.pve-ca.pem:"+ti.CACertPath+"\n") ||
+		!strings.Contains(string(unit), "ImportCredential=parcon.*\n") {
+		t.Errorf("unit: %v\n%s", err, unit)
+	}
+	if !n.services[ServiceName] || !n.ran("systemctl daemon-reload") {
+		t.Error("parcon.service isn't enabled")
+	}
+	// Proxmox is checked as the controller, in its sandbox.
+	if !slices.ContainsFunc(n.lines(), func(l string) bool {
+		return strings.HasPrefix(l, "systemd-run ") && strings.Contains(l, "--property=DynamicUser=yes") &&
+			strings.HasSuffix(l, ti.BinaryPath+" check proxmox")
+	}) {
+		t.Errorf("parcon check proxmox didn't run as the controller:\n%s", strings.Join(n.lines(), "\n"))
 	}
 	if !strings.Contains(ti.stdout.String(), "runs-on: proxmox-ubuntu-26.04") {
 		t.Errorf("summary:\n%s", ti.stdout)
@@ -264,16 +286,6 @@ func TestInstall(t *testing.T) {
 	// A second install refuses: the node has a finished install.
 	if err := ti.Install(ctx, defaultOptions()); !errors.Is(err, ErrInstalled) {
 		t.Errorf("second Install = %v", err)
-	}
-}
-
-func mapKeys(m map[string]string) func(func(string) bool) {
-	return func(yield func(string) bool) {
-		for k := range m {
-			if !yield(k) {
-				return
-			}
-		}
 	}
 }
 
@@ -307,7 +319,7 @@ func TestInstallContinuesWithTheSameApp(t *testing.T) {
 	ti.answerManifest()
 	ctx := context.Background()
 	// The first run stops while waiting for the App's installation.
-	ti.node.guest = func(_ *fakeVM, argv []string, _ []byte) (int, string, string, bool) {
+	ti.node.controller = func(argv []string) (int, string, string, bool) {
 		if slices.Contains(argv, "wait-installation") {
 			return 1, "", "timed out", true
 		}
@@ -322,30 +334,18 @@ func TestInstallContinuesWithTheSameApp(t *testing.T) {
 	}
 
 	// The second run continues: no second App, the same VMs, and it refuses new settings.
-	ti.node.guest = nil
+	ti.node.controller = nil
 	opts := defaultOptions()
 	opts.FlagsGiven = true
 	if err := ti.Install(ctx, opts); err == nil || !strings.Contains(err.Error(), "earlier install's settings") {
 		t.Errorf("Install with new settings = %v", err)
 	}
-	creates := 0
-	for _, l := range ti.node.lines() {
-		if strings.Contains(l, "parcon github app create") {
-			creates++
-		}
-	}
 	vmsBefore := len(ti.node.vms)
 	if err := ti.Install(ctx, defaultOptions()); err != nil {
 		t.Fatalf("second Install: %v\n%s", err, ti.stderr)
 	}
-	after := 0
-	for _, l := range ti.node.lines() {
-		if strings.Contains(l, "parcon github app create") {
-			after++
-		}
-	}
-	if after != creates {
-		t.Error("the second run created another App")
+	if s, _ := settings.Load(ti.SettingsPath); len(s.GitHub.Apps) != 1 {
+		t.Errorf("the second run created another App: %+v", s.GitHub.Apps)
 	}
 	if len(ti.node.vms) != vmsBefore {
 		t.Errorf("VMs: %d before, %d after", vmsBefore, len(ti.node.vms))
@@ -365,18 +365,11 @@ func TestInstallWithAnExistingApp(t *testing.T) {
 		t.Fatalf("Install: %v", err)
 	}
 	ti.assertNoSecrets(t, err)
-	if ti.node.ran("qm guest exec 100 --timeout 60 -- runuser -u parcon -- parcon github app create") {
+	if ti.stdout.Len() > 0 && strings.Contains(ti.stdout.String(), "Created GitHub App") {
 		t.Error("created an App")
 	}
-	var imported bool
-	for _, c := range ti.node.calls {
-		if strings.HasSuffix(c.String(), "parcon github app import -client-id Iv23liEXISTING") &&
-			string(c.Stdin) == appKeyPEM {
-			imported = true
-		}
-	}
-	if !imported {
-		t.Error("the key wasn't imported on stdin")
+	if ti.node.credentials["parcon.github-app-Iv23liEXISTING"] != appKeyPEM {
+		t.Error("the key wasn't encrypted from stdin")
 	}
 	if s, _ := settings.Load(ti.SettingsPath); len(s.GitHub.Apps) != 1 || s.GitHub.Apps[0].ClientID != "Iv23liEXISTING" ||
 		s.GitHub.Apps[0].Owner != "my-org" {
@@ -438,10 +431,10 @@ func TestUninstall(t *testing.T) {
 
 	ti.Change.DryRun = true
 	must(t, ti.Uninstall(ctx))
-	if !strings.Contains(ti.stdout.String(), "now: 100 10000 10096") {
+	if !strings.Contains(ti.stdout.String(), "now: 10000 10096") {
 		t.Errorf("dry-run plan:\n%s", ti.stdout)
 	}
-	if len(ti.node.vms) != 4 {
+	if len(ti.node.vms) != 3 {
 		t.Error("the dry run destroyed VMs")
 	}
 
@@ -477,16 +470,24 @@ func TestUninstall(t *testing.T) {
 	if i, j := strings.Index(lines, "parcon github scaleset delete"), strings.Index(lines, "qm destroy"); i < 0 || j < i {
 		t.Error("the scale set wasn't deleted first")
 	}
-	for _, path := range []string{ti.SettingsPath, ti.BinaryPath} {
+	for _, path := range []string{ti.SettingsPath, ti.BinaryPath, ti.UnitPath, ti.ConfigPath, ti.CACertPath,
+		filepath.Join(ti.CredStoreDir, "parcon.pve-token"),
+		filepath.Join(ti.CredStoreDir, "parcon.github-app-Iv23liEXAMPLE")} {
 		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
 			t.Errorf("%s is left", path)
 		}
 	}
+	if n.services[ServiceName] {
+		t.Error("parcon.service is still enabled")
+	}
+	// The scale sets are deleted before the controller stops.
+	if i, j := strings.Index(lines, "github scaleset delete"), strings.Index(lines, "systemctl disable --now parcon.service"); i < 0 || j < i {
+		t.Errorf("stop order:\n%s", lines)
+	}
 }
 
 func TestControllerStopTimeoutOutlastsTheService(t *testing.T) {
-	unit, err := os.ReadFile("../../deploy/parcon.service")
-	must(t, err)
+	unit := newTestInstaller(t).renderUnit()
 	m := regexp.MustCompile(`(?m)^TimeoutStopSec=(\d+)(min|s)$`).FindSubmatch(unit)
 	if m == nil {
 		t.Fatal("parcon.service has no TimeoutStopSec")
@@ -509,7 +510,7 @@ func TestInstallEndsWithTheAppsInstallLink(t *testing.T) {
 	ti.answerManifest()
 	var shown []string
 	waits := 0
-	ti.node.guest = func(_ *fakeVM, argv []string, _ []byte) (int, string, string, bool) {
+	ti.node.controller = func(argv []string) (int, string, string, bool) {
 		if slices.Contains(argv, "wait-installation") {
 			shown = append(shown, lastLine(ti.stdout.String()))
 			if waits++; waits == 1 {
@@ -539,7 +540,7 @@ func TestInstallWithAnExistingAppSaysWhereToInstallIt(t *testing.T) {
 	ti := newTestInstaller(t)
 	ti.Term = &linkAnswerer{ti: ti}
 	var shown string
-	ti.node.guest = func(_ *fakeVM, argv []string, _ []byte) (int, string, string, bool) {
+	ti.node.controller = func(argv []string) (int, string, string, bool) {
 		if slices.Contains(argv, "wait-installation") && shown == "" {
 			shown = lastLine(ti.stdout.String())
 		}

@@ -45,27 +45,6 @@ func (in *Installer) guestExec(ctx context.Context, vmid int, timeout time.Durat
 	return res.Stdout, nil
 }
 
-// asParcon runs argv in the controller VM as the parcon user.
-func (in *Installer) asParcon(ctx context.Context, vmid int, timeout time.Duration, stdin []byte, argv ...string) (
-	[]byte, error,
-) {
-	return in.guestExec(ctx, vmid, timeout, stdin, append([]string{"runuser", "-u", "parcon", "--"}, argv...)...)
-}
-
-// writeControllerFile writes data to a file in the controller VM, owned by parcon with mode 0600. The data travels
-// on stdin, so it may be a secret.
-func (in *Installer) writeControllerFile(ctx context.Context, vmid int, path string, data []byte) error {
-	in.Change.Log(fmt.Sprintf("controller VM %d: write %s", vmid, path))
-	if in.Change.DryRun {
-		return nil
-	}
-	_, err := in.asParcon(ctx, vmid, 30*time.Second, data, "sh", "-c", `umask 077 && cat >"$1"`, "sh", path)
-	if err != nil {
-		return fmt.Errorf("write %s in the controller VM: %w", path, err)
-	}
-	return nil
-}
-
 // waitAgent waits until a VM's guest agent answers.
 func (in *Installer) waitAgent(ctx context.Context, vmid int) error {
 	for deadline := in.Now().Add(5 * time.Minute); ; {

@@ -28,9 +28,9 @@ func (in *Installer) destroyBuildVMs(ctx context.Context) error {
 }
 
 // CheckNetwork clones a worker from the newest template into a reserved VMID and checks from inside it that it gets
-// a DHCP lease and reaches GitHub, and can't reach the Proxmox API or the controller VM. The clone is tagged Build,
-// so the controller leaves it alone, and is always destroyed.
-func (in *Installer) CheckNetwork(ctx context.Context, s *settings.Settings, controller netip.Addr) (err error) {
+// a DHCP lease and reaches GitHub, and can't reach the Proxmox API, which is on the host the controller runs on. The
+// clone is tagged Build, so the controller leaves it alone, and is always destroyed.
+func (in *Installer) CheckNetwork(ctx context.Context, s *settings.Settings) (err error) {
 	in.Out.Step("Worker network check")
 	if err := in.destroyBuildVMs(ctx); err != nil {
 		return err
@@ -85,16 +85,10 @@ func (in *Installer) CheckNetwork(ctx context.Context, s *settings.Settings, con
 		"https://"+netip.AddrPortFrom(pve, 8006).String()+"/"); err == nil {
 		failures = append(failures, "the worker can reach the Proxmox API")
 	}
-	if controller.IsValid() {
-		if _, err := in.guestExec(ctx, vmid, 30*time.Second, nil, "timeout", "5", "bash", "-c",
-			"</dev/tcp/"+controller.String()+"/22"); err == nil {
-			failures = append(failures, "the worker can reach the controller VM")
-		}
-	}
 	if len(failures) > 0 {
 		return fmt.Errorf("worker network check: %s", strings.Join(failures, "; "))
 	}
-	in.Out.Say("    the worker got a lease, reaches GitHub, and can't reach the Proxmox API or the controller")
+	in.Out.Say("    the worker got a lease, reaches GitHub, and can't reach the host or its Proxmox API")
 	return nil
 }
 

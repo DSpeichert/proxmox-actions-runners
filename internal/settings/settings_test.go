@@ -50,7 +50,8 @@ func TestParseRejects(t *testing.T) {
 	for name, doc := range map[string]string{
 		"empty":         "",
 		"old version":   "version: 0\n",
-		"unknown field": "version: 2\nnetwork: {bridge: vmbr0, controllerIP: dhcp, workerSubnet: 10.251.0.0/22}\nsurprise: 1\n",
+		"unknown field": "version: 4\nnetwork: {bridge: vmbr0, workerSubnet: 10.251.0.0/22}\nsurprise: 1\n",
+		"VM fields":     "version: 4\nnetwork: {bridge: vmbr0, controllerIP: dhcp, workerSubnet: 10.251.0.0/22}\n",
 	} {
 		if _, err := Parse([]byte(doc)); err == nil {
 			t.Errorf("%s: no error", name)
@@ -58,10 +59,18 @@ func TestParseRejects(t *testing.T) {
 	}
 }
 
-func TestParseRefusesTheGatewayVMSettings(t *testing.T) {
-	doc := "version: 1\nnetwork: {bridge: vmbr0, gatewayIP: dhcp, controllerIP: dhcp, workerSubnet: 10.251.0.0/22}\n"
-	if _, err := Parse([]byte(doc)); err == nil || !strings.Contains(err.Error(), "parcon uninstall, then parcon install") {
-		t.Errorf("Parse = %v, want the reinstall message", err)
+// Versions 1 to 3 had a controller VM, which an update can't move to the host.
+func TestParseRefusesTheControllerVMSettings(t *testing.T) {
+	for _, doc := range []string{
+		"version: 1\nnetwork: {bridge: vmbr0, gatewayIP: dhcp, controllerIP: dhcp, workerSubnet: 10.251.0.0/22}\n",
+		"version: 2\nnetwork: {bridge: vmbr0, controllerIP: dhcp, workerSubnet: 10.251.0.0/22}\n" +
+			"github: {configUrl: https://github.com/my-org}\n",
+		"version: 3\nnetwork: {bridge: vmbr0, controllerIP: dhcp, workerSubnet: 10.251.0.0/22}\n",
+	} {
+		if _, err := Parse([]byte(doc)); err == nil || !strings.Contains(err.Error(), "controller VM") ||
+			!strings.Contains(err.Error(), "then parcon install") {
+			t.Errorf("Parse = %v, want the reinstall message", err)
+		}
 	}
 }
 
@@ -81,8 +90,7 @@ func TestValidateChecksTheDHCPRange(t *testing.T) {
 func TestValidateReportsEveryProblem(t *testing.T) {
 	s := Default()
 	s.Network.Bridge = "vmbr0; rm"
-	s.Network.VLAN = 5000
-	s.Network.ControllerIP = "banana"
+	s.Network.PVEAddress = "banana"
 	s.Network.WorkerSubnet = "10.251.1.0/22"
 	s.Proxmox.Storage = "-bad"
 	s.Proxmox.VMIDRange.End = s.Proxmox.VMIDRange.Start + 2
@@ -102,7 +110,7 @@ func TestValidateReportsEveryProblem(t *testing.T) {
 		t.Fatalf("Validate = %v", err)
 	}
 	want := []string{
-		"network.bridge", "network.vlan", "network.controllerIP", "network.lanGateway", "network.workerSubnet",
+		"network.bridge", "network.pveAddress", "network.workerSubnet",
 		"proxmox.storage", "proxmox.vmidRange", "github.apps[0].clientId", "github.targets[0].url",
 		"github.targets[1].clientId", "scaleSet.name", "scaleSet.labels", "scaleSet.maxLifetime",
 		"scaleSet.minRunners", "worker.memoryMiB",
@@ -113,50 +121,6 @@ func TestValidateReportsEveryProblem(t *testing.T) {
 	for i, field := range want {
 		if i < len(verr.Problems) && !strings.HasPrefix(verr.Problems[i], field+": ") {
 			t.Errorf("problem %d = %q, want %s", i, verr.Problems[i], field)
-		}
-	}
-}
-
-// Settings from before several targets are read as one App and one target, and saved in the current format.
-func TestParseMigratesVersion2(t *testing.T) {
-	v2 := `version: 2
-network: {bridge: vmbr0, controllerIP: dhcp, workerSubnet: 10.251.0.0/22}
-proxmox: {storage: local-lvm, vmidRange: {start: 10000, end: 10099}}
-github:
-  configUrl: https://github.com/octocat/hello
-  app: {clientId: Iv23liEXAMPLE, installationId: 7, slug: my-runners}
-scaleSet: {name: proxmox-ubuntu-26.04, runnerGroup: default, minRunners: 0, maxRunners: 2}
-`
-	s, err := Parse([]byte(v2))
-	if err != nil {
-		t.Fatalf("Parse: %v", err)
-	}
-	want := GitHub{
-		Apps:    []App{{ClientID: "Iv23liEXAMPLE", Slug: "my-runners", Owner: "octocat"}},
-		Targets: []Target{{URL: "https://github.com/octocat/hello", ClientID: "Iv23liEXAMPLE", InstallationID: 7}},
-	}
-	if s.Version != Version || s.MigratedFrom() != 2 || !reflect.DeepEqual(s.GitHub, want) ||
-		s.ScaleSet.MaxRunners != 2 {
-		t.Errorf("Parse = %+v (migrated from %d)", s, s.MigratedFrom())
-	}
-	data, err := s.Marshal()
-	if err != nil {
-		t.Fatal(err)
-	}
-	again, err := Parse(data)
-	if err != nil || again.MigratedFrom() != 0 || !reflect.DeepEqual(again.GitHub, want) {
-		t.Errorf("Parse(Marshal) = %+v, %v\n%s", again, err, data)
-	}
-
-	// An install that stopped before its App was installed: only the target, or only the App.
-	for doc, want := range map[string]GitHub{
-		"configUrl: https://github.com/my-org": {Targets: []Target{{URL: "https://github.com/my-org"}}},
-		"app: {clientId: Iv23liEXAMPLE}":       {Apps: []App{{ClientID: "Iv23liEXAMPLE"}}},
-	} {
-		s, err := Parse([]byte(strings.Replace(v2, `  configUrl: https://github.com/octocat/hello
-  app: {clientId: Iv23liEXAMPLE, installationId: 7, slug: my-runners}`, "  "+doc, 1)))
-		if err != nil || !reflect.DeepEqual(s.GitHub, want) {
-			t.Errorf("Parse with %s = %+v, %v", doc, s, err)
 		}
 	}
 }

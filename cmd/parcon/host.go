@@ -20,12 +20,6 @@ import (
 	"github.com/klponce/proxmox-actions-runners/internal/term"
 )
 
-// hostMode reports whether parcon runs on the Proxmox host rather than in the controller VM. Tests replace it.
-var hostMode = func() bool {
-	st, err := os.Stat("/etc/pve/nodes")
-	return err == nil && st.IsDir()
-}
-
 // newInstaller returns the Installer for this host. Tests replace it.
 var newInstaller = func(stdout, stderr io.Writer, dryRun bool) (*installer.Installer, error) {
 	self, err := os.Executable()
@@ -91,12 +85,9 @@ type settingsFlags struct {
 func (f *settingsFlags) register(fs *flag.FlagSet) {
 	f.s = settings.Default()
 	n := &f.s.Network
-	fs.StringVar(&n.Bridge, "bridge", n.Bridge, "LAN bridge for the controller VM")
-	fs.IntVar(&n.VLAN, "vlan", 0, "VLAN tag on the LAN bridge (default none)")
+	fs.StringVar(&n.Bridge, "bridge", n.Bridge, "the host's LAN bridge, whose LAN workers can't reach")
 	fs.StringVar(&n.PVEAddress, "pve-address", "", "this node's address the controller uses for the API "+
 		"(default: its address on the bridge)")
-	fs.StringVar(&n.ControllerIP, "controller-ip", n.ControllerIP, "controller VM's LAN address: dhcp or a CIDR such as 192.0.2.10/24")
-	fs.StringVar(&n.LANGateway, "lan-gateway", "", "LAN router, needed with a static address")
 	fs.StringVar(&n.WorkerSubnet, "worker-subnet", n.WorkerSubnet, "worker network")
 	fs.StringVar(&f.s.Proxmox.Storage, "storage", f.s.Proxmox.Storage, "storage for VM disks")
 	fs.StringVar(&f.vmids, "vmid-range", fmt.Sprintf("%d-%d", config.DefaultVMIDStart, config.DefaultVMIDEnd),

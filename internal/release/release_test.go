@@ -229,11 +229,3 @@ func TestLocalAndReplaceBinary(t *testing.T) {
 		t.Errorf("dst = %q, %v", data, st.Mode())
 	}
 }
-
-func TestAssetURL(t *testing.T) {
-	v, _ := ParseVersion("0.2.0-rc.1")
-	want := "https://github.com/klponce/proxmox-actions-runners/releases/download/v0.2.0-rc.1/parcon-0.2.0-rc.1-linux-amd64"
-	if got := AssetURL(v, "parcon-0.2.0-rc.1-linux-amd64"); got != want {
-		t.Errorf("AssetURL = %s", got)
-	}
-}

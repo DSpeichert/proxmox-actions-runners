@@ -85,10 +85,6 @@ func (g GitHub) Open(ctx context.Context, v Version, asset string) (io.ReadClose
 	return resp.Body, nil
 }
 
-// AssetURL is the download URL of an asset of a release on github.com, for the controller VM, which downloads its
-// own parcon.
-func AssetURL(v Version, asset string) string { return GitHub{}.assetURL(v, asset) }
-
 // Latest returns the newest release, or the newest release or pre-release with includePre.
 func Latest(ctx context.Context, src Source, includePre bool) (Info, error) {
 	rels, err := src.Releases(ctx)

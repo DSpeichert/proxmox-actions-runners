@@ -3,7 +3,6 @@ package installer
 import (
 	"context"
 	"errors"
-	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -45,19 +44,17 @@ func vmids(vms []proxmox.VM) string {
 	return strings.Join(ids, " ")
 }
 
-// Uninstall removes everything parcon and the controller created: the scale sets in GitHub, the VMs (an older
-// release's gateway VM too), the Proxmox objects, the worker firewall and network, the offload rule, no-kvm-apf,
-// the settings, and parcon itself, last. The GitHub Apps stay.
+// Uninstall removes everything parcon and the controller created: the scale sets in GitHub, the controller's service,
+// config, and credentials, the VMs, the Proxmox objects, the worker firewall and network, the offload rule,
+// no-kvm-apf, the settings, and parcon itself, last. The GitHub Apps stay.
 func (in *Installer) Uninstall(ctx context.Context) error {
 	vms, err := in.vms(ctx)
 	if err != nil {
 		return err
 	}
 	managed := managedVMs(vms)
-	controller, hasController, err := in.systemVM(ctx, vmtags.Controller)
-	if err != nil {
-		return err
-	}
+	_, unitErr := os.Stat(in.UnitPath)
+	hasController := unitErr == nil
 	node, err := in.nodeName(ctx)
 	if err != nil {
 		return err
@@ -70,13 +67,13 @@ func (in *Installer) Uninstall(ctx context.Context) error {
 		if s, err := settings.Load(in.SettingsPath); err == nil && len(s.GitHub.Targets) > 0 {
 			targets = strings.Join(targetURLs(s), ", ")
 		}
-		in.Out.Say("  stop the controller and delete its scale sets in GitHub, for %s (the Apps themselves stay)",
-			targets)
+		in.Out.Say("  delete the scale sets in GitHub, for %s (the Apps themselves stay), then stop %s", targets,
+			ServiceName)
 	}
-	in.Out.Say("  destroy the VMs tagged %s in %s and %s, now: %s", vmtags.Managed, SystemPool, RunnerPool,
-		vmids(managed))
-	in.Out.Say("  remove pools %s and %s, role %s, user %s with its token and ACLs", SystemPool, RunnerPool, Role,
-		PVEUser)
+	in.Out.Say("  remove %s, %s, %s, and the controller's credentials in %s", in.UnitPath, in.ConfigPath,
+		in.CACertPath, in.CredStoreDir)
+	in.Out.Say("  destroy the VMs tagged %s in %s, now: %s", vmtags.Managed, RunnerPool, vmids(managed))
+	in.Out.Say("  remove pool %s, role %s, user %s with its token and ACLs", RunnerPool, Role, PVEUser)
 	in.Out.Say("  remove firewall security group %s, IP set %s, and the host's DHCP rule for %s (the datacenter "+
 		"firewall stays on)", FirewallGroup, BlockedIPSet, VNet)
 	in.Out.Say("  remove SDN subnet, VNet %s, and zone %s, then apply the SDN config", VNet, Zone)
@@ -99,25 +96,13 @@ func (in *Installer) Uninstall(ctx context.Context) error {
 	}
 	defer unlock()
 
-	if hasController && controller.Status == "running" {
-		in.Out.Step("Stop the controller")
-		in.Change.Log(fmt.Sprintf("controller VM %d: systemctl disable --now parcon.service", controller.VMID))
-		if _, err := in.guestExec(ctx, controller.VMID, ControllerStopTimeout, nil, "systemctl", "disable", "--now",
-			"parcon.service"); err != nil {
-			in.Out.Warn("stopping parcon.service failed: %v", err)
-		}
-		in.Change.Log(fmt.Sprintf("controller VM %d: parcon github scaleset delete", controller.VMID))
-		if out, err := in.asParcon(ctx, controller.VMID, 2*time.Minute, nil, "parcon", "github", "scaleset",
-			"delete"); err != nil {
-			in.Out.Warn("deleting the scale sets in GitHub failed; remove those left in the organizations' or "+
-				"repositories' Actions settings (Runners): %v", err)
-		} else {
-			in.Out.Say("    %s", strings.TrimSpace(string(out)))
-		}
+	if err := in.removeController(ctx, hasController); err != nil {
+		return err
 	}
 
 	in.Out.Step("Destroy VMs")
-	// Listed again: until it stopped, the controller kept creating and destroying workers.
+	// Listed again: until it stopped, the controller kept creating and destroying workers. VMs an older release left
+	// in its system pool go too.
 	if vms, err = in.vms(ctx); err != nil {
 		return err
 	}
@@ -157,6 +142,47 @@ func (in *Installer) Uninstall(ctx context.Context) error {
 	}
 	in.Out.Step("Done")
 	in.Out.Say("proxmox-actions-runners is removed. The GitHub Apps remain; delete them in GitHub's settings if you like.")
+	return nil
+}
+
+// removeController stops the controller and removes it: its scale sets in GitHub first, while it still has its
+// credentials, then its service, its unit, its config, and its credentials. The scale sets are deleted before the
+// service stops, since the controller would register them again if it ran on; it then retires workers whose runners
+// are gone.
+func (in *Installer) removeController(ctx context.Context, hasController bool) error {
+	in.Out.Step("Stop and remove the controller")
+	if hasController {
+		in.Change.Log("as the controller: parcon github scaleset delete")
+		if !in.Change.DryRun {
+			if out, err := in.controllerExec(ctx, 2*time.Minute, "github", "scaleset", "delete"); err != nil {
+				in.Out.Warn("deleting the scale sets in GitHub failed; remove those left in the organizations' or "+
+					"repositories' Actions settings (Runners): %v", err)
+			} else {
+				in.Out.Say("    %s", strings.TrimSpace(string(out)))
+			}
+		}
+		if err := in.run(ctx, "systemctl", "disable", "--now", ServiceName); err != nil {
+			in.Out.Warn("stopping %s failed: %v", ServiceName, err)
+		}
+		if err := in.Change.Remove(in.UnitPath); err != nil {
+			return err
+		}
+		if err := in.run(ctx, "systemctl", "daemon-reload"); err != nil {
+			return err
+		}
+	}
+	for _, name := range in.ourCredentials() {
+		if err := in.removeCredential(name); err != nil {
+			return err
+		}
+	}
+	for _, path := range []string{in.ConfigPath, in.CACertPath} {
+		if _, err := os.Stat(path); err == nil {
+			if err := in.Change.Remove(path); err != nil {
+				return err
+			}
+		}
+	}
 	return nil
 }
 

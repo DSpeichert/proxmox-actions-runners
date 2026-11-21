@@ -1,7 +1,8 @@
 // Package installer is parcon's host side: it installs, checks, updates, and uninstalls the runners on a standalone
-// Proxmox VE node, and pushes the host's settings into the controller VM. It is install.sh's successor, and keeps its
-// rules (docs/install.md): checks come first and change nothing, every change is logged and shown in a plan first,
-// every step checks what already exists so a re-run continues, and secrets reach a VM only on a command's stdin.
+// Proxmox VE node, and renders the controller's config and service from the host's settings. It is install.sh's
+// successor, and keeps its rules (docs/install.md): checks come first and change nothing, every change is logged and
+// shown in a plan first, every step checks what already exists so a re-run continues, and secrets travel only on a
+// command's stdin, to systemd-creds, which encrypts them for the controller.
 package installer
 
 import (
@@ -17,6 +18,8 @@ import (
 	"time"
 
 	"github.com/klponce/proxmox-actions-runners/internal/config"
+	"github.com/klponce/proxmox-actions-runners/internal/controller"
+	"github.com/klponce/proxmox-actions-runners/internal/github"
 	"github.com/klponce/proxmox-actions-runners/internal/hostsys"
 	"github.com/klponce/proxmox-actions-runners/internal/proxmox"
 	"github.com/klponce/proxmox-actions-runners/internal/pvecli"
@@ -28,6 +31,8 @@ import (
 
 // Proxmox objects. Uninstall finds everything by these names and tags.
 const (
+	// SystemPool held the controller VM in releases before the controller ran on the host; preflight refuses a node
+	// that still has it.
 	SystemPool = "par-system"
 	RunnerPool = config.DefaultPool
 	Role       = "PARController"
@@ -35,27 +40,23 @@ const (
 	TokenName  = "controller"
 	Zone       = config.DefaultZone
 	VNet       = config.DefaultVNet
-	// PoolComment marks the system pool as ours. The installer creates it first, so it also marks an earlier,
+	// PoolComment marks the runner pool as ours. The installer creates it first, so it also marks an earlier,
 	// unfinished install.
 	PoolComment = "proxmox-actions-runners"
 )
 
 // Sizes, in GiB unless named otherwise.
 const (
-	// ControllerGiB is the controller image's and VM's disk. The image holds about 2.5 GiB when built, but a kernel
-	// update (unattended-upgrades) briefly needs two kernels and a new initramfs.
-	ControllerGiB = 6
-	// FreeGiB is what the VM storage needs for the default install: the controller and template disks, and room
-	// for a worker.
+	// FreeGiB is what the VM storage needs for the default install: the template's disk, and room for a worker.
 	FreeGiB = 50
-	// DownloadDir holds the images between download and import, on the host's root filesystem; DownloadGiB is
-	// what the two need, with room to grow.
+	// DownloadDir holds the runner image between download and import, on the host's root filesystem; DownloadGiB is
+	// what it needs, with room to grow.
 	DownloadDir = "/var/tmp"
-	DownloadGiB = 6
+	DownloadGiB = 4
 )
 
-// ControllerStopTimeout is how long parcon.service may take to stop or restart: longer than its TimeoutStopSec in
-// deploy/parcon.service, since the controller finishes retirements in flight first. A test keeps the two in step.
+// ControllerStopTimeout is how long parcon.service may take to stop or restart: longer than its TimeoutStopSec
+// (renderUnit), since the controller finishes retirements in flight first. A test keeps the two in step.
 const ControllerStopTimeout = 420 * time.Second
 
 // HelperURL is the GitHub Pages helper for the GitHub App manifest flow.
@@ -77,6 +78,15 @@ type Installer struct {
 	// SettingsPath is the host settings file, and BinaryPath where parcon is installed.
 	SettingsPath string
 	BinaryPath   string
+	// ConfigPath is the controller's config, CACertPath the node's CA for it, CredStoreDir where its secrets are
+	// kept encrypted, UnitPath its unit, and StatusPath the status file it writes.
+	ConfigPath   string
+	CACertPath   string
+	CredStoreDir string
+	UnitPath     string
+	StatusPath   string
+	// ConvertManifest spends a GitHub App manifest code and returns the new App and its private key.
+	ConvertManifest func(ctx context.Context, code string) (github.App, string, error)
 	// Self is the running parcon executable, which install copies to BinaryPath.
 	Self string
 	// Version is this parcon's release. Install and update bring the node to it.
@@ -109,21 +119,27 @@ func New(out *term.Out, self string, version release.Version, dryRun bool) (*Ins
 	}
 	exec := pvecli.OSExec{}
 	return &Installer{
-		PVE:          pvecli.PVE{Exec: exec},
-		Change:       &pvecli.Changer{Exec: exec, Out: out.W, DryRun: dryRun},
-		Sys:          hostsys.System{Paths: hostsys.DefaultPaths(), Exec: exec},
-		Term:         term.TTY{},
-		Out:          out,
-		SettingsPath: settings.DefaultPath,
-		BinaryPath:   BinaryPath,
-		Self:         self,
-		Version:      version,
-		Source:       release.GitHub{},
-		Keys:         keys,
-		Reach:        reachHTTPS,
-		Now:          time.Now,
-		Sleep:        sleep,
-		LockPath:     "/run/lock/parcon.lock",
+		PVE:             pvecli.PVE{Exec: exec},
+		Change:          &pvecli.Changer{Exec: exec, Out: out.W, DryRun: dryRun},
+		Sys:             hostsys.System{Paths: hostsys.DefaultPaths(), Exec: exec},
+		Term:            term.TTY{},
+		Out:             out,
+		SettingsPath:    settings.DefaultPath,
+		BinaryPath:      BinaryPath,
+		ConfigPath:      config.DefaultPath,
+		CACertPath:      config.CACertPath,
+		CredStoreDir:    CredStoreDir,
+		UnitPath:        UnitPath,
+		StatusPath:      controller.StatusPath,
+		ConvertManifest: github.ConvertManifest,
+		Self:            self,
+		Version:         version,
+		Source:          release.GitHub{},
+		Keys:            keys,
+		Reach:           reachHTTPS,
+		Now:             time.Now,
+		Sleep:           sleep,
+		LockPath:        "/run/lock/parcon.lock",
 	}, nil
 }
 
@@ -207,7 +223,7 @@ func tagged(vms []proxmox.VM, pool, tag string) []proxmox.VM {
 	return out
 }
 
-// systemVM returns a VM in the system pool by its tag: the controller, or an older release's gateway.
+// systemVM returns a VM in the system pool by its tag: an older release's controller or gateway VM.
 func (in *Installer) systemVM(ctx context.Context, tag string) (proxmox.VM, bool, error) {
 	vms, err := in.vms(ctx)
 	if err != nil {
@@ -219,25 +235,50 @@ func (in *Installer) systemVM(ctx context.Context, tag string) (proxmox.VM, bool
 	return proxmox.VM{}, false, nil
 }
 
-// releaseTag is this release's tag.
+// releaseTag is this release's tag, which the runner template it imports carries.
 func (in *Installer) releaseTag() string { return vmtags.ReleasePrefix + in.Version.String() }
 
-// InstalledRelease returns the release of a finished install: the controller VM's release tag. The controller gets
-// it last, so an install that stopped partway has none.
-func (in *Installer) InstalledRelease(ctx context.Context) (release.Version, bool, error) {
-	vm, ok, err := in.systemVM(ctx, vmtags.Controller)
-	if err != nil || !ok {
-		return release.Version{}, false, err
+// refuseOlderLayout refuses a node with a controller or gateway VM from an older release: this release runs the
+// controller on the host, and can't move an install over.
+func (in *Installer) refuseOlderLayout(ctx context.Context) error {
+	for _, tag := range []string{vmtags.Controller, vmtags.Gateway} {
+		vm, ok, err := in.systemVM(ctx, tag)
+		if err != nil {
+			return err
+		}
+		if ok {
+			return fmt.Errorf("VM %d (%s) is from an older release, which this release replaces with a service on "+
+				"the host; it can't move that install over: run parcon uninstall with the release that installed "+
+				"it, then parcon install", vm.VMID, vm.Name)
+		}
 	}
-	s, ok := vmtags.String(vm, vmtags.ReleasePrefix)
-	if !ok {
+	return nil
+}
+
+// InstalledRelease returns the release of a finished install, from the settings. An install sets it last, so one
+// that stopped partway has none.
+func (in *Installer) InstalledRelease(context.Context) (release.Version, bool, error) {
+	s, err := settings.Load(in.SettingsPath)
+	if errors.Is(err, os.ErrNotExist) {
 		return release.Version{}, false, nil
 	}
-	v, err := release.ParseVersion(s)
 	if err != nil {
-		return release.Version{}, false, fmt.Errorf("controller VM %d: %w", vm.VMID, err)
+		return release.Version{}, false, err
+	}
+	if s.Installed == "" {
+		return release.Version{}, false, nil
+	}
+	v, err := release.ParseVersion(s.Installed)
+	if err != nil {
+		return release.Version{}, false, fmt.Errorf("settings %s: installed: %w", in.SettingsPath, err)
 	}
 	return v, true, nil
+}
+
+// markInstalled records in the settings that the install is finished, at this release.
+func (in *Installer) markInstalled(s *settings.Settings) error {
+	s.Installed = in.Version.String()
+	return in.saveSettings(s)
 }
 
 // loadSettings reads the host settings.

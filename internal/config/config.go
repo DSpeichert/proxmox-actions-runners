@@ -1,8 +1,8 @@
 // Package config defines the controller's configuration file: its schema, defaults, and validation.
 //
 // parcon on the Proxmox host renders the file from its settings and writes it to
-// /etc/proxmox-actions-runners/config.yaml in the controller VM. Secrets are never stored in it; it only names the
-// files that hold them.
+// /etc/proxmox-actions-runners/config.yaml, which the controller's service gets as a credential. Secrets are never
+// stored in it; it only names the credentials that hold them.
 package config
 
 import (
@@ -20,23 +20,15 @@ import (
 	"go.yaml.in/yaml/v3"
 )
 
-// The controller VM's files (docs/install.md, "Controller VM contract"): the config, and the secrets it names. Only
-// the parcon user can read them.
+// The controller's files on the host (docs/install.md, "Controller service contract"), readable only by root. The
+// service gets them as credentials (CredConfig, CredCACert); the secrets are credentials of their own.
 const (
 	Dir = "/etc/proxmox-actions-runners"
 	// DefaultPath is the config file.
 	DefaultPath = Dir + "/config.yaml"
-	// TokenSecretFile holds the Proxmox API token's secret.
-	TokenSecretFile = Dir + "/pve-token"
-	// LegacyAppKeyFile held the one GitHub App's private key before several Apps; parcon update moves it to
-	// AppKeyFile.
-	LegacyAppKeyFile = Dir + "/github-app.pem"
-	// CACertFile is a copy of the node's CA, when the API serves the node's own certificate.
-	CACertFile = Dir + "/pve-ca.pem"
+	// CACertPath is a copy of the node's CA, when the API serves the node's own certificate.
+	CACertPath = Dir + "/pve-ca.pem"
 )
-
-// AppKeyFile returns where a GitHub App's private key is kept, by its Client ID.
-func AppKeyFile(clientID string) string { return Dir + "/github-app-" + clientID + ".pem" }
 
 // Config is the controller's whole configuration.
 type Config struct {

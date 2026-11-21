@@ -3,9 +3,14 @@ package installer
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
 	"crypto/sha256"
+	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"maps"
@@ -21,6 +26,7 @@ import (
 	"time"
 
 	"github.com/klponce/proxmox-actions-runners/internal/config"
+	"github.com/klponce/proxmox-actions-runners/internal/github"
 	"github.com/klponce/proxmox-actions-runners/internal/hostsys"
 	"github.com/klponce/proxmox-actions-runners/internal/pvecli"
 	"github.com/klponce/proxmox-actions-runners/internal/release"
@@ -33,8 +39,18 @@ const (
 	manifestCode = "SENTINEL-manifest-code"
 	// userManifestCode makes the manifest flow create an App on the personal account octocat.
 	userManifestCode = "SENTINEL-user-manifest-code"
-	appKeyPEM        = "-----BEGIN RSA PRIVATE KEY-----\nSENTINEL-app-key\n-----END RSA PRIVATE KEY-----\n"
 )
+
+// appKeyPEM is a GitHub App's private key; appKeyLine, a line from the middle of it, stands for it when tests look
+// for leaks.
+var appKeyPEM, appKeyLine = func() (string, string) {
+	k, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		panic(err)
+	}
+	key := string(pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(k)}))
+	return key, strings.Split(key, "\n")[3]
+}()
 
 type fakeVM struct {
 	id       int
@@ -45,8 +61,6 @@ type fakeVM struct {
 	running  bool
 	memMiB   int
 	config   map[string]string
-	// files are files in the guest, for the controller.
-	files map[string]string
 	// fwOptions and fwRules are the VM's own firewall, which a clone copies.
 	fwOptions map[string]string
 	fwRules   []pvecli.Rule
@@ -89,8 +103,16 @@ type fakeNode struct {
 	kvmGuest            bool
 	grubDropIn, grubCfg string
 
-	// guest handles commands run in a VM; nil means the defaults in guestDefault.
+	// guest handles commands run in a VM; nil means the defaults in exec.
 	guest func(vm *fakeVM, argv []string, stdin []byte) (exit int, stdout, stderr string, handled bool)
+	// controller handles the parcon commands run as the controller (systemd-run); nil means the defaults in parcon.
+	controller func(args []string) (exit int, stdout, stderr string, handled bool)
+	// configPath is the controller's config, which the controller's log follows.
+	configPath string
+	// credentials are the secrets systemd-creds encrypted, by credential name; the files hold no secret.
+	credentials map[string]string
+	// tpm2 makes systemd-creds find a TPM2.
+	tpm2 bool
 	// failOnce makes the first command whose line starts with a key fail.
 	failOnce map[string]bool
 	// apps are the Apps the manifest flow creates, by manifest code, and installations where they are installed,
@@ -112,9 +134,10 @@ func newFakeNode(t *testing.T, sysNet string) *fakeNode {
 			Avail: 200 << 30},
 		addrs: `[{"ifname":"lo","addr_info":[{"local":"127.0.0.1","prefixlen":8}]},
 			{"ifname":"vmbr0","addr_info":[{"local":"192.0.2.5","prefixlen":24}]}]`,
-		routes:     `[{"dst":"default","dev":"vmbr0"},{"dst":"192.0.2.0/24","dev":"vmbr0"}]`,
-		offloadsOn: map[string]bool{},
-		failOnce:   map[string]bool{},
+		routes:      `[{"dst":"default","dev":"vmbr0"},{"dst":"192.0.2.0/24","dev":"vmbr0"}]`,
+		offloadsOn:  map[string]bool{},
+		failOnce:    map[string]bool{},
+		credentials: map[string]string{},
 		apps: map[string]fakeApp{
 			manifestCode: {ClientID: "Iv23liEXAMPLE", AppID: 1, Slug: "my-runners", Owner: "my-org",
 				OwnerType: "Organization"},
@@ -129,13 +152,25 @@ func newFakeNode(t *testing.T, sysNet string) *fakeNode {
 	}
 }
 
-// fakeApp is what parcon github app create prints.
+// fakeApp is an App the manifest flow creates.
 type fakeApp struct {
-	ClientID  string `json:"clientId"`
-	AppID     int    `json:"appId"`
-	Slug      string `json:"slug"`
-	Owner     string `json:"owner"`
-	OwnerType string `json:"ownerType"`
+	ClientID  string
+	AppID     int
+	Slug      string
+	Owner     string
+	OwnerType string
+}
+
+// convertManifest is the fake node's GitHub: it creates the App for a manifest code.
+func (n *fakeNode) convertManifest(_ context.Context, code string) (github.App, string, error) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	app, ok := n.apps[code]
+	if !ok {
+		return github.App{}, "", errors.New("github: the manifest code is invalid or expired")
+	}
+	return github.App{ID: int64(app.AppID), Slug: app.Slug, ClientID: app.ClientID, Owner: app.Owner,
+		OwnerType: app.OwnerType}, appKeyPEM, nil
 }
 
 func (n *fakeNode) Run(_ context.Context, c pvecli.Cmd) ([]byte, error) {
@@ -229,10 +264,40 @@ func (n *fakeNode) run(c pvecli.Cmd) (string, error) {
 		}
 		return "install ok installed", nil
 	case "systemctl":
-		if n.services[a[len(a)-1]] {
-			return "", nil
+		return n.systemctl(a)
+	case "systemd-run":
+		i := slices.Index(a, "--")
+		exit, stdout, stderr := n.parcon(a[i+2:])
+		if exit != 0 {
+			return stdout, fmt.Errorf("exit status %d: %s", exit, stderr)
 		}
-		return "", fmt.Errorf("exit status 3")
+		return stdout, nil
+	case "systemd-creds":
+		switch a[0] {
+		case "has-tpm2":
+			if n.tpm2 {
+				return "", nil
+			}
+			return "", fmt.Errorf("exit status 1")
+		case "encrypt":
+			name := strings.TrimPrefix(a[slices.IndexFunc(a, func(s string) bool {
+				return strings.HasPrefix(s, "--name=")
+			})], "--name=")
+			n.credentials[name] = string(c.Stdin)
+			return "", os.WriteFile(a[len(a)-1], []byte("encrypted credential "+name+"\n"), 0o644)
+		}
+	case "journalctl":
+		// The controller logs JSON, and a line for each target's session once it is open.
+		out := `{"level":"INFO","msg":"starting"}` + "\n"
+		if data, err := os.ReadFile(n.configPath); err == nil {
+			if cfg, err := config.Parse(data); err == nil {
+				for _, t := range cfg.GitHub.Targets {
+					out += jsonOf(map[string]any{"level": "INFO", "msg": "scale set session opened",
+						"component": "github", "target": t.ConfigURL, "scaleSetId": 3}) + "\n"
+				}
+			}
+		}
+		return out, nil
 	}
 	return "", fmt.Errorf("the fake node doesn't know %s", c)
 }
@@ -618,7 +683,7 @@ func (n *fakeNode) qm(a []string, stdin []byte) (string, error) {
 		}
 		mem, _ := strconv.Atoi(flagOf(a, "--memory"))
 		vm := &fakeVM{id: id, name: flagOf(a, "--name"), pool: flagOf(a, "--pool"), memMiB: mem,
-			tags: strings.Split(flagOf(a, "--tags"), ";"), config: map[string]string{}, files: map[string]string{}}
+			tags: strings.Split(flagOf(a, "--tags"), ";"), config: map[string]string{}}
 		for _, k := range []string{"net0", "net1"} {
 			if v := flagOf(a, "--"+k); v != "" {
 				vm.config[k] = v
@@ -667,7 +732,7 @@ func (n *fakeNode) qm(a []string, stdin []byte) (string, error) {
 		}
 		id, _ := strconv.Atoi(a[2])
 		n.vms[id] = &fakeVM{id: id, name: flagOf(a, "--name"), pool: flagOf(a, "--pool"), tags: slices.Clone(src.tags),
-			config: map[string]string{"scsi0": "clone"}, files: map[string]string{},
+			config:    map[string]string{"scsi0": "clone"},
 			fwOptions: maps.Clone(src.fwOptions), fwRules: slices.Clone(src.fwRules)}
 		return "", nil
 	case "guest":
@@ -694,92 +759,72 @@ func (n *fakeNode) qm(a []string, stdin []byte) (string, error) {
 	return "", fmt.Errorf("the fake node doesn't know qm %s", strings.Join(a, " "))
 }
 
-// exec runs a command in a guest.
-func (n *fakeNode) exec(vm *fakeVM, argv []string, stdin []byte) (int, string, string) {
-	if n.guest != nil {
-		if exit, stdout, stderr, ok := n.guest(vm, argv, stdin); ok {
+// systemctl handles the host's systemctl: the services in services are active, parcon.service among them once it is
+// enabled.
+func (n *fakeNode) systemctl(a []string) (string, error) {
+	unit := a[len(a)-1]
+	switch a[0] {
+	case "--version":
+		return "systemd 257 (257.9-1~deb13u1)\n+PAM +AUDIT +SELINUX +APPARMOR +TPM2\n", nil
+	case "enable":
+		n.services[unit] = true
+		return "", nil
+	case "disable":
+		delete(n.services, unit)
+		return "", nil
+	case "daemon-reload", "try-restart":
+		return "", nil
+	case "is-active":
+		if n.services[unit] {
+			return "active\n", nil
+		}
+		return "inactive\n", fmt.Errorf("exit status 3")
+	}
+	return "", fmt.Errorf("the fake node doesn't know systemctl %s", strings.Join(a, " "))
+}
+
+// parcon runs a parcon command as the controller, as systemd-run would.
+func (n *fakeNode) parcon(argv []string) (int, string, string) {
+	if n.controller != nil {
+		if exit, stdout, stderr, ok := n.controller(argv); ok {
 			return exit, stdout, stderr
 		}
 	}
-	if len(argv) > 4 && argv[0] == "runuser" {
-		argv = argv[4:]
-	}
 	line := strings.Join(argv, " ")
 	switch {
-	case line == "systemctl is-system-running --wait":
-		return 0, "running\n", ""
-	case strings.HasPrefix(line, "sh -c umask 077 && cat"):
-		vm.files[argv[len(argv)-1]] = string(stdin)
+	case strings.HasPrefix(line, "check"):
 		return 0, "", ""
-	case argv[0] == "test":
-		if vm.files[argv[2]] != "" {
-			return 0, "", ""
+	case strings.HasPrefix(line, "github app wait-installation"):
+		if _, ok := n.credentials[config.CredAppKey(flagOf(argv, "-client-id"))]; !ok {
+			return 1, "", "GitHub App key: no such credential"
 		}
-		return 1, "", ""
-	case argv[0] == "mv":
-		vm.files[argv[2]] = vm.files[argv[1]]
-		delete(vm.files, argv[1])
-		return 0, "", ""
-	case argv[0] == "rm":
-		delete(vm.files, argv[2])
-		return 0, "", ""
-	case strings.HasPrefix(line, "parcon check"), line == "systemctl enable --now parcon.service",
-		line == "systemctl disable --now parcon.service":
-		return 0, "", ""
-	case line == "parcon github app create":
-		app, ok := n.apps[strings.TrimSpace(string(stdin))]
-		if !ok {
-			return 1, "", "bad code"
-		}
-		vm.files[config.AppKeyFile(app.ClientID)] = "key of " + app.ClientID
-		return 0, jsonOf(app), ""
-	case strings.HasPrefix(line, "parcon github app import -client-id "):
-		vm.files[config.AppKeyFile(argv[len(argv)-1])] = string(stdin)
-		return 0, "", ""
-	case strings.HasPrefix(line, "parcon github app wait-installation"):
-		account := ""
-		if i := slices.Index(argv, "-account"); i >= 0 {
-			account = strings.ToLower(argv[i+1])
-		}
+		account := strings.ToLower(flagOf(argv, "-account"))
 		inst, ok := n.installations[account]
-		if i := slices.Index(argv, "-repository"); ok && i >= 0 && !slices.Contains(inst.Repositories, argv[i+1]) {
+		if repo := flagOf(argv, "-repository"); ok && repo != "" && !slices.Contains(inst.Repositories, repo) {
 			ok = false
 		}
 		if !ok {
 			return 1, "", "the GitHub App isn't installed after 15m"
 		}
 		return 0, jsonOf(inst), ""
-	case strings.HasPrefix(line, "parcon github scaleset delete"):
+	case strings.HasPrefix(line, "github scaleset delete"):
 		return 0, "https://github.com/my-org: scale set proxmox-ubuntu-26.04: deleted (ID 3)\n", ""
-	case argv[0] == "sh" && strings.Contains(line, "cp -p"):
-		// The App key's move: test -e "$2" || ! test -e "$1" || cp -p "$1" "$2".
-		src, dst := argv[len(argv)-2], argv[len(argv)-1]
-		if vm.files[dst] == "" && vm.files[src] != "" {
-			vm.files[dst] = vm.files[src]
+	}
+	n.t.Errorf("the fake controller doesn't know %q", line)
+	return 127, "", "unknown command"
+}
+
+// exec runs a command in a guest: a smoke-test worker's.
+func (n *fakeNode) exec(vm *fakeVM, argv []string, stdin []byte) (int, string, string) {
+	if n.guest != nil {
+		if exit, stdout, stderr, ok := n.guest(vm, argv, stdin); ok {
+			return exit, stdout, stderr
 		}
-		return 0, "", ""
-	case line == "parcon version":
-		if v := vm.files["parcon-version"]; v != "" {
-			return 0, v + "\n", ""
-		}
-		return 0, "0.2.0\n", ""
-	case strings.HasPrefix(line, "systemctl is-active"), line == "systemctl try-restart parcon.service":
-		return 0, "active\n", ""
-	case argv[0] == "cat":
-		if content, ok := vm.files[argv[1]]; ok {
-			return 0, content, ""
-		}
-		return 1, "", "cat: " + argv[1] + ": No such file or directory"
-	case argv[0] == "journalctl":
-		// The controller logs JSON, and a line for each target's session once it is open.
-		out := `{"level":"INFO","msg":"starting"}` + "\n"
-		if cfg, err := config.Parse([]byte(vm.files[config.DefaultPath])); err == nil {
-			for _, t := range cfg.GitHub.Targets {
-				out += jsonOf(map[string]any{"level": "INFO", "msg": "scale set session opened",
-					"component": "github", "target": t.ConfigURL, "scaleSetId": 3}) + "\n"
-			}
-		}
-		return 0, out, ""
+	}
+	line := strings.Join(argv, " ")
+	switch {
+	case line == "systemctl is-system-running --wait":
+		return 0, "running\n", ""
 	case argv[0] == "curl" && strings.Contains(line, "api.github.com"):
 		return 0, "", ""
 	case argv[0] == "curl", argv[0] == "timeout":
@@ -888,23 +933,32 @@ func newTestInstaller(t *testing.T) *testInstaller {
 	must(t, os.WriteFile(self, []byte("parcon 0.2.0"), 0o755))
 
 	in := &Installer{
-		PVE:          pvecli.PVE{Exec: node},
-		Change:       &pvecli.Changer{Exec: node, Out: stdout},
-		Sys:          hostsys.System{Paths: paths, Exec: node},
-		Term:         scripted,
-		Out:          out,
-		SettingsPath: filepath.Join(dir, "etc/settings.yaml"),
-		BinaryPath:   filepath.Join(dir, "bin/parcon"),
-		Self:         self,
-		Version:      v,
-		Assets:       assets,
-		Source:       &fakeSource{releases: []release.Info{{Version: v}}},
-		Reach:        func(context.Context, string) error { return nil },
-		Now:          clock.Now,
-		Sleep:        clock.Sleep,
-		LockPath:     filepath.Join(dir, "lock"),
+		PVE:             pvecli.PVE{Exec: node},
+		Change:          &pvecli.Changer{Exec: node, Out: stdout},
+		Sys:             hostsys.System{Paths: paths, Exec: node},
+		Term:            scripted,
+		Out:             out,
+		SettingsPath:    filepath.Join(dir, "etc/settings.yaml"),
+		BinaryPath:      filepath.Join(dir, "bin/parcon"),
+		ConfigPath:      filepath.Join(dir, "etc/config.yaml"),
+		CACertPath:      filepath.Join(dir, "etc/pve-ca.pem"),
+		CredStoreDir:    filepath.Join(dir, "credstore.encrypted"),
+		UnitPath:        filepath.Join(dir, "systemd/parcon.service"),
+		StatusPath:      filepath.Join(dir, "run/parcon/status.json"),
+		ConvertManifest: node.convertManifest,
+		Self:            self,
+		Version:         v,
+		Assets:          assets,
+		Source:          &fakeSource{releases: []release.Info{{Version: v}}},
+		Reach:           func(context.Context, string) error { return nil },
+		Now:             clock.Now,
+		Sleep:           clock.Sleep,
+		LockPath:        filepath.Join(dir, "lock"),
 	}
 	must(t, os.MkdirAll(filepath.Dir(in.BinaryPath), 0o755))
+	must(t, os.MkdirAll(filepath.Dir(in.UnitPath), 0o755))
+	must(t, os.MkdirAll(filepath.Dir(in.StatusPath), 0o755))
+	node.configPath = in.ConfigPath
 	geteuid = func() int { return 0 }
 	lookPath = func(file string) (string, error) { return "/usr/sbin/" + file, nil }
 	t.Cleanup(func() { geteuid, lookPath = os.Geteuid, defaultLookPath })
@@ -916,10 +970,9 @@ func writeAssets(t *testing.T, dir string, v release.Version) {
 	t.Helper()
 	must(t, os.MkdirAll(dir, 0o755))
 	files := map[string]string{
-		runnerImage(v):     "runner image",
-		runnerManifest(v):  `{"builds":[{"custom_data":{"runner_version":"2.338.0"}}]}`,
-		controllerImage(v): "controller image",
-		BinaryAsset(v):     "parcon " + v.String(),
+		runnerImage(v):    "runner image",
+		runnerManifest(v): `{"builds":[{"custom_data":{"runner_version":"2.338.0"}}]}`,
+		BinaryAsset(v):    "parcon " + v.String(),
 	}
 	var sums strings.Builder
 	for name, content := range files {

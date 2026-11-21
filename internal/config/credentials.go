@@ -33,6 +33,14 @@ func CredAppKey(clientID string) string { return CredPrefix + "github-app-" + cl
 // CredentialPath is the path a config gives for credential name: inside the service's credentials directory.
 func CredentialPath(name string) string { return CredentialsDir + "/" + name }
 
+// CredentialFile is the file of credential name in the service; outside it, the config's path for it.
+func CredentialFile(name string) string {
+	if dir := credentialsDir(); dir != "" {
+		return filepath.Join(dir, name)
+	}
+	return CredentialPath(name)
+}
+
 // credentialsDir returns the service's credentials directory, or "" outside the service.
 func credentialsDir() string { return os.Getenv(credentialsEnv) }
 

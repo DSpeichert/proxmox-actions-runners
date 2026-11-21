@@ -61,7 +61,7 @@ type ListenOptions struct {
 	ScaleSetID int
 	// MaxRunners is the capacity reported to GitHub.
 	MaxRunners int
-	// Owner names this controller in GitHub's session list, such as the controller VM's hostname.
+	// Owner names this controller in GitHub's session list, such as the node's hostname.
 	Owner string
 	// MinBackoff and MaxBackoff bound the wait before re-creating a failed session. Zero means 1s and 1m.
 	MinBackoff time.Duration

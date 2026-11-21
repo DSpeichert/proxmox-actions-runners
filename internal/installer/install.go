@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net/netip"
 	"os"
 	"strings"
 	"time"
@@ -97,7 +96,7 @@ func (in *Installer) install(ctx context.Context, s *settings.Settings, opts Ins
 	if err := in.createNetwork(ctx, s); err != nil {
 		return err
 	}
-	if err := in.configureFirewall(ctx, s, netip.Addr{}); err != nil {
+	if err := in.configureFirewall(ctx, s); err != nil {
 		return err
 	}
 	if err := in.tuneOffloads(ctx, s); err != nil {
@@ -119,36 +118,29 @@ func (in *Installer) install(ctx context.Context, s *settings.Settings, opts Ins
 	if err := in.importTemplate(ctx, s, assets, false); err != nil {
 		return err
 	}
-	controller, addr, err := in.createController(ctx, s, func() (string, error) {
-		return in.get(ctx, assets, controllerImage(in.Version))
-	})
-	if err != nil {
-		return err
-	}
-	if err := in.configureController(ctx, controller, s); err != nil {
+	if err := in.configureController(ctx, s); err != nil {
 		return err
 	}
 	if in.stop("configure") {
 		return nil
 	}
-	if err := in.setupApp(ctx, controller, s, opts.App, opts.ClientID); err != nil {
+	if err := in.setupApp(ctx, s, opts.App, opts.ClientID); err != nil {
 		return err
 	}
-	started, err := in.startController(ctx, controller)
+	started, err := in.startController(ctx)
 	if err != nil {
 		return err
 	}
-	if err := in.CheckNetwork(ctx, s, addr); err != nil {
+	if err := in.CheckNetwork(ctx, s); err != nil {
 		return err
 	}
-	if err := in.waitSessions(ctx, controller, s, started, 5*time.Minute); err != nil {
+	if err := in.waitSessions(ctx, s, started, 5*time.Minute); err != nil {
 		return err
 	}
 	in.Out.Say("    the controller registered scale set %s and is listening for jobs", s.ScaleSet.Name)
 
-	// The release tag goes on the controller last: it marks a finished install.
-	if err := in.run(ctx, "qm", "set", fmt.Sprint(controller), "--tags",
-		strings.Join(in.controllerSpec(s).tags, ";")+";"+in.releaseTag()); err != nil {
+	// The settings record the release last: it marks a finished install.
+	if err := in.markInstalled(s); err != nil {
 		return err
 	}
 	in.Out.Step("Done")
@@ -156,12 +148,12 @@ func (in *Installer) install(ctx context.Context, s *settings.Settings, opts Ins
 
   runs-on: %s
 
-Controller VM %d (%s).
+Controller: %s, logs with journalctl -u parcon.
 Status:    parcon status
 Settings:  parcon config get --all
 Update:    parcon update
 Targets:   parcon target add|remove|list
-Uninstall: parcon uninstall`, strings.Join(targetURLs(s), " and "), runsOn(s), controller, addr)
+Uninstall: parcon uninstall`, strings.Join(targetURLs(s), " and "), runsOn(s), ServiceName)
 	in.rebootNote(ctx)
 	return nil
 }
@@ -196,18 +188,17 @@ func (in *Installer) printPlan(ctx context.Context, s *settings.Settings, warnin
 	in.Out.Step("Plan")
 	w := in.Out.W
 	r := s.Proxmox.VMIDRange
-	vlan := ""
-	if s.Network.VLAN != 0 {
-		vlan = fmt.Sprintf(" VLAN %d", s.Network.VLAN)
-	}
 	p := func(format string, args ...any) { _, _ = fmt.Fprintf(w, format+"\n", args...) }
 	p("Host:")
 	p("  install parcon as %s, and its settings as %s", in.BinaryPath, in.SettingsPath)
+	p("  the controller: service %s (%s) as a transient user in a systemd sandbox, its config in %s,",
+		ServiceName, in.UnitPath, in.ConfigPath)
+	p("    and its secrets (the API token, each GitHub App's key) encrypted with systemd-creds in %s", in.CredStoreDir)
 	for _, l := range append(in.offloadPlan(ctx, s), in.asyncPFPlan(ctx)...) {
 		p("  %s", l)
 	}
 	p("Proxmox objects on node %s:", node)
-	p("  pools %s and %s", SystemPool, RunnerPool)
+	p("  pool %s", RunnerPool)
 	p("  role %s, user %s, token %s!%s, and ACLs for them on /pool/%s,", Role, PVEUser, PVEUser, TokenName, RunnerPool)
 	p("    /storage/%s, and /sdn/zones/%s/%s", s.Proxmox.Storage, Zone, VNet)
 	wn, err := workerNetwork(s)
@@ -221,13 +212,11 @@ func (in *Installer) printPlan(ctx context.Context, s *settings.Settings, warnin
 	p("  SDN zone %s with SDN DHCP, VNet %s, and subnet %s: the host at %s with SNAT, DHCP for the rest,", Zone, VNet,
 		wn.subnet, wn.gateway)
 	p("    DNS %s; then apply the SDN config", dns)
-	p("  datacenter firewall: IP set %s (private, CGNAT, and link-local ranges, the LAN, this host, the", BlockedIPSet)
+	p("  datacenter firewall: IP set %s (private, CGNAT, and link-local ranges, the LAN, this host and its", BlockedIPSet)
 	p("    controller) and security group %s (DNS to %s, then drop %s); host rule: DHCP in on %s", FirewallGroup,
 		dns, BlockedIPSet, VNet)
 	p("  runner template in %s, VMIDs %d-%d reserved for templates; its firewall: in dropped, group %s", RunnerPool,
 		r.End-config.ReservedVMIDs+1, r.End, FirewallGroup)
-	p("  controller VM in %s: 2 vCPU, 2 GiB, %d GiB disk, LAN %s%s (%s)", SystemPool, ControllerGiB, s.Network.Bridge,
-		vlan, s.Network.ControllerIP)
 	wk := s.EffectiveWorker()
 	p("Workers: VMIDs %d-%d on %s (%s), at most %d, each %d vCPU and %s", r.Start, r.End-config.ReservedVMIDs, VNet,
 		s.Network.WorkerSubnet, s.ScaleSet.MaxRunners, wk.Cores, config.FormatMiB(wk.MemoryMiB))

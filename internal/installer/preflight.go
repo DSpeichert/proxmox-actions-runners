@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -88,6 +89,8 @@ func (in *Installer) Preflight(ctx context.Context, s *settings.Settings, mode M
 		{Hard, "KVM available", func() result { return checkExists(in.Sys.Paths.KVM) }},
 		{Hard, "required tools present", checkTools},
 		{Hard, "standalone node", func() result { return in.checkStandalone() }},
+		{Hard, "no controller VM from an older release", func() result { return in.checkOlderLayout(ctx) }},
+		{Hard, "systemd credentials", func() result { return in.checkCredentials(ctx) }},
 		{Hard, "clock synchronized", func() result { return in.checkClock(ctx) }},
 		{Hard, "outbound HTTPS to GitHub", func() result { return in.checkHTTPS(ctx) }},
 		{Hard, "storage " + s.Proxmox.Storage, func() result { return in.checkStorage(ctx, s) }},
@@ -179,7 +182,8 @@ var lookPath = exec.LookPath
 
 func checkTools() result {
 	var missing []string
-	for _, tool := range []string{"qm", "pveum", "pvesh", "pvesm", "ip"} {
+	for _, tool := range []string{"qm", "pveum", "pvesh", "pvesm", "ip", "systemctl", "systemd-run", "systemd-creds",
+		"journalctl"} {
 		if _, err := lookPath(tool); err != nil {
 			missing = append(missing, tool)
 		}
@@ -295,8 +299,8 @@ func (in *Installer) checkDownloadSpace() result {
 	return result{avail >= DownloadGiB, fmt.Sprintf("%d GiB free, %d GiB needed", avail, DownloadGiB)}
 }
 
-// systemVMsMiB is the memory of the controller VM.
-const systemVMsMiB = 2048
+// controllerMiB is the most memory the controller's service may use (MemoryMax in sandboxProperties).
+const controllerMiB = 512
 
 func (in *Installer) checkMemory(ctx context.Context, s *settings.Settings) result {
 	total, err := in.Sys.MemTotalMiB()
@@ -309,12 +313,12 @@ func (in *Installer) checkMemory(ctx context.Context, s *settings.Settings) resu
 	}
 	var used int64
 	for _, vm := range vms {
-		// Our own controller is counted with systemVMsMiB, and workers come and go.
-		if !vm.Template && vm.Pool != SystemPool && vm.Pool != RunnerPool {
+		// Workers come and go, and the controller is counted with controllerMiB.
+		if !vm.Template && vm.Pool != RunnerPool {
 			used += vm.MaxMemBytes
 		}
 	}
-	need := int(used>>20) + s.ScaleSet.MaxRunners*s.EffectiveWorker().MemoryMiB + systemVMsMiB
+	need := int(used>>20) + s.ScaleSet.MaxRunners*s.EffectiveWorker().MemoryMiB + controllerMiB
 	return result{total >= need, fmt.Sprintf("%d MiB RAM, %d MiB allocated to VMs with %d workers", total, need,
 		s.ScaleSet.MaxRunners)}
 }
@@ -423,20 +427,17 @@ func (in *Installer) checkWorkerSubnet(ctx context.Context, s *settings.Settings
 			return fail("%s overlaps %s on this host; choose another with --worker-subnet", subnet, p)
 		}
 	}
-	if p, err := netip.ParsePrefix(s.Network.ControllerIP); err == nil && subnet.Overlaps(p) {
-		return fail("%s overlaps the LAN %s", subnet, p)
-	}
 	return pass("")
 }
 
-// ours reports whether an earlier run created our objects: it creates the system pool first, with PoolComment.
+// ours reports whether an earlier run created our objects: it creates the runner pool first, with PoolComment.
 func (in *Installer) ours(ctx context.Context) (bool, error) {
 	pools, err := in.PVE.Pools(ctx)
 	if err != nil {
 		return false, err
 	}
 	for _, p := range pools {
-		if p.ID == SystemPool && p.Comment == PoolComment {
+		if p.ID == RunnerPool && p.Comment == PoolComment {
 			return true, nil
 		}
 	}
@@ -466,7 +467,7 @@ func (in *Installer) checkNames(ctx context.Context, mode Mode) result {
 	}
 	pools, _ := in.PVE.Pools(ctx)
 	for _, p := range pools {
-		if p.ID == RunnerPool || p.ID == SystemPool {
+		if p.ID == RunnerPool {
 			taken = append(taken, "pool "+p.ID)
 		}
 	}
@@ -513,6 +514,52 @@ func (in *Installer) checkPendingSDN(ctx context.Context) result {
 			strings.Join(pending, " "))
 	}
 	return pass("")
+}
+
+// checkOlderLayout fails on a node with an older release's install: a controller or gateway VM, or the pool that
+// held them.
+func (in *Installer) checkOlderLayout(ctx context.Context) result {
+	if err := in.refuseOlderLayout(ctx); err != nil {
+		return fail("%v", err)
+	}
+	pools, err := in.PVE.Pools(ctx)
+	if err != nil {
+		return fail("%v", err)
+	}
+	for _, p := range pools {
+		if p.ID == SystemPool && p.Comment == PoolComment {
+			return fail("pool %s is from an older release, which this release can't move over: run parcon "+
+				"uninstall with the release that installed it, then parcon install", SystemPool)
+		}
+	}
+	return pass("")
+}
+
+// minSystemd is the oldest systemd whose units can import credentials (ImportCredential=).
+const minSystemd = 254
+
+var systemdVersion = regexp.MustCompile(`^systemd (\d+)`)
+
+// checkCredentials checks that systemd can give the controller its secrets as encrypted credentials, and says which
+// key protects them. It changes nothing: systemd-creds makes the host's key when parcon first encrypts a secret.
+func (in *Installer) checkCredentials(ctx context.Context) result {
+	out, err := in.PVE.Exec.Run(ctx, pvecli.C("systemctl", "--version"))
+	if err != nil {
+		return fail("%v", err)
+	}
+	m := systemdVersion.FindSubmatch(out)
+	if m == nil {
+		return fail("can't tell systemd's version from %q", strings.TrimSpace(string(out)))
+	}
+	v, _ := strconv.Atoi(string(m[1]))
+	if v < minSystemd {
+		return fail("systemd %d is older than %d", v, minSystemd)
+	}
+	// has-tpm2 exits 0 only with a TPM2 that systemd can use.
+	if _, err := in.PVE.Exec.Run(ctx, pvecli.C("systemd-creds", "has-tpm2", "--quiet")); err == nil {
+		return pass("systemd %d; the controller's secrets are encrypted with the TPM2 and the host's key", v)
+	}
+	return pass("systemd %d; no TPM2, so the controller's secrets are encrypted with the host's key", v)
 }
 
 // errPreflight is a failed hard check.

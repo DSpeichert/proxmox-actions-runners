@@ -24,8 +24,9 @@ const (
 	// Build marks a VM the installer creates and destroys itself, such as its smoke-test clone. It lives in the
 	// reserved VMIDs, which the controller never treats as workers or leftovers.
 	Build = "par-build"
-	// Controller marks the controller VM, which parcon creates in the system pool. Gateway marks the gateway VM of
-	// releases before the worker firewall, which parcon only recognizes, to refuse updating or to remove it.
+	// Controller marks the controller VM of releases before the controller ran on the host, and Gateway the gateway
+	// VM of releases before the worker firewall. parcon only recognizes them, to refuse installing or updating over
+	// them.
 	Gateway    = "par-gateway"
 	Controller = "par-controller"
 )
@@ -48,8 +49,8 @@ const (
 	TemplateVersionPrefix = "par-tv-"
 	// RunnerVersionPrefix is followed by the actions/runner version a template contains, such as 2.337.0.
 	RunnerVersionPrefix = "par-rv-"
-	// ReleasePrefix is followed by the project release a VM was created or last upgraded by, such as 0.2.0. The
-	// controller VM gets it last, so it marks a finished install or update.
+	// ReleasePrefix is followed by the project release a VM was created by, such as 0.2.0: the runner template
+	// parcon imports for that release.
 	ReleasePrefix = "par-release-"
 )
 

@@ -29,9 +29,9 @@ func onHost(t *testing.T, s *settings.Settings, args ...string) (stdout, stderr 
 		}
 	}
 	defer func(h func() bool, n func(io.Writer, io.Writer, bool) (*installer.Installer, error)) {
-		hostMode, newInstaller = h, n
-	}(hostMode, newInstaller)
-	hostMode = func() bool { return true }
+		inService, newInstaller = h, n
+	}(inService, newInstaller)
+	inService = func() bool { return false }
 	newInstaller = func(stdout, stderr io.Writer, _ bool) (*installer.Installer, error) {
 		return &installer.Installer{
 			Out:          &term.Out{W: stdout, Err: stderr},
