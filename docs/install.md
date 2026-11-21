@@ -259,13 +259,14 @@ saved settings, skips the free space an install needs, and also runs the control
 | `scaleSet` | the name, labels, runner group, the most and fewest workers, and how long a worker may live | install flags, `runners.max`, `worker.maxLifetime` |
 | `worker` | worker hardware; a field left out uses the GitHub-matching default | `worker.cores`, `worker.memory`, `worker.disk` |
 
-Version 2 of the file, from releases before several targets, had one `github.configUrl` and one `github.app`. `parcon`
-reads it as one App and one target, and `parcon update` saves it as version 3. A target that is waiting for its App or
-installation isn't rendered into the controller's config, so the controller serves only the targets that are set up.
+The file is version 4, the first with the controller on the host. `parcon` refuses versions 1 to 3, from releases with
+a controller VM, which need that release's `parcon uninstall` first. `installed` records the release of a finished
+install or update. A target that is waiting for its App or installation isn't rendered into the controller's config,
+so the controller serves only the targets that are set up.
 
 It holds nothing secret. `parcon` renders the controller's `config.yaml` from it together with what it reads from
 the node each time (the node's name, the API's address and certificate, and whether the storage can make linked
-clones), and checks the result with the controller's own config validation before it pushes it. The defaults live
+clones), and checks the result with the controller's own config validation before it writes it. The defaults live
 only in `internal/config`, like every other default.
 
 The **config keys** are the settings `parcon config` changes. Each has a description, the values it takes on this
