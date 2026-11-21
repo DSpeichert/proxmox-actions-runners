@@ -39,7 +39,7 @@ func runCheck(args []string, stdout, stderr io.Writer) error {
 	target := args[0]
 	fs := flag.NewFlagSet("check "+target, flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	path := fs.String("config", config.DefaultPath, "path of the config file")
+	path := fs.String("config", config.Path(), "path of the config file")
 	if err := fs.Parse(args[1:]); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return nil

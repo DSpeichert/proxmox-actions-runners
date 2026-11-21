@@ -36,7 +36,7 @@ var newScaleSetClients = func(cfg *config.Config) (map[string]scaleSetClient, er
 // otherwise register them again, and before it removes a target. A failing target doesn't stop the others.
 func scaleSetDelete(args []string, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("github scaleset delete", flag.ContinueOnError)
-	path := fs.String("config", config.DefaultPath, "path of the config file")
+	path := fs.String("config", config.Path(), "path of the config file")
 	only := fs.String("target", "", "the organization or repository URL to delete the scale sets of; empty for all")
 	if err := parseFlags(fs, args, stderr); err != nil {
 		return err

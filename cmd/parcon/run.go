@@ -20,7 +20,7 @@ import (
 func runController(args []string, stderr io.Writer) error {
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	path := fs.String("config", config.DefaultPath, "path of the config file")
+	path := fs.String("config", config.Path(), "path of the config file")
 	level := fs.String("log-level", "info", "log level: debug, info, warn, or error")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {

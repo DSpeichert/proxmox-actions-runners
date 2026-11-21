@@ -298,7 +298,8 @@ func Marshal(c *Config) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-// Load reads and parses the config file at path.
+// Load reads and parses the config file at path. In the service, paths in the credentials directory
+// (CredentialsDir) become paths in the service's own.
 func Load(path string) (*Config, error) {
 	data, err := os.ReadFile(path) //nolint:gosec // G304: the operator chooses the config path.
 	if err != nil {
@@ -308,6 +309,7 @@ func Load(path string) (*Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("config %s: %w", path, err)
 	}
+	c.expandCredentials()
 	return c, nil
 }
 

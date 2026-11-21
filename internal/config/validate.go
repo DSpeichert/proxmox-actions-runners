@@ -55,8 +55,8 @@ func (v *validator) required(field, value string) bool {
 }
 
 func (v *validator) absPath(field, value string) {
-	if v.required(field, value) && !filepath.IsAbs(value) {
-		v.addf(field, "%q must be an absolute path", value)
+	if v.required(field, value) && !filepath.IsAbs(value) && !isCredentialPath(value) {
+		v.addf(field, "%q must be an absolute path or in %s", value, CredentialsDir)
 	}
 }
 
