@@ -136,11 +136,6 @@ type GitHub struct {
 	Apps []GitHubApp `yaml:"apps,omitempty"`
 	// Targets are the organizations and repositories the runners serve.
 	Targets []Target `yaml:"targets,omitempty"`
-
-	// ConfigURL and App are the format before several targets: one target and its App. Parse turns them into one
-	// App and one target, so a controller reads a config an older release rendered. Marshal never writes them.
-	ConfigURL string    `yaml:"configUrl,omitempty"`
-	App       LegacyApp `yaml:"app,omitempty"`
 }
 
 // GitHubApp is a GitHub App the controller authenticates as.
@@ -168,30 +163,6 @@ func (t Target) IsRepository() bool {
 
 // Key returns the target's key (TargetKey).
 func (t Target) Key() string { return TargetKey(t.ConfigURL) }
-
-// LegacyApp is the App block of the format before several targets.
-type LegacyApp struct {
-	ClientID       string `yaml:"clientId,omitempty"`
-	InstallationID int64  `yaml:"installationId,omitempty"`
-	PrivateKeyFile string `yaml:"privateKeyFile,omitempty"`
-}
-
-func (g GitHub) legacy() bool { return g.ConfigURL != "" || g.App != LegacyApp{} }
-
-// normalize turns the format before several targets into one App and one target. A config that mixes the two
-// formats is left as it is, for validation to report.
-func (g *GitHub) normalize() {
-	if !g.legacy() || len(g.Apps) > 0 || len(g.Targets) > 0 {
-		return
-	}
-	if g.App.ClientID != "" || g.App.PrivateKeyFile != "" {
-		g.Apps = []GitHubApp{{ClientID: g.App.ClientID, PrivateKeyFile: g.App.PrivateKeyFile}}
-	}
-	if g.ConfigURL != "" {
-		g.Targets = []Target{{ConfigURL: g.ConfigURL, ClientID: g.App.ClientID, InstallationID: g.App.InstallationID}}
-	}
-	g.ConfigURL, g.App = "", LegacyApp{}
-}
 
 // AppFor returns the App with the client ID, if the config has it.
 func (g GitHub) AppFor(clientID string) (GitHubApp, bool) {

@@ -116,10 +116,6 @@ func (g GitHub) validate(v *validator) {
 	// Targets and Apps are optional here, and a target may lack its App: the installer checks Proxmox before the user
 	// creates an App, and it learns the organization or repository from where the App is installed. RequireGitHub
 	// checks that they are complete.
-	if g.legacy() {
-		v.addf("github", "configUrl and app are the format before several targets; use apps and targets instead, "+
-			"not both")
-	}
 	apps := map[string]int{}
 	for i, a := range g.Apps {
 		prefix := fmt.Sprintf("github.apps[%d]", i)

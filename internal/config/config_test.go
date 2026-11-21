@@ -2,7 +2,6 @@ package config
 
 import (
 	"errors"
-	"reflect"
 	"regexp"
 	"strconv"
 	"strings"
@@ -317,7 +316,6 @@ func TestParseInvalid(t *testing.T) {
 			map[string]any{"clientId": "Iv23liA", "privateKeyFile": "/b.pem"}}, "already used by github.apps[0]"},
 		{"relative private key", "github.apps.0.privateKeyFile", "key.pem", "must be an absolute path"},
 		{"App without key", "github.apps.0.privateKeyFile", nil, "github.apps[0].privateKeyFile: is required"},
-		{"both formats", "github.configUrl", "https://github.com/my-org", "use apps and targets instead, not both"},
 
 		{"controller memory in GiB by mistake", "worker.memoryMiB", 8, "worker.memoryMiB"},
 		{"negative cores", "worker.cores", -1, "worker.cores"},
@@ -404,41 +402,16 @@ func TestRequireGitHub(t *testing.T) {
 	}
 }
 
-// A config an older release rendered has one target and its App, and still parses, as one App and one target.
-func TestParseLegacyGitHub(t *testing.T) {
+// The format before several targets, one configUrl and one app, is refused: the controller only reads configs the
+// same parcon renders.
+func TestParseRefusesTheSingleTargetFormat(t *testing.T) {
 	doc := validDoc()
 	set(t, doc, "github", map[string]any{
 		"configUrl": "https://github.com/my-org/",
-		"app": map[string]any{"clientId": "Iv23liEXAMPLE", "installationId": 7,
-			"privateKeyFile": "/etc/proxmox-actions-runners/github-app.pem"},
+		"app":       map[string]any{"clientId": "Iv23liEXAMPLE", "installationId": 7},
 	})
-	c, err := parseDoc(t, doc)
-	if err != nil {
-		t.Fatalf("Parse: %v", err)
-	}
-	want := GitHub{
-		Apps:    []GitHubApp{{ClientID: "Iv23liEXAMPLE", PrivateKeyFile: "/etc/proxmox-actions-runners/github-app.pem"}},
-		Targets: []Target{{ConfigURL: "https://github.com/my-org", ClientID: "Iv23liEXAMPLE", InstallationID: 7}},
-	}
-	if !reflect.DeepEqual(c.GitHub, want) {
-		t.Errorf("github = %+v, want %+v", c.GitHub, want)
-	}
-	if err := c.RequireGitHub(); err != nil {
-		t.Errorf("RequireGitHub = %v", err)
-	}
-	data, err := Marshal(c)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if strings.Contains(string(data), "app:") || !strings.Contains(string(data), "targets:") {
-		t.Errorf("Marshal wrote the old format:\n%s", data)
-	}
-
-	// Before its App, an older release's config names only the target.
-	set(t, doc, "github", map[string]any{"configUrl": "https://github.com/my-org"})
-	if c, err = parseDoc(t, doc); err != nil || len(c.GitHub.Apps) != 0 ||
-		!reflect.DeepEqual(c.GitHub.Targets, []Target{{ConfigURL: "https://github.com/my-org"}}) {
-		t.Errorf("Parse of a target without an App = %+v, %v", c.GitHub, err)
+	if _, err := parseDoc(t, doc); err == nil || !strings.Contains(err.Error(), "configUrl") {
+		t.Errorf("Parse = %v", err)
 	}
 }
 

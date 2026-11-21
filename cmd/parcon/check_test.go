@@ -70,8 +70,8 @@ func writeCheckConfig(t *testing.T, srv *httptest.Server, secretMode os.FileMode
   vnet: parnet
   vmidRange: {start: 10000, end: 10999}
 github:
-  configUrl: https://github.com/my-org
-  app: {clientId: Iv23liEXAMPLE0000000, installationId: 1, privateKeyFile: /etc/key.pem}
+  apps: [{clientId: Iv23liEXAMPLE0000000, privateKeyFile: /etc/key.pem}]
+  targets: [{configUrl: https://github.com/my-org, clientId: Iv23liEXAMPLE0000000, installationId: 1}]
 scaleSets:
   - {name: proxmox-ubuntu-26.04, maxRunners: 2}
 `, srv.URL, secret, fingerprintOf(srv))
@@ -248,8 +248,9 @@ func TestWithoutGitHubApp(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	data = []byte(strings.Replace(string(data),
-		"  app: {clientId: Iv23liEXAMPLE0000000, installationId: 1, privateKeyFile: /etc/key.pem}\n", "", 1))
+	data = []byte(strings.Replace(strings.Replace(string(data),
+		"  apps: [{clientId: Iv23liEXAMPLE0000000, privateKeyFile: /etc/key.pem}]\n", "", 1),
+		", clientId: Iv23liEXAMPLE0000000, installationId: 1}", "}", 1))
 	if err := os.WriteFile(path, data, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -305,8 +306,8 @@ func TestCheckGitHubCredentialFailures(t *testing.T) {
   vnet: parnet
   vmidRange: {start: 10000, end: 10999}
 github:
-  configUrl: https://github.com/my-org
-  app: {clientId: Iv23liEXAMPLE0000000, installationId: 1, privateKeyFile: %s}
+  apps: [{clientId: Iv23liEXAMPLE0000000, privateKeyFile: %s}]
+  targets: [{configUrl: https://github.com/my-org, clientId: Iv23liEXAMPLE0000000, installationId: 1}]
 scaleSets:
   - {name: proxmox-ubuntu-26.04, maxRunners: 2}
 `, key)

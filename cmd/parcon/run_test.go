@@ -86,8 +86,8 @@ func TestNewController(t *testing.T) {
   vnet: parnet
   vmidRange: {start: 10000, end: 10999}
 github:
-  configUrl: https://github.com/my-org
-  app: {clientId: Iv23liEXAMPLE0000000, installationId: 1, privateKeyFile: %s}
+  apps: [{clientId: Iv23liEXAMPLE0000000, privateKeyFile: %s}]
+  targets: [{configUrl: https://github.com/my-org, clientId: Iv23liEXAMPLE0000000, installationId: 1}]
 scaleSets:
   - {name: proxmox-ubuntu-26.04, maxRunners: 2}
 `, secretFile, keyFile)
