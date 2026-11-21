@@ -29,16 +29,11 @@ bats install/tests .github/scripts/tests
 
 step "packer"
 packer fmt -check -recursive images
-bin=$(mktemp -d)
-trap 'rm -rf "$bin"' EXIT
-CGO_ENABLED=0 go build -o "$bin/parcon" ./cmd/parcon
-for image in runner controller; do
-	packer init "images/$image" >/dev/null
-	# validate refuses to run when a build's output directory exists, so point it somewhere empty.
-	args=(-var output_directory="$bin/output-$image")
-	[[ $image != controller ]] || args+=(-var parcon_binary="$bin/parcon")
-	packer validate "${args[@]}" "images/$image"
-done
+out=$(mktemp -d)
+trap 'rm -rf "$out"' EXIT
+packer init images/runner >/dev/null
+# validate refuses to run when a build's output directory exists, so point it somewhere empty.
+packer validate -var output_directory="$out/output-runner" images/runner
 
 step "actionlint"
 actionlint

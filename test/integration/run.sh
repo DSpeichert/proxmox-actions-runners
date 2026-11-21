@@ -38,9 +38,8 @@ environment:
   PAR_IT_RUNNER_IMAGE    optional: a par-runner-<version>.qcow2 built from images/runner, with its .json manifest
                          next to it; the suite imports it and runs a worker from it
   PAR_IT_IMAGE_TEMPLATE_VMID  the runner image template's VMID (default 9001)
-  PAR_IT_CONTROLLER_IMAGE  for installer: parcon-<version>.qcow2 built from images/controller
-                         installer also needs PAR_IT_RUNNER_IMAGE, both built with the same version, and a node
-                         with dnsmasq installed (its own service off) and the datacenter firewall on
+                         installer needs it, and a node with dnsmasq installed (its own service off) and the
+                         datacenter firewall on
   PAR_IT_STATE           private working directory (default .agents/integration, which git ignores)
 EOF
 }
@@ -377,18 +376,15 @@ cmd_test() {
 readonly INSTALLER_DIR=/var/tmp/par-it-installer
 
 # cmd_installer runs parcon's host commands on the node without GitHub: the dry run, the install up to the GitHub App
-# (--stop-after configure), the forwarded controller check, the worker network check, and the uninstall. It installs
-# from the local images (--assets), with the install's real names (par-runners, parzone), so it needs a node with no
-# install on it, and it uninstalls even when a step fails.
+# (--stop-after configure), the controller's check in its sandbox and the sandbox's exposure, the worker network
+# check, and the uninstall. It installs from the local runner image (--assets), with the install's real names
+# (par-runners, parzone), so it needs a node with no install on it, and it uninstalls even when a step fails.
 cmd_installer() {
 	require_throwaway
-	[[ -n $RUNNER_IMAGE && -f ${PAR_IT_CONTROLLER_IMAGE:-} ]] ||
-		die "installer needs PAR_IT_RUNNER_IMAGE and PAR_IT_CONTROLLER_IMAGE"
+	[[ -n $RUNNER_IMAGE ]] || die "installer needs PAR_IT_RUNNER_IMAGE"
 	local version
 	version=$(basename "$RUNNER_IMAGE" .qcow2)
 	version=${version#par-runner-}
-	[[ $(basename "$PAR_IT_CONTROLLER_IMAGE") == "parcon-$version.qcow2" ]] ||
-		die "the images must share one version: par-runner-$version, parcon-$version"
 	# What the operator sets up before parcon install, which the suite leaves to them: turning on the datacenter
 	# firewall could cut the suite's own SSH off.
 	# shellcheck disable=SC2016 # ${Status} is dpkg-query's field, expanded by neither shell.
@@ -405,13 +401,13 @@ cmd_installer() {
 	before=$(node_script objects.sh) || die "can't list the node's objects"
 	[[ -z $before ]] || die "the node already has an install on it; run parcon uninstall there first:"$'\n'"$before"
 
-	log "build parcon and copy it and the images to $INSTALLER_DIR on the node"
-	(cd "$ROOT" && CGO_ENABLED=0 go build -trimpath -o "$STATE/parcon-host" ./cmd/parcon)
+	log "build parcon and copy it and the runner image to $INSTALLER_DIR on the node"
+	(cd "$ROOT" && CGO_ENABLED=0 go build -trimpath -ldflags "-X main.version=$release" -o "$STATE/parcon-host" \
+		./cmd/parcon)
 	node "rm -rf $INSTALLER_DIR && mkdir -p $INSTALLER_DIR/assets"
 	scp -q "${SSH_OPTS[@]}" "$STATE/parcon-host" "$PAR_IT_SSH:$INSTALLER_DIR/parcon"
 	scp -q "${SSH_OPTS[@]}" "$RUNNER_IMAGE" "$PAR_IT_SSH:$INSTALLER_DIR/assets/par-runner-$release.qcow2"
 	scp -q "${SSH_OPTS[@]}" "$IMAGE_MANIFEST" "$PAR_IT_SSH:$INSTALLER_DIR/assets/par-runner-$release.json"
-	scp -q "${SSH_OPTS[@]}" "$PAR_IT_CONTROLLER_IMAGE" "$PAR_IT_SSH:$INSTALLER_DIR/assets/parcon-$release.qcow2"
 	node "cd $INSTALLER_DIR/assets && sha256sum -- * >SHA256SUMS"
 
 	# The GitHub settings are placeholders: nothing here contacts the App or the organization.
@@ -435,15 +431,19 @@ cmd_installer() {
 	objects=$(node_script objects.sh)
 	printf '%s\n' "$objects"
 	local want
-	for want in "pool par-runners" "pool par-system" "role PARController" "user par@pve" "zone parzone" \
-		"vnet parnet" "subnet parzone-" "group par-worker" "ipset par-blocked" "par-controller" "par-runner-"; do
+	for want in "pool par-runners" "role PARController" "user par@pve" "zone parzone" "vnet parnet" \
+		"subnet parzone-" "group par-worker" "ipset par-blocked" "par-runner-" "file /etc/systemd/system/parcon.service" \
+		"file /etc/proxmox-actions-runners/config.yaml" "file /etc/credstore.encrypted/parcon.pve-token"; do
 		grep -qF -- "$want" <<<"$objects" || die "the install has no $want"
 	done
 	node "test -x /usr/local/bin/parcon && test -f /etc/proxmox-actions-runners/settings.yaml" ||
 		die "parcon or its settings aren't on the host"
 
-	log "parcon check proxmox, forwarded to the controller VM"
+	log "parcon check proxmox, as the controller in its sandbox"
 	node "parcon check proxmox" || die "parcon check proxmox failed"
+	log "the controller's sandbox"
+	node "systemd-analyze security --threshold=25 --offline=true /etc/systemd/system/parcon.service" ||
+		die "parcon.service's sandbox is weaker than it should be"
 	log "parcon check network"
 	node "parcon check network" || die "parcon check network failed"
 
@@ -455,16 +455,13 @@ cmd_installer() {
 	node "test ! -e /usr/local/bin/parcon && test ! -e /etc/proxmox-actions-runners/settings.yaml" ||
 		die "parcon uninstall left parcon or its settings on the host"
 	node "rm -rf $INSTALLER_DIR"
-	log "installer tests passed: dry run, install, forwarded check, worker network, and uninstall"
+	log "installer tests passed: dry run, install, the controller's check and sandbox, worker network, and uninstall"
 }
 
-# installer_uninstall runs parcon uninstall. It stops the controller VM first: this install has no GitHub App, and
-# uninstall asks a running controller to delete its scale set in GitHub.
+# installer_uninstall runs parcon uninstall. This install has no GitHub App, so deleting its scale sets in GitHub
+# fails, which uninstall only warns about.
 installer_uninstall() {
 	log "parcon uninstall"
-	local controller
-	controller=$(node_script objects.sh | awk '$1 == "vm" && $3 == "par-controller" {print $2}')
-	[[ -z $controller ]] || node "qm stop $controller" || true
 	node "if [ -x /usr/local/bin/parcon ]; then parcon uninstall --yes; else $INSTALLER_DIR/parcon uninstall --yes; fi"
 }
 

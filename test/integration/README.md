@@ -2,8 +2,8 @@
 
 Runs the project against a real Proxmox VE 9 node. All it needs is root SSH access to a **throwaway** node: it
 creates its own test objects, runs the Go integration tests and the `parcon` checks, and can remove everything
-again. Given a runner image built from `images/runner`, it also runs a worker from that image, and given the
-controller image too, it runs `parcon install` on the node up to the GitHub App.
+again. Given a runner image built from `images/runner`, it also runs a worker from that image, and runs
+`parcon install` on the node up to the GitHub App.
 
 GitHub itself is only partly covered: `parcon check template` looks up the latest `actions/runner` release on
 github.com, but the controller tests use the in-memory GitHub fake, so no real runner registers.
@@ -67,42 +67,35 @@ devcontainer exec --workspace-folder . ... \
 
 ### The installer
 
-`run.sh installer` tests `parcon`'s host commands on the node with locally built images and no GitHub App. It
-needs both images, built with the same version, and a node with no install on it, but with what an install asks the
-user to set up first: `dnsmasq` installed with its own service off (`apt install dnsmasq`, then
-`systemctl disable --now dnsmasq`), and the datacenter firewall on. The suite checks both and doesn't change them:
-turning on the firewall could cut its own SSH off.
-
-```bash
-CGO_ENABLED=0 go build -o bin/parcon ./cmd/parcon
-packer init images/controller && packer build -var version=it -var parcon_binary=bin/parcon images/controller
-```
+`run.sh installer` tests `parcon`'s host commands on the node with a locally built runner image and no GitHub App.
+It needs a node with no install on it, but with what an install asks the user to set up first: `dnsmasq` installed
+with its own service off (`apt install dnsmasq`, then `systemctl disable --now dnsmasq`), and the datacenter
+firewall on. The suite checks both and doesn't change them: turning on the firewall could cut its own SSH off.
 
 ```bash
 devcontainer exec --workspace-folder . ... \
   --remote-env PAR_IT_RUNNER_IMAGE=output-runner/par-runner-it.qcow2 \
-  --remote-env PAR_IT_CONTROLLER_IMAGE=output-controller/parcon-it.qcow2 \
   test/integration/run.sh installer
 ```
 
-It builds `parcon` and copies it and the images, as release assets with a `SHA256SUMS`, to
-`/var/tmp/par-it-installer` on the node, then:
+It builds `parcon`, stamped with the image's version, and copies it and the image, as release assets with a
+`SHA256SUMS`, to `/var/tmp/par-it-installer` on the node, then:
 
 1. runs `parcon install --dry-run` with the local assets (`--assets`, which trusts their `SHA256SUMS` instead of a
    signed release), and checks that it changed nothing on the node or its files;
 2. runs `parcon install --stop-after configure`: parcon and its settings on the host, the Proxmox access objects, the
-   worker network and firewall, the runner template, the controller VM, and the controller's configuration, which
-   ends with `parcon check proxmox` inside the controller VM;
-3. runs `parcon check proxmox` on the host, which forwards it into the controller VM, and `parcon check network`: a
-   worker cloned from the template gets a DHCP lease from SDN DHCP, reaches the internet, and can't reach the
-   Proxmox API or the controller VM;
-4. stops the controller VM and runs `parcon uninstall --yes`, then checks that nothing of the install is left,
-   `/usr/local/bin/parcon` and its settings included.
+   worker network and firewall, the runner template, and the controller's config, unit, and encrypted token, which
+   ends with `parcon check proxmox` as the controller, in its sandbox;
+3. runs `parcon check proxmox` on the host, which runs it in the controller's sandbox with `systemd-run`, checks the
+   sandbox with `systemd-analyze security`, and runs `parcon check network`: a worker cloned from the template gets a
+   DHCP lease from SDN DHCP, reaches the internet, and can't reach the Proxmox API on the host;
+4. runs `parcon uninstall --yes`, then checks that nothing of the install is left: the Proxmox objects, the
+   controller's unit, config, and credentials, and `/usr/local/bin/parcon` and its settings.
 
 It stops before the GitHub App and doesn't start the controller service, whose scale set session needs the App. It
-uses the install's real names (`par-runners`, `par-system`, `parzone`, `parnet`), so it refuses a node that already
-has an install, and it uninstalls even when a step fails. The node needs the free space the install's checks ask
-for: 50 GiB on the VM storage.
+uses the install's real names (`par-runners`, `parzone`, `parnet`), so it refuses a node that already has an
+install, and it uninstalls even when a step fails. The node needs the free space the install's checks ask for:
+50 GiB on the VM storage.
 
 ## What setup creates
 

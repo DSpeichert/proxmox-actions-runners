@@ -386,7 +386,6 @@ internal/controller/   reconcile loop and worker lifecycle
 internal/vmtags/       the Proxmox tags that hold the controller's state
 install/               install.sh, the bootstrap that runs parcon install, and its bats tests
 images/common/         what the image builds share: Ubuntu pin, base and cleanup steps, boot test
-images/controller/     Packer build of the controller VM image with parcon (CI)
 images/runner/         Packer build of the runner template image (CI)
 .github/               CI, the release build, and the daily actions/runner check
 deploy/                example config

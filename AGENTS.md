@@ -148,7 +148,6 @@ internal/metrics/      Prometheus metrics
 internal/vmtags/       the Proxmox tags that hold the project's state, shared by the controller and the host commands
 install/               install.sh, the bootstrap that verifies and runs parcon install; fill-release.sh; bats tests
 images/common/         what every image build shares: the Ubuntu and plugin pins, base and cleanup steps, boot test
-images/controller/     Packer (qemu builder): the controller VM image with parcon, shipped as a release asset
 images/runner/         Packer (qemu builder): the runner template image, shipped as a release asset
 deploy/                example config
 .devcontainer/         development container with every tool below, at pinned versions
@@ -212,7 +211,6 @@ way the release workflow does; run one build at a time:
 
 ```bash
 .github/scripts/build-image.sh runner dev       # output-runner/par-runner-dev.qcow2
-.github/scripts/build-image.sh controller dev   # output-controller/parcon-dev.qcow2, with bin/parcon built first
 ```
 
 Run the integration suite when you change how the controller talks to Proxmox: the fakes only check what the code
@@ -385,9 +383,9 @@ commit messages are the release process. Follow these rules exactly.
     X.Y.Z*, with the next version (`.release-please-manifest.json`) and `CHANGELOG.md`. Its configuration is
     `release-please-config.json`.
   - When that pull request is merged, release-please creates release `vX.Y.Z` as a **draft**, with its tag. The
-    **images** job builds the two images on KVM, each boot-tested; **assemble** builds `parcon-<ver>-linux-amd64`
+    **images** job builds the runner image on KVM, boot-tested; **assemble** builds `parcon-<ver>-linux-amd64`
     and fills `install.sh`; **publish** signs `SHA256SUMS`, uploads `par-runner-<ver>.qcow2`, `par-runner-<ver>.json`,
-    `parcon-<ver>.qcow2`, `parcon-<ver>-linux-amd64`, `install.sh`, `SHA256SUMS`, and
+    `parcon-<ver>-linux-amd64`, `install.sh`, `SHA256SUMS`, and
     `SHA256SUMS.sig`, and only then publishes the draft. `releases/latest` never points at a release without its
     files.
 - **The procedure to release**: merge the pull requests that belong in it, wait for the release pull request to

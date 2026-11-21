@@ -158,7 +158,6 @@ published, and the release stays a draft until every file is uploaded.
 | ----- | -------- | -------- |
 | `install.sh` | The bootstrap, with this release's version and `parcon`'s checksum written in | Release workflow |
 | `parcon-<ver>-linux-amd64` | `parcon`: the host commands and the controller | Release workflow |
-| `parcon-<ver>.qcow2` | The controller VM: Ubuntu 26.04, `qemu-guest-agent`, `unattended-upgrades`, the `parcon` binary, user, and unit | Packer `qemu` builder in CI (`images/controller/`) |
 | `par-runner-<ver>.qcow2` | The runner template: Ubuntu 26.04, `qemu-guest-agent`, the `runner` user, a pinned `actions/runner`, Docker, and a few basics | Packer `qemu` builder in CI (`images/runner/`) |
 | `par-runner-<ver>.json` | The runner image's build manifest, including its `actions/runner` version | Packer `qemu` builder in CI |
 | `SHA256SUMS` | Checksums of all of the above | Release workflow |

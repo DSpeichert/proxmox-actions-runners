@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# build-image.sh IMAGE VERSION builds one release image (runner or controller) with Packer and boot-tests
+# build-image.sh IMAGE VERSION builds one release image (runner) with Packer and boot-tests
 # it. It runs in the dev container with KVM, in the release workflow or locally. The image and its checksum and
 # manifest land in output-IMAGE/.
 set -euo pipefail
@@ -13,14 +13,8 @@ main() {
 		name=par-runner-$version
 		expect=('Started.*par-runner.path')
 		;;
-	controller)
-		name=parcon-$version
-		mkdir -p bin
-		CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version=$version" -o bin/parcon ./cmd/parcon
-		args+=(-var parcon_binary=bin/parcon)
-		;;
 	*)
-		echo "unknown image $image; want runner or controller" >&2
+		echo "unknown image $image; want runner" >&2
 		exit 2
 		;;
 	esac

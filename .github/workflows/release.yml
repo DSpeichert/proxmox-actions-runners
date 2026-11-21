@@ -3,8 +3,8 @@
 # Every push to main (a merged pull request) runs the checks. release-please then reads the Conventional Commits since
 # the last release and keeps a release pull request open with the next version and its changelog
 # (release-please-config.json, .release-please-manifest.json). Merging that pull request is how a release happens:
-# release-please creates the release as a draft, with its tag, and the rest of the pipeline builds the three VM images
-# (each built with Packer and boot-tested on KVM), assembles parcon and install.sh with the version and checksums
+# release-please creates the release as a draft, with its tag, and the rest of the pipeline builds the runner image
+# (built with Packer and boot-tested on KVM), assembles parcon and install.sh with the version and checksums
 # written in, signs SHA256SUMS in the release environment, uploads everything, and only then publishes the release.
 # A version with a suffix, such as 0.2.0-rc.1 (from a Release-As footer), is published as a pre-release.
 #
@@ -88,7 +88,7 @@ jobs:
     timeout-minutes: 60
     strategy:
       matrix:
-        image: [runner, controller]
+        image: [runner]
     env:
       VERSION: ${{ needs.release-please.outputs.version }}
     steps:
@@ -145,8 +145,7 @@ jobs:
           find artifacts -type f \( -name '*.qcow2' -o -name 'par-runner-*.json' \) -exec mv {} dist/ \;
           docker run --rm -v "$PWD:$PWD" -w "$PWD" -e CGO_ENABLED=0 par-dev go build -trimpath \
             -ldflags "-s -w -X main.version=$VERSION" -o "dist/parcon-$VERSION-linux-amd64" ./cmd/parcon
-          for asset in "par-runner-$VERSION.qcow2" "par-runner-$VERSION.json" "parcon-$VERSION.qcow2" \
-            "parcon-$VERSION-linux-amd64"; do
+          for asset in "par-runner-$VERSION.qcow2" "par-runner-$VERSION.json" "parcon-$VERSION-linux-amd64"; do
             test -s "dist/$asset" || { echo "missing $asset" >&2; exit 1; }
           done
           (cd dist && sha256sum -- *) >assets.sha256
